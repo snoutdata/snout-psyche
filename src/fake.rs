@@ -322,6 +322,13 @@ fn embeddings(model: &str, body: &Value) -> Response {
 	.into_response()
 }
 
+/// A reply id of its own for every reply, as a provider's are: a gateway that keys its log by the
+/// reply's id (one does) would otherwise count a thousand calls as one.
+fn reply_id(prefix: &str) -> String {
+	static NEXT: AtomicUsize = AtomicUsize::new(0);
+	format!("{prefix}-fake-{}", NEXT.fetch_add(1, Ordering::Relaxed))
+}
+
 fn usage_of(completion: usize) -> Value {
 	json!({"prompt_tokens": 9, "completion_tokens": completion, "total_tokens": 9 + completion})
 }
@@ -330,13 +337,13 @@ fn whole(model: &str, chat: bool) -> Response {
 	let text: String = REPLY.concat();
 	let body = if chat {
 		json!({
-			"id": "chatcmpl-fake", "object": "chat.completion", "created": 0, "model": model,
+			"id": reply_id("chatcmpl"), "object": "chat.completion", "created": 0, "model": model,
 			"choices": [{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": "stop"}],
 			"usage": usage_of(REPLY.len()),
 		})
 	} else {
 		json!({
-			"id": "cmpl-fake", "object": "text_completion", "created": 0, "model": model,
+			"id": reply_id("cmpl"), "object": "text_completion", "created": 0, "model": model,
 			"choices": [{"index": 0, "text": "name, email", "finish_reason": "stop"}],
 			"usage": usage_of(3),
 		})
@@ -367,12 +374,13 @@ fn streamed(
 	gap: Duration,
 	cut: bool,
 ) -> Response {
+	let id = reply_id(if chat { "chatcmpl" } else { "cmpl" });
 	let chunk = |delta: Value, finish: Value| -> String {
 		let body = if chat {
-			json!({"id": "chatcmpl-fake", "object": "chat.completion.chunk", "created": 0, "model": model,
+			json!({"id": id, "object": "chat.completion.chunk", "created": 0, "model": model,
 				"choices": [{"index": 0, "delta": delta, "finish_reason": finish}]})
 		} else {
-			json!({"id": "cmpl-fake", "object": "text_completion", "created": 0, "model": model,
+			json!({"id": id, "object": "text_completion", "created": 0, "model": model,
 				"choices": [{"index": 0, "text": delta.get("content").cloned().unwrap_or(json!("")), "finish_reason": finish}]})
 		};
 		format!("data: {body}\n\n")
@@ -388,7 +396,7 @@ fn streamed(
 	if usage {
 		events.push(format!(
 			"data: {}\n\n",
-			json!({"id": "chatcmpl-fake", "object": "chat.completion.chunk", "created": 0, "model": model,
+			json!({"id": id, "object": "chat.completion.chunk", "created": 0, "model": model,
 				"choices": [], "usage": usage_of(words.len())})
 		));
 	}
