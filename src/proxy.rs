@@ -1,0 +1,2121 @@
+//! The OpenAI-compatible API: `/ai/v1/chat/completions`, `/ai/v1/completions`, `/ai/v1/embeddings`
+//! and `/ai/v1/models` (each also at `/v1/…`, for clients whose base URL ends in `/v1`).
+//!
+//! A call is checked, resolved to a model in the catalogue, and sent to that model's provider with
+//! Psyche's credential. To a provider that speaks OpenAI's API the request goes as the caller wrote
+//! it, with three changes only: `model` becomes the provider's name for it, a streamed call asks for
+//! usage (`stream_options.include_usage`) so every call is counted, and `cache_control` breakpoints
+//! are removed for a model the catalogue does not say caches. A caller that did not ask for the
+//! usage chunk does not get it. To Anthropic and to Bedrock it is translated, both ways
+//! (`anthropic.rs`, `bedrock.rs`), and their streams are turned into OpenAI's as they arrive
+//! (`translate.rs`). Embeddings from Bedrock are InvokeModel calls, one per text or per batch of
+//! texts, sent a few at a time and put back in order (`embeddings.rs`).
+//!
+//! The reply carries the model name the caller asked for, never the provider's own name for it:
+//! the catalogue's names are the API, and which upstream model serves one is
+//! Psyche's business (the `x-psyche-provider` header says which provider did).
+//!
+//! The rules this file keeps:
+//!  - **Bytes stream through as they arrive** (PS9): a provider's events are forwarded as the bytes
+//!    it sent, one network read at a time, never buffered into a whole reply.
+//!  - **A caller that goes away cancels the provider's call** (PS9): the stream is dropped, and with
+//!    it the provider's connection, so nobody pays for tokens no one reads.
+//!  - **After the first byte, a failure is reported in the stream**, as OpenAI reports one (a `data:`
+//!    event holding an `error` object), and the stream ends. Before it, the caller gets a status.
+//!  - **A provider's error never carries Psyche's credential back out** (`error::scrub`).
+//!  - **A refused credential is Psyche's problem, not the caller's**: a provider's 401 or 403 is
+//!    answered 502, never passed on as if the caller's own key were wrong.
+
+use std::pin::Pin;
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use axum::Router;
+use axum::body::{Body, Bytes};
+use axum::extract::rejection::BytesRejection;
+use axum::extract::{DefaultBodyLimit, State};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post};
+use futures_util::{Stream, StreamExt, TryStreamExt};
+use serde_json::{Map, Value, json};
+
+use crate::config::Timeouts;
+use crate::error::{ApiError, Class, scrub};
+use crate::jwt::{self, Role};
+use crate::net;
+use crate::providers::{Catalogue, Kind, Model};
+use crate::sse::{Event, Parser};
+use crate::translate::{Out, Translator};
+use crate::usage::Usage;
+use crate::{anthropic, bedrock, embeddings, sigv4};
+
+/// How much of a provider's error body is read. Errors are a few hundred bytes.
+const MAX_ERROR_BODY: usize = 64 * 1024;
+/// How much of a non-streamed reply is read. A long reply is well under a megabyte.
+const MAX_REPLY_BODY: usize = 64 * 1024 * 1024;
+/// How many of one request's embedding calls are in flight at once.
+const EMBED_CONCURRENCY: usize = 8;
+
+/// The server: the catalogue, the one outbound client, and the rules for callers.
+pub struct Proxy {
+	pub catalogue: Catalogue,
+	pub http: reqwest::Client,
+	pub jwt_secret: String,
+	pub timeouts: Timeouts,
+	pub max_request_bytes: usize,
+	/// Where each finished call is sent. Phase 3 puts the request log here; until then the call is
+	/// logged (`psyche::call`) and, in tests, handed to whoever listens.
+	pub calls: Option<tokio::sync::mpsc::UnboundedSender<Call>>,
+}
+
+/// One call, as the request log will hold it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Call {
+	pub operation: Operation,
+	pub model: String,
+	pub provider: String,
+	pub streamed: bool,
+	pub outcome: Outcome,
+	pub usage: Option<Usage>,
+	/// From sending the request to the provider's response headers.
+	pub first_byte: Duration,
+	pub total: Duration,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+	Completed,
+	/// The caller went away before the reply ended.
+	Cancelled,
+	Failed(Class),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Operation {
+	Chat,
+	Completions,
+	Embeddings,
+}
+
+impl Operation {
+	fn path(self) -> &'static str {
+		match self {
+			Operation::Chat => "chat/completions",
+			Operation::Completions => "completions",
+			Operation::Embeddings => "embeddings",
+		}
+	}
+
+	fn name(self) -> &'static str {
+		match self {
+			Operation::Chat => "chat",
+			Operation::Completions => "completions",
+			Operation::Embeddings => "embeddings",
+		}
+	}
+}
+
+/// What a caller sent, read only as far as Psyche needs.
+#[derive(Debug, Clone)]
+pub struct Inbound {
+	pub body: Map<String, Value>,
+	pub model: String,
+	pub stream: bool,
+	/// Whether the caller asked for the usage chunk itself.
+	pub wants_usage: bool,
+}
+
+impl Inbound {
+	pub fn parse(bytes: &[u8]) -> Result<Self, ApiError> {
+		let value: Value = serde_json::from_slice(bytes).map_err(|e| {
+			ApiError::new(
+				Class::BadRequest,
+				format!("The request is not valid JSON: {e}"),
+			)
+		})?;
+		let Value::Object(body) = value else {
+			return Err(ApiError::new(
+				Class::BadRequest,
+				"The request is a JSON object.",
+			));
+		};
+		let model = match body.get("model") {
+			Some(Value::String(model)) if !model.is_empty() => model.clone(),
+			_ => {
+				return Err(ApiError::new(
+					Class::BadRequest,
+					"The request names no model. GET /ai/v1/models lists them.",
+				));
+			}
+		};
+		let stream = match body.get("stream") {
+			None | Some(Value::Null) => false,
+			Some(Value::Bool(stream)) => *stream,
+			Some(_) => {
+				return Err(ApiError::new(Class::BadRequest, "stream is true or false."));
+			}
+		};
+		let wants_usage = body
+			.get("stream_options")
+			.and_then(|o| o.get("include_usage"))
+			.and_then(Value::as_bool)
+			== Some(true);
+		Ok(Self {
+			body,
+			model,
+			stream,
+			wants_usage,
+		})
+	}
+
+	/// The body the provider gets, for this operation.
+	fn upstream(&self, model: &Model, operation: Operation) -> Result<Vec<u8>, ApiError> {
+		match model.provider.kind {
+			Kind::Openai => return Ok(self.openai(model)),
+			Kind::Anthropic | Kind::Bedrock if operation != Operation::Chat => {
+				return Err(ApiError::new(
+					Class::BadRequest,
+					format!(
+						"{}'s provider has no text-completion API. Use /chat/completions.",
+						model.name
+					),
+				));
+			}
+			_ => {}
+		}
+		let body = match model.provider.kind {
+			Kind::Bedrock => bedrock::request(&self.body, model)?,
+			_ => anthropic::request(&self.body, model, self.stream)?,
+		};
+		Ok(serde_json::to_vec(&body).unwrap_or_default())
+	}
+
+	/// To an OpenAI-style provider: the provider's name for the model, usage asked for, and no
+	/// breakpoint for a model that does not cache.
+	fn openai(&self, model: &Model) -> Vec<u8> {
+		let mut body = self.body.clone();
+		body.insert("model".into(), Value::String(model.upstream.clone()));
+		if !model.prompt_caching {
+			strip_cache_control(&mut body);
+		}
+		if self.stream {
+			let options = body
+				.entry("stream_options")
+				.or_insert_with(|| Value::Object(Map::new()));
+			if !options.is_object() {
+				*options = Value::Object(Map::new());
+			}
+			if let Value::Object(options) = options {
+				options.insert("include_usage".into(), Value::Bool(true));
+			}
+		}
+		serde_json::to_vec(&Value::Object(body)).unwrap_or_default()
+	}
+}
+
+/// Removes every `cache_control` breakpoint from a chat request: on a message, on a content part,
+/// on a tool (a model that does not cache can answer a request that carries one with an error,
+/// whatever the gateway's settings say).
+fn strip_cache_control(body: &mut Map<String, Value>) {
+	for list in ["messages", "tools"] {
+		let Some(Value::Array(items)) = body.get_mut(list) else {
+			continue;
+		};
+		for item in items.iter_mut().filter_map(Value::as_object_mut) {
+			item.remove("cache_control");
+			if let Some(Value::Array(parts)) = item.get_mut("content") {
+				for part in parts.iter_mut().filter_map(Value::as_object_mut) {
+					part.remove("cache_control");
+				}
+			}
+		}
+	}
+}
+
+pub fn router(proxy: Arc<Proxy>) -> Router {
+	let api = Router::new()
+		.route("/chat/completions", post(chat))
+		.route("/completions", post(completions))
+		.route("/embeddings", post(embed))
+		.route("/models", get(models));
+	let limit = proxy.max_request_bytes;
+	Router::new()
+		.nest("/ai/v1", api.clone())
+		.nest("/v1", api)
+		.route("/health", get(|| async { "ok" }))
+		.layer(DefaultBodyLimit::max(limit))
+		.with_state(proxy)
+}
+
+async fn chat(
+	State(proxy): State<Arc<Proxy>>,
+	headers: HeaderMap,
+	body: Result<Bytes, BytesRejection>,
+) -> Response {
+	match proxy.forward(&headers, body, Operation::Chat).await {
+		Ok(response) => response,
+		Err(error) => error.into_response(),
+	}
+}
+
+async fn completions(
+	State(proxy): State<Arc<Proxy>>,
+	headers: HeaderMap,
+	body: Result<Bytes, BytesRejection>,
+) -> Response {
+	match proxy.forward(&headers, body, Operation::Completions).await {
+		Ok(response) => response,
+		Err(error) => error.into_response(),
+	}
+}
+
+async fn embed(
+	State(proxy): State<Arc<Proxy>>,
+	headers: HeaderMap,
+	body: Result<Bytes, BytesRejection>,
+) -> Response {
+	match proxy.forward(&headers, body, Operation::Embeddings).await {
+		Ok(response) => response,
+		Err(error) => error.into_response(),
+	}
+}
+
+async fn models(State(proxy): State<Arc<Proxy>>, headers: HeaderMap) -> Response {
+	if let Err(error) = proxy.authorize(&headers) {
+		return error.into_response();
+	}
+	let data: Vec<Value> = proxy
+		.catalogue
+		.models()
+		.iter()
+		.map(
+			|m| json!({"id": m.name, "object": "model", "created": 0, "owned_by": m.provider.name}),
+		)
+		.collect();
+	axum::Json(json!({"object": "list", "data": data})).into_response()
+}
+
+fn now() -> u64 {
+	SystemTime::now()
+		.duration_since(UNIX_EPOCH)
+		.map(|d| d.as_secs())
+		.unwrap_or(0)
+}
+
+impl Proxy {
+	/// The caller's token, from `Authorization: Bearer` or the `apikey` header (the front door
+	/// sends both). Until keys and budgets exist (Phase 3) only the service role may call.
+	fn authorize(&self, headers: &HeaderMap) -> Result<jwt::Caller, ApiError> {
+		let bearer = headers
+			.get(header::AUTHORIZATION)
+			.and_then(|v| v.to_str().ok())
+			.and_then(|v| {
+				v.strip_prefix("Bearer ")
+					.or_else(|| v.strip_prefix("bearer "))
+			});
+		let token = bearer
+			.or_else(|| headers.get("apikey").and_then(|v| v.to_str().ok()))
+			.map(str::trim)
+			.filter(|t| !t.is_empty())
+			.ok_or_else(|| {
+				ApiError::new(
+					Class::Unauthorized,
+					"Send the project's service key as a Bearer token.",
+				)
+			})?;
+		let caller = jwt::verify(token, &self.jwt_secret, now())
+			.map_err(|e| ApiError::new(Class::Unauthorized, e.0))?;
+		if caller.role != Role::Service {
+			return Err(ApiError::new(
+				Class::Forbidden,
+				"Only the project's service key may call a model until keys and budgets are set up.",
+			));
+		}
+		Ok(caller)
+	}
+
+	async fn forward(
+		&self,
+		headers: &HeaderMap,
+		body: Result<Bytes, BytesRejection>,
+		operation: Operation,
+	) -> Result<Response, ApiError> {
+		self.authorize(headers)?;
+		let body = body.map_err(|rejection| {
+			let mut error = ApiError::new(
+				Class::BadRequest,
+				format!("The request could not be read: {}", rejection.body_text()),
+			);
+			error.status = Some(rejection.status());
+			error
+		})?;
+		let inbound = Inbound::parse(&body)?;
+		let model = self
+			.catalogue
+			.model(&inbound.model)
+			.cloned()
+			.ok_or_else(|| {
+				ApiError::new(
+					Class::ModelNotFound,
+					format!(
+						"There is no model named {} here. GET /ai/v1/models lists them.",
+						inbound.model
+					),
+				)
+			})?;
+		let provider = &model.provider;
+		if operation == Operation::Embeddings {
+			if inbound.stream {
+				return Err(ApiError::new(
+					Class::BadRequest,
+					"Embeddings are not streamed: leave stream out.",
+				));
+			}
+			match provider.kind {
+				Kind::Openai => {}
+				Kind::Anthropic => {
+					return Err(ApiError::new(
+						Class::BadRequest,
+						format!("{}'s provider has no embeddings API.", model.name),
+					));
+				}
+				Kind::Bedrock => return Ok(labelled(self.embed(&inbound, &model).await?, &model)),
+			}
+		}
+		let body = inbound.upstream(&model, operation)?;
+		let (path, accept) = match provider.kind {
+			Kind::Openai => (operation.path().to_string(), "text/event-stream"),
+			Kind::Anthropic => ("messages".to_string(), "text/event-stream"),
+			// The model id goes in the path, percent-encoded: `qwen.qwen3-coder-30b-a3b-v1:0` and
+			// inference-profile ARNs hold characters a path segment may not.
+			Kind::Bedrock => (
+				format!(
+					"model/{}/{}",
+					sigv4::encode(&model.upstream),
+					if inbound.stream {
+						"converse-stream"
+					} else {
+						"converse"
+					}
+				),
+				"application/vnd.amazon.eventstream",
+			),
+		};
+		let url = url::Url::parse(&provider.endpoint(&path)).map_err(|_| {
+			ApiError::new(
+				Class::Upstream,
+				format!("{}'s endpoint is not a URL.", provider.name),
+			)
+		})?;
+
+		let started = Instant::now();
+		let mut request = self
+			.http
+			.post(url.clone())
+			.header(header::CONTENT_TYPE, "application/json");
+		request = provider.authorize(request, &url, &body, now());
+		request = request.body(body);
+		if provider.kind == Kind::Anthropic {
+			request = request.header("anthropic-version", anthropic::VERSION);
+		}
+		if inbound.stream {
+			request = request.header(header::ACCEPT, accept);
+		}
+		let record = Record {
+			sink: self.calls.clone(),
+			call: Call {
+				operation,
+				model: model.name.clone(),
+				provider: provider.name.clone(),
+				streamed: inbound.stream,
+				outcome: Outcome::Cancelled,
+				usage: None,
+				first_byte: Duration::ZERO,
+				total: Duration::ZERO,
+			},
+			started,
+		};
+		let response = match tokio::time::timeout(self.timeouts.first_byte, request.send()).await {
+			Err(_) => {
+				let error = ApiError::new(
+					Class::Timeout,
+					format!(
+						"{} did not answer within {} seconds.",
+						provider.name,
+						self.timeouts.first_byte.as_secs()
+					),
+				)
+				.from_provider(&provider.name);
+				return Err(record.fail(error));
+			}
+			Ok(Err(e)) => return Err(record.fail(send_error(&e, &provider.name))),
+			Ok(Ok(response)) => response,
+		};
+		let mut record = record;
+		record.call.first_byte = started.elapsed();
+
+		if !response.status().is_success() {
+			let error = self.provider_error(response, &model).await;
+			return Err(record.fail(error));
+		}
+		let out = if inbound.stream {
+			self.stream(response, &model, inbound.wants_usage, record)
+		} else {
+			self.whole(response, &model, record).await?
+		};
+		Ok(labelled(out, &model))
+	}
+
+	/// Embeddings from a Bedrock model, in the InvokeModel body the catalogue names for it: every
+	/// call made (a few at a time), the vectors put back in the order of the texts, and the input
+	/// counted from what each call reported. Any call failing fails the request; the rest are
+	/// dropped, and with them their connections.
+	async fn embed(&self, inbound: &Inbound, model: &Model) -> Result<Response, ApiError> {
+		let provider = &model.provider;
+		let family = model.embeddings.ok_or_else(|| {
+			ApiError::new(
+				Class::BadRequest,
+				format!(
+					"{} is not an embedding model. GET /ai/v1/models lists the models.",
+					model.name
+				),
+			)
+		})?;
+		let request = embeddings::request(&inbound.body, family)?;
+		let url = url::Url::parse(
+			&provider.endpoint(&format!("model/{}/invoke", sigv4::encode(&model.upstream))),
+		)
+		.map_err(|_| {
+			ApiError::new(
+				Class::Upstream,
+				format!("{}'s endpoint is not a URL.", provider.name),
+			)
+		})?;
+		let mut record = Record {
+			sink: self.calls.clone(),
+			call: Call {
+				operation: Operation::Embeddings,
+				model: model.name.clone(),
+				provider: provider.name.clone(),
+				streamed: false,
+				outcome: Outcome::Cancelled,
+				usage: None,
+				first_byte: Duration::ZERO,
+				total: Duration::ZERO,
+			},
+			started: Instant::now(),
+		};
+		let calls = request
+			.bodies(family)
+			.into_iter()
+			.map(|body| self.invoke(&url, model, body));
+		let replies = tokio::time::timeout(
+			self.timeouts.total,
+			futures_util::stream::iter(calls)
+				.buffered(EMBED_CONCURRENCY)
+				.try_collect::<Vec<_>>(),
+		)
+		.await;
+		let replies = match replies {
+			Err(_) => {
+				return Err(record.fail(
+					ApiError::new(
+						Class::Timeout,
+						format!("{} did not finish the embeddings in time.", provider.name),
+					)
+					.from_provider(&provider.name),
+				));
+			}
+			Ok(Err(error)) => return Err(record.fail(error)),
+			Ok(Ok(replies)) => replies,
+		};
+		let mut vectors = Vec::with_capacity(request.inputs.len());
+		let mut tokens = Some(0u64);
+		let mut broken = None;
+		for invoked in &replies {
+			record.call.first_byte = record.call.first_byte.max(invoked.first_byte);
+			tokens = tokens.zip(invoked.tokens).map(|(a, b)| a + b);
+			match embeddings::vectors(family, &invoked.reply) {
+				Ok(more) => vectors.extend(more),
+				Err(why) => {
+					broken = Some(why);
+					break;
+				}
+			}
+		}
+		if broken.is_none() && vectors.len() != request.inputs.len() {
+			broken = Some(format!(
+				"{} embeddings for {} texts",
+				vectors.len(),
+				request.inputs.len()
+			));
+		}
+		let body = match broken {
+			None => embeddings::reply(vectors, request.base64, &model.name, tokens),
+			Some(why) => Err(why),
+		};
+		let body = match body {
+			Ok(body) => body,
+			Err(why) => {
+				return Err(record.fail(
+					ApiError::new(
+						Class::Upstream,
+						format!(
+							"{} answered with something that is not its API: {why}.",
+							provider.name
+						),
+					)
+					.from_provider(&provider.name),
+				));
+			}
+		};
+		record.call.usage = tokens.map(|prompt_tokens| Usage {
+			prompt_tokens,
+			..Usage::default()
+		});
+		record.finish(Outcome::Completed);
+		Ok((
+			StatusCode::OK,
+			[(header::CONTENT_TYPE, "application/json")],
+			serde_json::to_vec(&body).unwrap_or_default(),
+		)
+			.into_response())
+	}
+
+	/// One InvokeModel call.
+	async fn invoke(
+		&self,
+		url: &url::Url,
+		model: &Model,
+		body: Value,
+	) -> Result<Invoked, ApiError> {
+		let provider = &model.provider;
+		let body = serde_json::to_vec(&body).unwrap_or_default();
+		let started = Instant::now();
+		let request = self
+			.http
+			.post(url.clone())
+			.header(header::CONTENT_TYPE, "application/json");
+		let request = provider.authorize(request, url, &body, now()).body(body);
+		let response = match tokio::time::timeout(self.timeouts.first_byte, request.send()).await {
+			Err(_) => {
+				return Err(ApiError::new(
+					Class::Timeout,
+					format!(
+						"{} did not answer within {} seconds.",
+						provider.name,
+						self.timeouts.first_byte.as_secs()
+					),
+				)
+				.from_provider(&provider.name));
+			}
+			Ok(Err(e)) => return Err(send_error(&e, &provider.name)),
+			Ok(Ok(response)) => response,
+		};
+		let first_byte = started.elapsed();
+		if !response.status().is_success() {
+			return Err(self.provider_error(response, model).await);
+		}
+		let counted = response
+			.headers()
+			.get("x-amzn-bedrock-input-token-count")
+			.and_then(|v| v.to_str().ok())
+			.and_then(|v| v.trim().parse::<u64>().ok());
+		let body = read(response, MAX_REPLY_BODY).await.map_err(|e| {
+			ApiError::new(
+				Class::Transport,
+				format!("{}'s reply broke off: {e}", provider.name),
+			)
+			.from_provider(&provider.name)
+		})?;
+		let reply: Value = serde_json::from_slice(&body).map_err(|_| {
+			ApiError::new(
+				Class::Upstream,
+				format!(
+					"{} answered with something that is not JSON.",
+					provider.name
+				),
+			)
+			.from_provider(&provider.name)
+		})?;
+		let tokens = counted.or_else(|| reply.get("inputTextTokenCount").and_then(Value::as_u64));
+		Ok(Invoked {
+			reply,
+			tokens,
+			first_byte,
+		})
+	}
+
+	/// A non-streamed reply: read whole (it is bounded), counted, passed on as the provider wrote it.
+	async fn whole(
+		&self,
+		response: reqwest::Response,
+		model: &Model,
+		mut record: Record,
+	) -> Result<Response, ApiError> {
+		let provider = record.call.provider.clone();
+		let deadline = self.timeouts.total.saturating_sub(record.started.elapsed());
+		let body = match tokio::time::timeout(deadline, read(response, MAX_REPLY_BODY)).await {
+			Err(_) => {
+				return Err(record.fail(
+					ApiError::new(
+						Class::Timeout,
+						format!("{provider} did not finish its reply in time."),
+					)
+					.from_provider(&provider),
+				));
+			}
+			Ok(Err(e)) => {
+				return Err(record.fail(
+					ApiError::new(
+						Class::Transport,
+						format!("{provider}'s reply broke off: {e}"),
+					)
+					.from_provider(&provider),
+				));
+			}
+			Ok(Ok(body)) => body,
+		};
+		let Ok(value) = serde_json::from_slice::<Value>(&body) else {
+			return Err(record.fail(
+				ApiError::new(
+					Class::Upstream,
+					format!("{provider} answered with something that is not JSON."),
+				)
+				.from_provider(&provider),
+			));
+		};
+		let body = match model.provider.kind {
+			Kind::Openai => {
+				record.call.usage = Usage::from_openai(&value);
+				let mut value = value;
+				if rename(&mut value, &model.name) {
+					serde_json::to_vec(&value).unwrap_or_default()
+				} else {
+					body
+				}
+			}
+			Kind::Anthropic | Kind::Bedrock => match match model.provider.kind {
+				Kind::Bedrock => bedrock::reply(&value, &model.name, &bedrock::new_id(), now()),
+				_ => anthropic::reply(&value, &model.name, now()),
+			} {
+				Ok(reply) => {
+					record.call.usage = value.get("usage").and_then(match model.provider.kind {
+						Kind::Bedrock => Usage::from_bedrock,
+						_ => Usage::from_anthropic,
+					});
+					serde_json::to_vec(&reply).unwrap_or_default()
+				}
+				Err(why) => {
+					return Err(record.fail(
+						ApiError::new(
+							Class::Upstream,
+							format!(
+								"{provider} answered with something that is not its API: {why}."
+							),
+						)
+						.from_provider(&provider),
+					));
+				}
+			},
+		};
+		record.finish(Outcome::Completed);
+		Ok((
+			StatusCode::OK,
+			[(header::CONTENT_TYPE, "application/json")],
+			body,
+		)
+			.into_response())
+	}
+
+	/// A streamed reply, forwarded read by read.
+	fn stream(
+		&self,
+		response: reqwest::Response,
+		model: &Model,
+		wants_usage: bool,
+		record: Record,
+	) -> Response {
+		let state = Streaming {
+			upstream: Box::pin(response.bytes_stream()),
+			parser: Parser::new(),
+			translate: match model.provider.kind {
+				Kind::Openai => None,
+				Kind::Anthropic => Some(Translator::anthropic(wants_usage, &model.name, now())),
+				Kind::Bedrock => Some(Translator::bedrock(
+					wants_usage,
+					&model.name,
+					&bedrock::new_id(),
+					now(),
+				)),
+			},
+			wants_usage,
+			idle: self.timeouts.idle,
+			secrets: self
+				.catalogue
+				.secrets()
+				.into_iter()
+				.map(String::from)
+				.collect(),
+			done: false,
+			record,
+		};
+		let body = futures_util::stream::unfold(state, |mut state| async move {
+			let out = state.next().await?;
+			Some((Ok::<Bytes, std::io::Error>(out), state))
+		});
+		(
+			StatusCode::OK,
+			[
+				(header::CONTENT_TYPE, "text/event-stream"),
+				(header::CACHE_CONTROL, "no-cache"),
+				// Anything between here and the caller (the front door, nginx) must not hold the
+				// stream back to buffer it.
+				(header::HeaderName::from_static("x-accel-buffering"), "no"),
+			],
+			Body::from_stream(body),
+		)
+			.into_response()
+	}
+
+	/// A provider's error status, as the caller and the log should see it.
+	async fn provider_error(&self, response: reqwest::Response, model: &Model) -> ApiError {
+		let provider = &model.provider.name;
+		let status = response.status();
+		let retry_after = response
+			.headers()
+			.get(header::RETRY_AFTER)
+			.and_then(|v| v.to_str().ok())
+			.map(String::from);
+		let body = tokio::time::timeout(self.timeouts.idle, read(response, MAX_ERROR_BODY))
+			.await
+			.ok()
+			.and_then(Result::ok)
+			.unwrap_or_default();
+		let text = scrub(&String::from_utf8_lossy(&body), &self.catalogue.secrets());
+		let said = serde_json::from_str::<Value>(&text)
+			.ok()
+			.and_then(|v| {
+				v.pointer("/error/message")
+					.or_else(|| v.get("message"))
+					.or_else(|| v.get("Message"))
+					.or_else(|| v.get("error"))
+					.and_then(Value::as_str)
+					.map(String::from)
+			})
+			.unwrap_or_else(|| text.chars().take(500).collect());
+		let (class, message) = match status.as_u16() {
+			// Bedrock's ServiceUnavailableException: the model has no capacity for this account just
+			// now, which is a limit to route around, not a failure.
+			503 if model.provider.kind == Kind::Bedrock => (
+				Class::RateLimited,
+				format!("{provider} has no capacity just now: {said}"),
+			),
+			401 | 403 => (
+				Class::ProviderAuth,
+				format!("{provider} refused Psyche's credential ({status}): {said}"),
+			),
+			429 => (
+				Class::RateLimited,
+				format!("{provider} is rate-limiting: {said}"),
+			),
+			408 => (Class::Timeout, format!("{provider} timed out: {said}")),
+			400..=499 => (
+				Class::Rejected,
+				format!("{provider} refused the request: {said}"),
+			),
+			_ => (
+				Class::Upstream,
+				format!("{provider} failed ({status}): {said}"),
+			),
+		};
+		let mut error = ApiError::new(class, message).from_provider(provider);
+		if class == Class::Rejected {
+			// The caller's own request was at fault: they get the provider's status.
+			error.status =
+				Some(StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_REQUEST));
+		}
+		error.retry_after = retry_after;
+		error
+	}
+}
+
+/// One embedding call's reply.
+struct Invoked {
+	reply: Value,
+	tokens: Option<u64>,
+	first_byte: Duration,
+}
+
+/// Says which catalogue model and which provider answered.
+fn labelled(mut out: Response, model: &Model) -> Response {
+	for (name, value) in [
+		("x-psyche-model", &model.name),
+		("x-psyche-provider", &model.provider.name),
+	] {
+		if let Ok(value) = HeaderValue::from_str(value) {
+			out.headers_mut().insert(name, value);
+		}
+	}
+	out
+}
+
+/// Gives a reply (or a chunk of one) the model name the caller asked for. Whether it changed
+/// anything, so an unchanged event is forwarded as the bytes the provider sent.
+fn rename(value: &mut Value, name: &str) -> bool {
+	match value.get_mut("model") {
+		Some(model) if model.as_str() != Some(name) && model.is_string() => {
+			*model = Value::String(name.to_string());
+			true
+		}
+		_ => false,
+	}
+}
+
+/// Why a request never got a response.
+fn send_error(error: &reqwest::Error, provider: &str) -> ApiError {
+	let chain = std::iter::successors(std::error::Error::source(error), |s| s.source())
+		.map(ToString::to_string)
+		.collect::<Vec<_>>()
+		.join(": ");
+	let class = if chain.contains(net::REFUSED) {
+		Class::EgressRefused
+	} else if error.is_timeout() {
+		Class::Timeout
+	} else {
+		Class::Transport
+	};
+	let detail = if chain.is_empty() {
+		error.to_string()
+	} else {
+		chain
+	};
+	ApiError::new(class, format!("Could not reach {provider}: {detail}")).from_provider(provider)
+}
+
+/// Reads a body up to `limit` bytes, refusing one that is longer.
+async fn read(mut response: reqwest::Response, limit: usize) -> Result<Vec<u8>, String> {
+	let mut body = Vec::new();
+	while let Some(chunk) = response.chunk().await.map_err(|e| e.to_string())? {
+		if body.len() + chunk.len() > limit {
+			return Err(format!("the reply is longer than {limit} bytes"));
+		}
+		body.extend_from_slice(&chunk);
+	}
+	Ok(body)
+}
+
+/// A call in flight. Whatever ends it (completion, failure, or the caller dropping the stream),
+/// it is recorded exactly once, when this is dropped.
+struct Record {
+	sink: Option<tokio::sync::mpsc::UnboundedSender<Call>>,
+	call: Call,
+	started: Instant,
+}
+
+impl Record {
+	fn finish(&mut self, outcome: Outcome) {
+		self.call.outcome = outcome;
+	}
+
+	fn fail(mut self, error: ApiError) -> ApiError {
+		self.finish(Outcome::Failed(error.class));
+		error
+	}
+}
+
+impl Drop for Record {
+	fn drop(&mut self) {
+		self.call.total = self.started.elapsed();
+		let call = &self.call;
+		let usage = call.usage.unwrap_or_default();
+		tracing::info!(
+			target: "psyche::call",
+			operation = call.operation.name(),
+			model = %call.model,
+			provider = %call.provider,
+			streamed = call.streamed,
+			outcome = ?call.outcome,
+			prompt_tokens = usage.prompt_tokens,
+			completion_tokens = usage.completion_tokens,
+			counted = call.usage.is_some(),
+			first_byte_ms = call.first_byte.as_millis() as u64,
+			total_ms = call.total.as_millis() as u64,
+		);
+		if let Some(sink) = &self.sink {
+			let _ = sink.send(self.call.clone());
+		}
+	}
+}
+
+type Upstream = Pin<Box<dyn Stream<Item = reqwest::Result<Bytes>> + Send>>;
+
+/// The state of one streamed reply.
+struct Streaming {
+	upstream: Upstream,
+	parser: Parser,
+	/// For a provider whose stream is not OpenAI's: what turns it into OpenAI's chunks.
+	translate: Option<Translator>,
+	wants_usage: bool,
+	idle: Duration,
+	secrets: Vec<String>,
+	done: bool,
+	record: Record,
+}
+
+impl Streaming {
+	/// The next bytes for the caller, or `None` once the stream is over.
+	async fn next(&mut self) -> Option<Bytes> {
+		loop {
+			if self.done {
+				return None;
+			}
+			let provider = self.record.call.provider.clone();
+			match tokio::time::timeout(self.idle, self.upstream.next()).await {
+				Err(_) => {
+					return Some(self.fail(
+						Class::Timeout,
+						format!(
+							"{provider} went quiet for {} seconds in the middle of its reply.",
+							self.idle.as_secs()
+						),
+					));
+				}
+				Ok(Some(Err(e))) => {
+					return Some(self.fail(
+						Class::Transport,
+						format!("{provider}'s stream broke off: {e}"),
+					));
+				}
+				Ok(None) => {
+					let out = match self.translate.as_mut() {
+						// The provider closed its stream: a cut reply is an error event.
+						Some(translate) => {
+							let pieces = translate.end();
+							self.render(pieces)
+						}
+						None => {
+							let rest = std::mem::take(&mut self.parser).finish();
+							self.pass(rest)
+						}
+					};
+					if !self.done {
+						self.done = true;
+						if self.record.call.outcome == Outcome::Cancelled {
+							self.record.finish(Outcome::Completed);
+						}
+					}
+					return (!out.is_empty()).then_some(out);
+				}
+				Ok(Some(Ok(chunk))) if self.translate.is_some() => {
+					let pieces = self
+						.translate
+						.as_mut()
+						.map(|t| t.feed(&chunk))
+						.unwrap_or_default();
+					let out = self.render(pieces);
+					if !out.is_empty() {
+						return Some(out);
+					}
+				}
+				Ok(Some(Ok(chunk))) => match self.parser.feed(&chunk) {
+					Err(e) => return Some(self.fail(Class::Upstream, format!("{provider}: {e}"))),
+					Ok(events) => {
+						let out = self.pass(events);
+						if !out.is_empty() {
+							return Some(out);
+						}
+					}
+				},
+			}
+		}
+	}
+
+	/// The bytes of the events the caller gets: usage counted, the usage chunk kept back from a
+	/// caller that did not ask for it, an error event noted and scrubbed.
+	fn pass(&mut self, events: Vec<Event>) -> Bytes {
+		let mut out = Vec::new();
+		for event in events {
+			let mut parsed = event
+				.data
+				.as_deref()
+				.filter(|d| *d != "[DONE]")
+				.and_then(|d| serde_json::from_str::<Value>(d).ok());
+			if let Some(value) = &mut parsed {
+				if value.get("error").is_some() {
+					self.record.finish(Outcome::Failed(Class::Upstream));
+					let secrets: Vec<&str> = self.secrets.iter().map(String::as_str).collect();
+					let clean = scrub(&String::from_utf8_lossy(&event.raw), &secrets);
+					out.extend_from_slice(clean.as_bytes());
+					continue;
+				}
+				if let Some(usage) = Usage::from_openai(value) {
+					self.record.call.usage = Some(usage);
+					let no_choices = value
+						.get("choices")
+						.and_then(Value::as_array)
+						.is_none_or(Vec::is_empty);
+					if !self.wants_usage && no_choices {
+						continue;
+					}
+				}
+				if rename(value, &self.record.call.model) {
+					out.extend_from_slice(format!("data: {value}\n\n").as_bytes());
+					continue;
+				}
+			}
+			out.extend_from_slice(&event.raw);
+		}
+		Bytes::from(out)
+	}
+
+	/// The bytes of a translated stream's pieces. The first error ends the stream.
+	fn render(&mut self, pieces: Vec<Out>) -> Bytes {
+		let mut out = Vec::new();
+		let mut failed = None;
+		for piece in pieces {
+			match piece {
+				Out::Chunk(chunk) => out.extend_from_slice(format!("data: {chunk}\n\n").as_bytes()),
+				Out::Done => out.extend_from_slice(b"data: [DONE]\n\n"),
+				Out::KeepAlive => out.extend_from_slice(b": ping\n\n"),
+				Out::Error(class, message) => {
+					failed = Some((class, message));
+					break;
+				}
+			}
+		}
+		self.record.call.usage = self.translate.as_ref().and_then(Translator::usage);
+		if let Some((class, message)) = failed {
+			let secrets: Vec<&str> = self.secrets.iter().map(String::as_str).collect();
+			let provider = self.record.call.provider.clone();
+			let message = format!("{provider}: {}", scrub(&message, &secrets));
+			out.extend_from_slice(&self.fail(class, message));
+		}
+		Bytes::from(out)
+	}
+
+	/// Ends the stream with an error event, OpenAI's way.
+	fn fail(&mut self, class: Class, message: String) -> Bytes {
+		self.done = true;
+		self.record.finish(Outcome::Failed(class));
+		let error = ApiError::new(class, message).from_provider(&self.record.call.provider);
+		Bytes::from(format!("data: {}\n\n", error.body()))
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use std::collections::HashMap;
+
+	use super::*;
+	use crate::fake::Fake;
+	use crate::net::Egress;
+
+	const SECRET: &str = "a-project-secret-of-at-least-32-chars";
+
+	struct Setup {
+		base: String,
+		fake: Fake,
+		calls: tokio::sync::mpsc::UnboundedReceiver<Call>,
+		client: reqwest::Client,
+	}
+
+	impl Setup {
+		async fn new() -> Self {
+			Self::with(Fake::KEY, Timeouts::default()).await
+		}
+
+		/// Psyche in front of a fake provider, presenting `key` to it.
+		async fn with(key: &str, mut timeouts: Timeouts) -> Self {
+			let fake = Fake::start().await;
+			let catalogue = Catalogue::from_json(
+				&format!(
+					r#"{{"providers": [
+						{{"name": "fake", "kind": "openai", "base_url": "{0}/v1", "api_key_env": "FAKE_KEY"}},
+						{{"name": "anthropic", "kind": "anthropic", "base_url": "{0}/v1", "api_key_env": "FAKE_KEY"}},
+						{{"name": "bedrock", "kind": "bedrock", "region": "us-west-2", "base_url": "{0}",
+							"aws": {{"access_key_id_env": "AWS_AK", "secret_access_key_env": "AWS_SK"}}}},
+						{{"name": "bedrock-key", "kind": "bedrock", "region": "us-west-2", "base_url": "{0}", "api_key_env": "FAKE_KEY"}},
+						{{"name": "bedrock-wrong", "kind": "bedrock", "region": "us-west-2", "base_url": "{0}",
+							"aws": {{"access_key_id_env": "AWS_AK", "secret_access_key_env": "AWS_SK_WRONG"}}}}
+					],
+					"models": [
+						{{"name": "ok", "provider": "fake", "upstream": "fake-ok"}},
+						{{"name": "cached", "provider": "fake", "upstream": "fake-ok", "prompt_caching": true}},
+						{{"name": "claude", "provider": "anthropic", "upstream": "fake-ok", "prompt_caching": true}},
+						{{"name": "claude-tool", "provider": "anthropic", "upstream": "fake-tool"}},
+						{{"name": "claude-529", "provider": "anthropic", "upstream": "fake-529"}},
+						{{"name": "claude-overloaded", "provider": "anthropic", "upstream": "fake-overloaded"}},
+						{{"name": "claude-truncated", "provider": "anthropic", "upstream": "fake-truncated"}},
+						{{"name": "qwen", "provider": "bedrock", "upstream": "fake.qwen:0"}},
+						{{"name": "bedrock-tool", "provider": "bedrock-key", "upstream": "fake-tool", "prompt_caching": true}},
+						{{"name": "luna", "provider": "bedrock", "upstream": "fake-luna"}},
+						{{"name": "luna-marked-caching", "provider": "bedrock", "upstream": "fake-luna", "prompt_caching": true}},
+						{{"name": "bedrock-throttle", "provider": "bedrock", "upstream": "fake-throttle"}},
+						{{"name": "bedrock-unavailable", "provider": "bedrock", "upstream": "fake-unavailable"}},
+						{{"name": "bedrock-stream-throttle", "provider": "bedrock", "upstream": "fake-stream-throttle"}},
+						{{"name": "bedrock-truncated", "provider": "bedrock", "upstream": "fake-truncated"}},
+						{{"name": "bedrock-wrong", "provider": "bedrock-wrong", "upstream": "fake-ok"}},
+						{{"name": "slow", "provider": "fake", "upstream": "fake-slow"}},
+						{{"name": "fails", "provider": "fake", "upstream": "fake-500"}},
+						{{"name": "limited", "provider": "fake", "upstream": "fake-429"}},
+						{{"name": "picky", "provider": "fake", "upstream": "fake-400"}},
+						{{"name": "hangs", "provider": "fake", "upstream": "fake-hang"}},
+						{{"name": "cut", "provider": "fake", "upstream": "fake-cut"}},
+						{{"name": "embed", "provider": "fake", "upstream": "fake-embed"}},
+						{{"name": "titan", "provider": "bedrock", "upstream": "amazon.titan-embed-text-v2:0", "embeddings": "titan"}},
+						{{"name": "cohere", "provider": "bedrock-key", "upstream": "cohere.embed-english-v3", "embeddings": "cohere"}},
+						{{"name": "cohere-throttle", "provider": "bedrock", "upstream": "cohere.embed-fake-throttle", "embeddings": "cohere"}}
+					]}}"#,
+					fake.origin
+				),
+				&HashMap::from([
+					("FAKE_KEY".to_string(), key.to_string()),
+					("AWS_AK".to_string(), Fake::AWS_ACCESS_KEY_ID.to_string()),
+					("AWS_SK".to_string(), Fake::AWS_SECRET.to_string()),
+					("AWS_SK_WRONG".to_string(), "a-secret-the-fake-does-not-know".to_string()),
+				]),
+				Egress::Private,
+			)
+			.unwrap();
+			if timeouts == Timeouts::default() {
+				timeouts.idle = Duration::from_secs(5);
+			}
+			let (tx, calls) = tokio::sync::mpsc::unbounded_channel();
+			let proxy = Arc::new(Proxy {
+				catalogue,
+				http: net::client(Egress::Private).unwrap(),
+				jwt_secret: SECRET.into(),
+				timeouts,
+				max_request_bytes: 1024 * 1024,
+				calls: Some(tx),
+			});
+			let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+			let base = format!("http://{}", listener.local_addr().unwrap());
+			tokio::spawn(async move { axum::serve(listener, router(proxy)).await.unwrap() });
+			Self {
+				base,
+				fake,
+				calls,
+				client: reqwest::Client::new(),
+			}
+		}
+
+		fn post(&self, path: &str, body: Value) -> reqwest::RequestBuilder {
+			self.client
+				.post(format!("{}{path}", self.base))
+				.bearer_auth(jwt::sign(&json!({"role": "service_role"}), SECRET))
+				.json(&body)
+		}
+
+		async fn call(&mut self) -> Call {
+			tokio::time::timeout(Duration::from_secs(5), self.calls.recv())
+				.await
+				.expect("a call is recorded")
+				.unwrap()
+		}
+	}
+
+	fn chat(model: &str, stream: bool) -> Value {
+		json!({"model": model, "stream": stream, "messages": [{"role": "user", "content": "hello there"}]})
+	}
+
+	/// The `data:` payloads of an SSE body, in order.
+	fn data_of(body: &str) -> Vec<String> {
+		body.split("\n\n")
+			.filter_map(|e| e.strip_prefix("data: "))
+			.map(String::from)
+			.collect()
+	}
+
+	#[tokio::test]
+	async fn a_whole_reply_passes_through_with_the_model_renamed() {
+		let mut s = Setup::new().await;
+		let response = s
+			.post("/ai/v1/chat/completions", chat("ok", false))
+			.send()
+			.await
+			.unwrap();
+		assert_eq!(response.status(), 200);
+		assert_eq!(response.headers()["x-psyche-provider"], "fake");
+		let body: Value = response.json().await.unwrap();
+		assert_eq!(
+			body["choices"][0]["message"]["content"],
+			"Hello from the fake."
+		);
+		assert_eq!(body["model"], "ok", "the reply carries the caller's name");
+		let seen = s.fake.last();
+		assert_eq!(seen.path, "/v1/chat/completions");
+		assert_eq!(
+			seen.body["model"], "fake-ok",
+			"the provider gets its own name for the model"
+		);
+		assert_eq!(seen.body["messages"][0]["content"], "hello there");
+		assert_eq!(
+			seen.authorization.as_deref(),
+			Some(format!("Bearer {}", Fake::KEY).as_str())
+		);
+		assert!(
+			seen.body.get("stream_options").is_none(),
+			"a whole reply is not asked for usage"
+		);
+		let call = s.call().await;
+		assert_eq!(call.outcome, Outcome::Completed);
+		assert_eq!(call.usage.unwrap().completion_tokens, 4);
+		assert!(!call.streamed);
+	}
+
+	#[tokio::test]
+	async fn a_stream_is_counted_without_handing_the_caller_a_chunk_it_did_not_ask_for() {
+		let mut s = Setup::new().await;
+		let response = s
+			.post("/v1/chat/completions", chat("ok", true))
+			.send()
+			.await
+			.unwrap();
+		assert_eq!(response.status(), 200);
+		assert_eq!(response.headers()["content-type"], "text/event-stream");
+		let body = response.text().await.unwrap();
+		let data = data_of(&body);
+		assert_eq!(data.last().unwrap(), "[DONE]");
+		let text: String = data
+			.iter()
+			.filter_map(|d| serde_json::from_str::<Value>(d).ok())
+			.filter_map(|v| {
+				v.pointer("/choices/0/delta/content")
+					.and_then(Value::as_str)
+					.map(String::from)
+			})
+			.collect();
+		assert_eq!(text, "Hello from the fake.");
+		assert!(
+			!body.contains("fake-ok"),
+			"every chunk carries the caller's name: {body}"
+		);
+		assert!(!body.contains("\"usage\""), "{body}");
+		assert_eq!(s.fake.last().body["stream_options"]["include_usage"], true);
+		let call = s.call().await;
+		assert_eq!(call.outcome, Outcome::Completed);
+		assert_eq!(call.usage.unwrap().completion_tokens, 4);
+	}
+
+	#[tokio::test]
+	async fn a_caller_that_asked_for_usage_gets_it() {
+		let mut s = Setup::new().await;
+		let mut request = chat("ok", true);
+		request["stream_options"] = json!({"include_usage": true});
+		let body = s
+			.post("/ai/v1/chat/completions", request)
+			.send()
+			.await
+			.unwrap()
+			.text()
+			.await
+			.unwrap();
+		assert!(body.contains("\"usage\""), "{body}");
+		assert_eq!(s.call().await.outcome, Outcome::Completed);
+	}
+
+	#[tokio::test]
+	async fn fim_keeps_its_suffix() {
+		// A gateway that drops `suffix` makes every completion duplicate the code after the cursor.
+		let mut s = Setup::new().await;
+		let request = json!({"model": "ok", "prompt": "SELECT id, ", "suffix": " FROM users;", "max_tokens": 16});
+		let response = s.post("/ai/v1/completions", request).send().await.unwrap();
+		assert_eq!(response.status(), 200);
+		let seen = s.fake.last();
+		assert_eq!(seen.path, "/v1/completions");
+		assert_eq!(seen.body["suffix"], " FROM users;");
+		assert_eq!(seen.body["prompt"], "SELECT id, ");
+		assert_eq!(s.call().await.operation, Operation::Completions);
+	}
+
+	#[tokio::test]
+	async fn models_lists_the_catalogue() {
+		let s = Setup::new().await;
+		let response = s
+			.client
+			.get(format!("{}/ai/v1/models", s.base))
+			.bearer_auth(jwt::sign(&json!({"role": "service_role"}), SECRET))
+			.send()
+			.await
+			.unwrap();
+		let body: Value = response.json().await.unwrap();
+		let ids: Vec<&str> = body["data"]
+			.as_array()
+			.unwrap()
+			.iter()
+			.map(|m| m["id"].as_str().unwrap())
+			.collect();
+		assert_eq!(ids[0], "ok");
+		assert_eq!(body["data"][0]["owned_by"], "fake");
+	}
+
+	#[tokio::test]
+	async fn callers_are_checked_before_anything_is_sent() {
+		let s = Setup::new().await;
+		let url = format!("{}/ai/v1/chat/completions", s.base);
+		let none = s
+			.client
+			.post(&url)
+			.json(&chat("ok", false))
+			.send()
+			.await
+			.unwrap();
+		assert_eq!(none.status(), 401);
+		let anon = s
+			.client
+			.post(&url)
+			.bearer_auth(jwt::sign(&json!({"role": "anon"}), SECRET))
+			.json(&chat("ok", false))
+			.send()
+			.await
+			.unwrap();
+		assert_eq!(anon.status(), 403);
+		let forged = s
+			.client
+			.post(&url)
+			.bearer_auth(jwt::sign(
+				&json!({"role": "service_role"}),
+				"another-secret-of-at-least-32-chars!",
+			))
+			.json(&chat("ok", false))
+			.send()
+			.await
+			.unwrap();
+		assert_eq!(forged.status(), 401);
+		// The apikey header works as the front door sends it.
+		let apikey = s
+			.client
+			.post(&url)
+			.header(
+				"apikey",
+				jwt::sign(&json!({"role": "service_role"}), SECRET),
+			)
+			.json(&chat("ok", false))
+			.send()
+			.await
+			.unwrap();
+		assert_eq!(apikey.status(), 200);
+		assert_eq!(
+			s.fake.count(),
+			1,
+			"only the authorised call reached the provider"
+		);
+
+		let unknown = s
+			.post("/ai/v1/chat/completions", chat("nope", false))
+			.send()
+			.await
+			.unwrap();
+		assert_eq!(unknown.status(), 404);
+		let body: Value = unknown.json().await.unwrap();
+		assert_eq!(body["error"]["code"], "model_not_found");
+		let bad = s
+			.client
+			.post(&url)
+			.bearer_auth(jwt::sign(&json!({"role": "service_role"}), SECRET))
+			.body("{not json")
+			.send()
+			.await
+			.unwrap();
+		assert_eq!(bad.status(), 400);
+		let huge = s
+			.post(
+				"/ai/v1/chat/completions",
+				json!({"model": "ok", "pad": "x".repeat(2 * 1024 * 1024)}),
+			)
+			.send()
+			.await
+			.unwrap();
+		assert_eq!(huge.status(), 413);
+	}
+
+	#[tokio::test]
+	async fn provider_failures_are_classified_and_never_leak_the_key() {
+		// Psyche holds the wrong key; the fake echoes what it was given, as OpenAI's 401 does.
+		let wrong = "sk-psyche-held-this-wrong-key-123456";
+		let mut s = Setup::with(wrong, Timeouts::default()).await;
+		let response = s
+			.post("/ai/v1/chat/completions", chat("ok", false))
+			.send()
+			.await
+			.unwrap();
+		assert_eq!(
+			response.status(),
+			502,
+			"a refused credential is not the caller's fault"
+		);
+		let body = response.text().await.unwrap();
+		assert!(!body.contains(wrong), "{body}");
+		assert!(body.contains("provider_auth"), "{body}");
+		assert_eq!(s.call().await.outcome, Outcome::Failed(Class::ProviderAuth));
+
+		let mut s = Setup::new().await;
+		let limited = s
+			.post("/ai/v1/chat/completions", chat("limited", false))
+			.send()
+			.await
+			.unwrap();
+		assert_eq!(limited.status(), 429);
+		assert_eq!(limited.headers()["retry-after"], "7");
+		assert_eq!(s.call().await.outcome, Outcome::Failed(Class::RateLimited));
+
+		let picky = s
+			.post("/ai/v1/chat/completions", chat("picky", false))
+			.send()
+			.await
+			.unwrap();
+		assert_eq!(
+			picky.status(),
+			400,
+			"the caller's own mistake keeps the provider's status"
+		);
+		let body: Value = picky.json().await.unwrap();
+		assert!(
+			body["error"]["message"]
+				.as_str()
+				.unwrap()
+				.contains("temperature"),
+			"{body}"
+		);
+		s.call().await;
+
+		let fails = s
+			.post("/ai/v1/chat/completions", chat("fails", true))
+			.send()
+			.await
+			.unwrap();
+		assert_eq!(fails.status(), 502);
+		assert_eq!(s.call().await.outcome, Outcome::Failed(Class::Upstream));
+	}
+
+	#[tokio::test]
+	async fn a_provider_that_never_answers_times_out() {
+		let timeouts = Timeouts {
+			first_byte: Duration::from_millis(300),
+			..Timeouts::default()
+		};
+		let mut s = Setup::with(Fake::KEY, timeouts).await;
+		let response = s
+			.post("/ai/v1/chat/completions", chat("hangs", false))
+			.send()
+			.await
+			.unwrap();
+		assert_eq!(response.status(), 504);
+		assert_eq!(s.call().await.outcome, Outcome::Failed(Class::Timeout));
+	}
+
+	#[tokio::test]
+	async fn a_stream_cut_halfway_ends_with_an_error_event() {
+		let mut s = Setup::new().await;
+		let response = s
+			.post("/ai/v1/chat/completions", chat("cut", true))
+			.send()
+			.await
+			.unwrap();
+		assert_eq!(response.status(), 200, "the first byte had gone out");
+		let body = response.text().await.unwrap();
+		let last = data_of(&body).pop().unwrap();
+		let error: Value = serde_json::from_str(&last).unwrap();
+		assert_eq!(error["error"]["code"], "transport", "{body}");
+		assert_eq!(s.call().await.outcome, Outcome::Failed(Class::Transport));
+	}
+
+	#[tokio::test]
+	async fn a_caller_that_goes_away_cancels_the_provider_call() {
+		let mut s = Setup::new().await;
+		let mut response = s
+			.post("/ai/v1/chat/completions", chat("slow", true))
+			.send()
+			.await
+			.unwrap();
+		let first = response.chunk().await.unwrap().unwrap();
+		assert!(!first.is_empty());
+		drop(response);
+		let call = s.call().await;
+		assert_eq!(call.outcome, Outcome::Cancelled);
+		// The fake sees its stream dropped, long before the 40 chunks it meant to send.
+		let deadline = Instant::now() + Duration::from_secs(3);
+		while s.fake.cancelled() == 0 {
+			assert!(
+				Instant::now() < deadline,
+				"the provider's stream was never dropped"
+			);
+			tokio::time::sleep(Duration::from_millis(20)).await;
+		}
+	}
+
+	/// The chunks of a translated stream, parsed.
+	fn chunks(body: &str) -> Vec<Value> {
+		data_of(body)
+			.iter()
+			.filter(|d| *d != "[DONE]")
+			.map(|d| serde_json::from_str(d).unwrap())
+			.collect()
+	}
+
+	fn breakpointed(model: &str) -> Value {
+		json!({"model": model, "messages": [
+			{"role": "system", "content": [{"type": "text", "text": "Schema.", "cache_control": {"type": "ephemeral"}}]},
+			{"role": "user", "content": "hello there", "cache_control": {"type": "ephemeral"}}
+		], "tools": [{"type": "function", "cache_control": {"type": "ephemeral"}, "function": {"name": "f"}}]})
+	}
+
+	#[tokio::test]
+	async fn an_openai_model_gets_a_breakpoint_only_if_it_caches() {
+		// A model that does not cache can refuse a request that carries a breakpoint.
+		let mut s = Setup::new().await;
+		let ok = s
+			.post("/ai/v1/chat/completions", breakpointed("ok"))
+			.send()
+			.await
+			.unwrap();
+		assert_eq!(ok.status(), 200);
+		let seen = s.fake.last().body;
+		assert!(!seen.to_string().contains("cache_control"), "{seen}");
+		assert_eq!(seen["messages"][0]["content"][0]["text"], "Schema.");
+		s.call().await;
+		s.post("/ai/v1/chat/completions", breakpointed("cached"))
+			.send()
+			.await
+			.unwrap();
+		let seen = s.fake.last().body;
+		assert_eq!(
+			seen,
+			{
+				let mut sent = breakpointed("cached");
+				sent["model"] = json!("fake-ok");
+				sent
+			},
+			"a model that caches gets the request as sent"
+		);
+	}
+
+	#[tokio::test]
+	async fn an_anthropic_model_answers_in_openai_s_shape() {
+		let mut s = Setup::new().await;
+		let response = s
+			.post("/ai/v1/chat/completions", breakpointed("claude"))
+			.send()
+			.await
+			.unwrap();
+		assert_eq!(response.status(), 200);
+		assert_eq!(response.headers()["x-psyche-provider"], "anthropic");
+		let body: Value = response.json().await.unwrap();
+		assert_eq!(body["object"], "chat.completion");
+		assert_eq!(
+			body["choices"][0]["message"]["content"],
+			"Hello from the fake."
+		);
+		assert_eq!(body["choices"][0]["finish_reason"], "stop");
+		assert_eq!(body["usage"]["prompt_tokens"], 129);
+		assert_eq!(body["usage"]["cache_read_input_tokens"], 100);
+		let seen = s.fake.last();
+		assert_eq!(seen.path, "/v1/messages");
+		assert_eq!(seen.api_key.as_deref(), Some(Fake::KEY));
+		assert_eq!(
+			seen.authorization, None,
+			"Anthropic takes its key in x-api-key only"
+		);
+		assert_eq!(seen.anthropic_version.as_deref(), Some(anthropic::VERSION));
+		assert_eq!(seen.body["system"][0]["cache_control"]["type"], "ephemeral");
+		assert_eq!(seen.body["max_tokens"], anthropic::DEFAULT_MAX_TOKENS);
+		let call = s.call().await;
+		assert_eq!(call.outcome, Outcome::Completed);
+		assert_eq!(call.usage.unwrap().cache_write_tokens, Some(20));
+
+		// A model the catalogue does not mark as caching gets no breakpoint on Anthropic either.
+		s.post("/ai/v1/chat/completions", breakpointed("claude-tool"))
+			.send()
+			.await
+			.unwrap();
+		assert!(!s.fake.last().body.to_string().contains("cache_control"));
+	}
+
+	#[tokio::test]
+	async fn an_anthropic_stream_is_translated_as_it_arrives() {
+		let mut s = Setup::new().await;
+		let mut request = chat("claude-tool", true);
+		request["stream_options"] = json!({"include_usage": true});
+		let response = s
+			.post("/ai/v1/chat/completions", request)
+			.send()
+			.await
+			.unwrap();
+		assert_eq!(response.status(), 200);
+		let body = response.text().await.unwrap();
+		assert!(body.ends_with("data: [DONE]\n\n"), "{body}");
+		assert!(body.contains(": ping\n\n"), "keep-alives pass through");
+		let chunks = chunks(&body);
+		let text: String = chunks
+			.iter()
+			.filter_map(|c| {
+				c.pointer("/choices/0/delta/content")
+					.and_then(Value::as_str)
+			})
+			.collect();
+		assert_eq!(text, "Let me look.");
+		let arguments: String = chunks
+			.iter()
+			.filter_map(|c| {
+				c.pointer("/choices/0/delta/tool_calls/0/function/arguments")
+					.and_then(Value::as_str)
+			})
+			.collect();
+		assert_eq!(
+			serde_json::from_str::<Value>(&arguments).unwrap()["sql"],
+			"select 1"
+		);
+		assert!(
+			chunks
+				.iter()
+				.any(|c| c["choices"][0]["finish_reason"] == "tool_calls")
+		);
+		let usage = chunks.last().unwrap();
+		assert_eq!(usage["usage"]["completion_tokens"], 4);
+		assert_eq!(s.fake.last().body["stream"], true);
+		let call = s.call().await;
+		assert_eq!(call.outcome, Outcome::Completed);
+		assert_eq!(call.usage.unwrap().prompt_tokens, 129);
+
+		// Without asking, no usage chunk, and the call is still counted.
+		let body = s
+			.post("/ai/v1/chat/completions", chat("claude", true))
+			.send()
+			.await
+			.unwrap()
+			.text()
+			.await
+			.unwrap();
+		assert!(!body.contains("\"usage\""), "{body}");
+		assert_eq!(s.call().await.usage.unwrap().completion_tokens, 4);
+	}
+
+	#[tokio::test]
+	async fn anthropic_failures() {
+		let mut s = Setup::new().await;
+		let overloaded = s
+			.post("/ai/v1/chat/completions", chat("claude-529", true))
+			.send()
+			.await
+			.unwrap();
+		assert_eq!(
+			overloaded.status(),
+			502,
+			"Anthropic's 529 is the provider failing"
+		);
+		let body: Value = overloaded.json().await.unwrap();
+		assert_eq!(body["error"]["code"], "upstream_error");
+		assert!(
+			body["error"]["message"]
+				.as_str()
+				.unwrap()
+				.contains("Overloaded")
+		);
+		assert_eq!(s.call().await.outcome, Outcome::Failed(Class::Upstream));
+
+		for model in ["claude-overloaded", "claude-truncated"] {
+			let body = s
+				.post("/ai/v1/chat/completions", chat(model, true))
+				.send()
+				.await
+				.unwrap()
+				.text()
+				.await
+				.unwrap();
+			let last: Value = serde_json::from_str(&data_of(&body).pop().unwrap()).unwrap();
+			assert_eq!(last["error"]["code"], "upstream_error", "{model}: {body}");
+			assert_eq!(
+				s.call().await.outcome,
+				Outcome::Failed(Class::Upstream),
+				"{model}"
+			);
+		}
+
+		let fim = s
+			.post(
+				"/ai/v1/completions",
+				json!({"model": "claude", "prompt": "SELECT "}),
+			)
+			.send()
+			.await
+			.unwrap();
+		assert_eq!(fim.status(), 400);
+		let refused = s
+			.post(
+				"/ai/v1/chat/completions",
+				json!({"model": "claude", "n": 3, "messages": [{"role": "user", "content": "hi"}]}),
+			)
+			.send()
+			.await
+			.unwrap();
+		assert_eq!(refused.status(), 400);
+		assert_eq!(s.fake.count(), 3, "nothing untranslatable was sent");
+	}
+
+	#[tokio::test]
+	async fn a_bedrock_model_signed_with_sigv4() {
+		// The fake checks the signature against the request as it arrived, so this passes only if
+		// what Psyche signs (host and port, the path with `:` encoded, the body) is what it sends.
+		let mut s = Setup::new().await;
+		let response = s
+			.post("/ai/v1/chat/completions", chat("qwen", false))
+			.send()
+			.await
+			.unwrap();
+		assert_eq!(response.status(), 200);
+		assert_eq!(response.headers()["x-psyche-provider"], "bedrock");
+		let body: Value = response.json().await.unwrap();
+		assert_eq!(body["model"], "qwen");
+		assert_eq!(
+			body["choices"][0]["message"]["content"],
+			"Hello from the fake."
+		);
+		assert_eq!(body["choices"][0]["finish_reason"], "stop");
+		assert_eq!(body["usage"]["prompt_tokens"], 129);
+		assert!(body["id"].as_str().unwrap().starts_with("chatcmpl-"));
+		let seen = s.fake.last();
+		assert_eq!(seen.path, "/model/fake.qwen%3A0/converse");
+		assert!(
+			seen.authorization
+				.unwrap()
+				.starts_with("AWS4-HMAC-SHA256 Credential=AKIDFAKEPROVIDER/")
+		);
+		assert_eq!(
+			seen.body["messages"][0]["content"][0]["text"],
+			"hello there"
+		);
+		assert!(seen.body.get("model").is_none());
+		let call = s.call().await;
+		assert_eq!(call.outcome, Outcome::Completed);
+		assert_eq!(call.usage.unwrap().cached_tokens, Some(100));
+
+		// The same signature made with a secret the provider does not hold is refused, and that is
+		// Psyche's credential failing, not the caller's.
+		let wrong = s
+			.post("/ai/v1/chat/completions", chat("bedrock-wrong", false))
+			.send()
+			.await
+			.unwrap();
+		assert_eq!(wrong.status(), 502);
+		let body: Value = wrong.json().await.unwrap();
+		assert_eq!(body["error"]["code"], "provider_auth");
+		assert!(!body.to_string().contains("a-secret-the-fake"));
+	}
+
+	#[tokio::test]
+	async fn a_bedrock_stream_with_a_tool_call() {
+		let mut s = Setup::new().await;
+		let mut request = chat("bedrock-tool", true);
+		request["stream_options"] = json!({"include_usage": true});
+		let response = s
+			.post("/ai/v1/chat/completions", request)
+			.send()
+			.await
+			.unwrap();
+		assert_eq!(response.status(), 200);
+		assert_eq!(response.headers()["content-type"], "text/event-stream");
+		let body = response.text().await.unwrap();
+		assert!(body.ends_with("data: [DONE]\n\n"), "{body}");
+		let chunks = chunks(&body);
+		let text: String = chunks
+			.iter()
+			.filter_map(|c| {
+				c.pointer("/choices/0/delta/content")
+					.and_then(Value::as_str)
+			})
+			.collect();
+		assert_eq!(text, "Let me look.");
+		let arguments: String = chunks
+			.iter()
+			.filter_map(|c| {
+				c.pointer("/choices/0/delta/tool_calls/0/function/arguments")
+					.and_then(Value::as_str)
+			})
+			.collect();
+		assert_eq!(
+			serde_json::from_str::<Value>(&arguments).unwrap()["sql"],
+			"select 1"
+		);
+		assert!(
+			chunks
+				.iter()
+				.any(|c| c["choices"][0]["finish_reason"] == "tool_calls")
+		);
+		assert_eq!(chunks.last().unwrap()["usage"]["completion_tokens"], 4);
+		let ids: std::collections::HashSet<&str> =
+			chunks.iter().filter_map(|c| c["id"].as_str()).collect();
+		assert_eq!(ids.len(), 1, "one id for the whole stream");
+		let seen = s.fake.last();
+		assert_eq!(seen.path, "/model/fake-tool/converse-stream");
+		assert_eq!(
+			seen.authorization.as_deref(),
+			Some(format!("Bearer {}", Fake::KEY).as_str()),
+			"a Bedrock API key"
+		);
+		let call = s.call().await;
+		assert_eq!(call.outcome, Outcome::Completed);
+		assert_eq!(call.usage.unwrap().prompt_tokens, 129);
+	}
+
+	#[tokio::test]
+	async fn a_bedrock_model_that_caches_by_itself_never_sees_a_cache_point() {
+		// gpt-5.6-luna on Bedrock refused every request carrying a cache point.
+		let mut s = Setup::new().await;
+		let ok = s
+			.post("/ai/v1/chat/completions", breakpointed("luna"))
+			.send()
+			.await
+			.unwrap();
+		assert_eq!(ok.status(), 200, "{}", ok.text().await.unwrap());
+		assert!(!s.fake.last().body.to_string().contains("cachePoint"));
+		s.call().await;
+		// The fake refuses one as the real model does: a catalogue that says otherwise is wrong.
+		let refused = s
+			.post(
+				"/ai/v1/chat/completions",
+				breakpointed("luna-marked-caching"),
+			)
+			.send()
+			.await
+			.unwrap();
+		assert_eq!(refused.status(), 400);
+		let body: Value = refused.json().await.unwrap();
+		assert!(
+			body["error"]["message"]
+				.as_str()
+				.unwrap()
+				.contains("prompt caching"),
+			"{body}"
+		);
+		assert_eq!(s.call().await.outcome, Outcome::Failed(Class::Rejected));
+	}
+
+	#[tokio::test]
+	async fn bedrock_failures() {
+		let mut s = Setup::new().await;
+		for model in ["bedrock-throttle", "bedrock-unavailable"] {
+			let response = s
+				.post("/ai/v1/chat/completions", chat(model, false))
+				.send()
+				.await
+				.unwrap();
+			assert_eq!(response.status(), 429, "{model}: a limit to route around");
+			let body: Value = response.json().await.unwrap();
+			assert_eq!(body["error"]["code"], "rate_limited", "{model}");
+			assert_eq!(s.call().await.outcome, Outcome::Failed(Class::RateLimited));
+		}
+		for (model, code, class) in [
+			(
+				"bedrock-stream-throttle",
+				"rate_limited",
+				Class::RateLimited,
+			),
+			("bedrock-truncated", "upstream_error", Class::Upstream),
+		] {
+			let body = s
+				.post("/ai/v1/chat/completions", chat(model, true))
+				.send()
+				.await
+				.unwrap()
+				.text()
+				.await
+				.unwrap();
+			assert!(body.contains("Hello "), "the reply started: {body}");
+			let last: Value = serde_json::from_str(&data_of(&body).pop().unwrap()).unwrap();
+			assert_eq!(last["error"]["code"], code, "{model}: {body}");
+			assert_eq!(s.call().await.outcome, Outcome::Failed(class), "{model}");
+		}
+		let fim = s
+			.post(
+				"/ai/v1/completions",
+				json!({"model": "qwen", "prompt": "SELECT "}),
+			)
+			.send()
+			.await
+			.unwrap();
+		assert_eq!(fim.status(), 400);
+	}
+
+	/// The first number of each vector, which the fake makes its text's length.
+	fn firsts(body: &Value) -> Vec<f64> {
+		body["data"]
+			.as_array()
+			.unwrap()
+			.iter()
+			.enumerate()
+			.map(|(i, d)| {
+				assert_eq!(d["index"], i);
+				d["embedding"][0].as_f64().unwrap()
+			})
+			.collect()
+	}
+
+	#[tokio::test]
+	async fn embeddings_pass_through_to_an_openai_style_provider() {
+		let mut s = Setup::new().await;
+		let request = json!({"model": "embed", "input": ["one", "two words"], "encoding_format": "float", "user": "u1"});
+		let response = s.post("/ai/v1/embeddings", request).send().await.unwrap();
+		assert_eq!(response.status(), 200);
+		let body: Value = response.json().await.unwrap();
+		assert_eq!(body["model"], "embed");
+		assert_eq!(firsts(&body), vec![3.0, 9.0]);
+		let seen = s.fake.last();
+		assert_eq!(seen.path, "/v1/embeddings");
+		assert_eq!(
+			seen.body,
+			json!({"model": "fake-embed", "input": ["one", "two words"], "encoding_format": "float", "user": "u1"})
+		);
+		let call = s.call().await;
+		assert_eq!(call.operation, Operation::Embeddings);
+		assert_eq!(call.usage.unwrap().prompt_tokens, 3);
+	}
+
+	#[tokio::test]
+	async fn titan_embeds_each_text_in_its_own_signed_call_and_keeps_the_order() {
+		let mut s = Setup::new().await;
+		let texts: Vec<String> = (1..=20)
+			.map(|n| "w ".repeat(n).trim().to_string())
+			.collect();
+		let response = s
+			.post(
+				"/ai/v1/embeddings",
+				json!({"model": "titan", "input": texts, "dimensions": 3}),
+			)
+			.send()
+			.await
+			.unwrap();
+		assert_eq!(response.status(), 200);
+		assert_eq!(response.headers()["x-psyche-provider"], "bedrock");
+		let body: Value = response.json().await.unwrap();
+		let expected: Vec<f64> = texts.iter().map(|t| t.len() as f64).collect();
+		assert_eq!(firsts(&body), expected);
+		assert_eq!(body["data"][0]["embedding"].as_array().unwrap().len(), 3);
+		assert_eq!(body["usage"]["prompt_tokens"], 210);
+		let seen = s.fake.since(0);
+		assert_eq!(seen.len(), 20);
+		assert!(seen.iter().all(|r| {
+			r.path == "/model/amazon.titan-embed-text-v2%3A0/invoke"
+				&& r.authorization
+					.as_deref()
+					.unwrap_or("")
+					.starts_with("AWS4-HMAC-SHA256")
+		}));
+		assert_eq!(seen[0].body["dimensions"], 3);
+		let call = s.call().await;
+		assert_eq!(call.outcome, Outcome::Completed);
+		assert_eq!(call.usage.unwrap().prompt_tokens, 210);
+
+		// base64 is the vector's numbers as little-endian f32s, OpenAI's form.
+		let body: Value = s
+			.post(
+				"/ai/v1/embeddings",
+				json!({"model": "titan", "input": "four", "encoding_format": "base64", "dimensions": 2}),
+			)
+			.send()
+			.await
+			.unwrap()
+			.json()
+			.await
+			.unwrap();
+		use base64::Engine;
+		let bytes = base64::engine::general_purpose::STANDARD
+			.decode(body["data"][0]["embedding"].as_str().unwrap())
+			.unwrap();
+		assert_eq!(
+			bytes,
+			[4.0f32.to_le_bytes(), 0.25f32.to_le_bytes()].concat()
+		);
+	}
+
+	#[tokio::test]
+	async fn cohere_takes_texts_in_batches_and_its_own_refusals_reach_the_caller() {
+		let mut s = Setup::new().await;
+		let texts: Vec<String> = (0..100).map(|i| format!("text number {i}")).collect();
+		let response = s
+			.post(
+				"/ai/v1/embeddings",
+				json!({"model": "cohere", "input": texts}),
+			)
+			.send()
+			.await
+			.unwrap();
+		assert_eq!(response.status(), 200);
+		let body: Value = response.json().await.unwrap();
+		let expected: Vec<f64> = texts.iter().map(|t| t.len() as f64).collect();
+		assert_eq!(firsts(&body), expected);
+		assert_eq!(body["usage"]["prompt_tokens"], 300);
+		let seen = s.fake.since(0);
+		assert_eq!(seen.len(), 2);
+		assert_eq!(seen[0].path, "/model/cohere.embed-english-v3/invoke");
+		assert_eq!(seen[0].body["texts"].as_array().unwrap().len(), 96);
+		assert_eq!(seen[0].body["input_type"], "search_document");
+		assert_eq!(s.call().await.outcome, Outcome::Completed);
+
+		// v3 has no output_dimension, and says so itself; the caller gets Bedrock's 400.
+		let response = s
+			.post(
+				"/ai/v1/embeddings",
+				json!({"model": "cohere", "input": "q", "input_type": "search_query", "dimensions": 256}),
+			)
+			.send()
+			.await
+			.unwrap();
+		assert_eq!(response.status(), 400);
+		let body: Value = response.json().await.unwrap();
+		assert!(
+			body["error"]["message"]
+				.as_str()
+				.unwrap()
+				.contains("output_dimension")
+		);
+		assert_eq!(s.fake.last().body["input_type"], "search_query");
+		assert_eq!(s.call().await.outcome, Outcome::Failed(Class::Rejected));
+
+		let response = s
+			.post(
+				"/ai/v1/embeddings",
+				json!({"model": "cohere-throttle", "input": "q"}),
+			)
+			.send()
+			.await
+			.unwrap();
+		assert_eq!(response.status(), 429);
+		assert_eq!(s.call().await.outcome, Outcome::Failed(Class::RateLimited));
+	}
+
+	#[tokio::test]
+	async fn embeddings_that_cannot_be_sent_are_refused_before_anything_is() {
+		let s = Setup::new().await;
+		for (request, says) in [
+			(
+				json!({"model": "titan", "input": "a", "stream": true}),
+				"not streamed",
+			),
+			(
+				json!({"model": "claude", "input": "a"}),
+				"no embeddings API",
+			),
+			(
+				json!({"model": "qwen", "input": "a"}),
+				"not an embedding model",
+			),
+			(json!({"model": "titan", "input": [[1, 2]]}), "Token ids"),
+			(
+				json!({"model": "titan", "input": "a", "input_type": "search_query"}),
+				"Cohere's",
+			),
+		] {
+			let response = s.post("/ai/v1/embeddings", request).send().await.unwrap();
+			assert_eq!(response.status(), 400, "{says}");
+			let body: Value = response.json().await.unwrap();
+			assert!(
+				body["error"]["message"].as_str().unwrap().contains(says),
+				"{body}"
+			);
+		}
+		assert_eq!(s.fake.count(), 0);
+	}
+}

@@ -1,0 +1,38 @@
+# snout-psyche's fuzz targets, run by scripts/fuzz.sh with cargo-fuzz on a pinned nightly.
+# Its own workspace, so the nightly-only libFuzzer build never touches the crate's.
+[package]
+name = "snout-psyche-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+snout-psyche = { path = ".." }
+tokio = { version = "1", features = ["rt", "io-util"] }
+
+[workspace]
+
+[[bin]]
+name = "psyche_request"
+path = "fuzz_targets/psyche_request.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "psyche_sse"
+path = "fuzz_targets/psyche_sse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "psyche_token"
+path = "fuzz_targets/psyche_token.rs"
+test = false
+doc = false
+bench = false
