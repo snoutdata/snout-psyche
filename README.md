@@ -184,9 +184,12 @@ to one that a budget covers is refused.
 
 Spend is held in memory, per day, and read at start from `psyche.usage_daily` (which keeps each
 key's totals for good), so a restart resumes where it was. What it can miss, stated rather than
-hidden: the rows a crash did not write (see the request log), and a reply with no cap at all (an
-OpenAI-style provider called without `max_tokens`, for a model with no `max_output_tokens`), which
-is reserved at 4,096 tokens and can run past that once. Measured against the fake provider, 300
+hidden: the rows a crash did not write (see the request log). A reply is never left uncapped under
+a hard budget: when the caller names no `max_tokens` and the model's entry no `max_output_tokens`,
+Psyche sends a cap of 4,096 tokens (the one Anthropic always gets), or less when that is all the
+tightest budget has room for, down to 256, below which the call is refused. It goes as
+`max_completion_tokens` to OpenAI's own API and Azure's, and as `max_tokens` everywhere else. A soft
+budget sends none. Measured against the fake provider, 300
 calls at once on a key with a $0.001 day: 18 answered, 282 refused, $0.000342 spent. The bound is
 generous where prompts are short, so near its end a budget refuses some calls that would have fit.
 

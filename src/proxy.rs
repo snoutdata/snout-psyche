@@ -48,7 +48,7 @@ use crate::keys::{self, Key, KeyId, Refusal};
 use crate::limits::{self, Limits, Taken};
 use crate::net;
 use crate::price::{Dollars, Price};
-use crate::providers::{Catalogue, Kind, Model};
+use crate::providers::{Catalogue, Kind, Model, Provider};
 use crate::sse::{Event, Parser};
 use crate::translate::{Out, Translator};
 use crate::usage::Usage;
@@ -289,6 +289,33 @@ fn output_cap(inbound: &Inbound, upstream: &[u8], model: &Model) -> u64 {
 	})
 	.or(model.max_output_tokens)
 	.unwrap_or(budgets::UNCAPPED_OUTPUT)
+}
+
+/// A call's worst-case cost: every prompt token at the dearer of the plain and cache-write prices,
+/// and `output` reply tokens.
+fn worst(price: &Price, prompt: u64, output: u64) -> u64 {
+	let at = |write: bool| {
+		price.cost(&Usage {
+			prompt_tokens: prompt,
+			completion_tokens: output,
+			cache_write_tokens: write.then_some(prompt),
+			..Usage::default()
+		})
+	};
+	at(false).max(at(true))
+}
+
+/// Where a reply cap goes in what the caller sent, so each translation carries it on: OpenAI's own
+/// API (and Azure's) refuse `max_tokens` for reasoning models and take `max_completion_tokens`;
+/// the legacy completions API and the other OpenAI-style servers take `max_tokens`.
+fn cap_field(provider: &Provider, operation: Operation) -> &'static str {
+	let host = provider.base_url.host_str().unwrap_or("");
+	let openai = host == "api.openai.com" || host.ends_with(".openai.azure.com");
+	if provider.kind == Kind::Openai && operation == Operation::Chat && openai {
+		"max_completion_tokens"
+	} else {
+		"max_tokens"
+	}
 }
 
 /// The soft budgets a reservation goes over, for the response's header.
@@ -856,20 +883,38 @@ impl Proxy {
 				),
 			));
 		};
-		// The worst case: every prompt token at the dearer of the plain and cache-write prices.
-		let worst = |write: bool| {
-			price.cost(&Usage {
-				prompt_tokens: prompt,
-				completion_tokens: output,
-				cache_write_tokens: write.then_some(prompt),
-				..Usage::default()
-			})
-		};
-		let amount = worst(false).max(worst(true));
+		let amount = worst(&price, prompt, output);
 		budgets
 			.reserve(key, amount, SystemTime::now())
 			.map(Some)
 			.map_err(|over| ApiError::new(Class::Budget, over.message))
+	}
+
+	/// The reply cap to send for a call that names none, when a hard budget applies: the default, or
+	/// what the tightest budget still has room for after the prompt if that is less. A cap below
+	/// [`budgets::MIN_SENT_OUTPUT`] is not shrunk to, so a call with less room is refused instead.
+	fn sent_cap(
+		&self,
+		key: Option<KeyId>,
+		inbound: &Inbound,
+		model: &Model,
+		prompt_bound: Option<u64>,
+	) -> Option<u64> {
+		let named = ["max_tokens", "max_completion_tokens"]
+			.iter()
+			.any(|f| inbound.body.get(*f).is_some_and(|v| !v.is_null()));
+		if named || model.max_output_tokens.is_some() {
+			return None;
+		}
+		let room = self.budgets.as_ref()?.room(key, SystemTime::now())?;
+		let (price, prompt) = (model.price?, prompt_bound?);
+		let base = worst(&price, prompt, 0);
+		let per_token = worst(&price, prompt, 1).saturating_sub(base);
+		let fits = room
+			.saturating_sub(base)
+			.checked_div(per_token)
+			.unwrap_or(budgets::UNCAPPED_OUTPUT);
+		Some(fits.clamp(budgets::MIN_SENT_OUTPUT, budgets::UNCAPPED_OUTPUT))
 	}
 
 	/// The caller, from `Authorization: Bearer` or the `apikey` header (the front door sends both):
@@ -937,7 +982,7 @@ impl Proxy {
 			error.status = Some(rejection.status());
 			error
 		})?;
-		let inbound = Inbound::parse(&body)?;
+		let mut inbound = Inbound::parse(&body)?;
 		let model = self
 			.catalogue
 			.model(&inbound.model)
@@ -989,6 +1034,13 @@ impl Proxy {
 					return Ok(headed(warn(labelled(out, &model), warned), rate));
 				}
 			}
+		}
+		// Under a hard budget a reply is never left uncapped: the provider is told the most it may
+		// write, which is what is reserved.
+		if budgeted && let Some(cap) = self.sent_cap(key, &inbound, &model, prompt_bound) {
+			inbound
+				.body
+				.insert(cap_field(provider, operation).into(), cap.into());
 		}
 		let body = inbound.upstream(&model, operation)?;
 		let output = match operation {
@@ -2291,6 +2343,123 @@ mod tests {
 			.unwrap();
 		assert_eq!(unpriced.status(), 429);
 		assert!(unpriced.text().await.unwrap().contains("has no price"));
+	}
+
+	#[tokio::test]
+	async fn an_uncapped_reply_under_a_hard_budget_is_sent_a_cap_that_fits() {
+		let Some((s, _db, key, id)) = with_budgets("budget_cap").await else {
+			return;
+		};
+		let call = |key: String, body: Value| {
+			let s = &s;
+			async move {
+				let reply = s
+					.client
+					.post(format!("{}/ai/v1/chat/completions", s.base))
+					.bearer_auth(key)
+					.json(&body)
+					.send()
+					.await
+					.unwrap();
+				let status = reply.status().as_u16();
+				reply.text().await.unwrap();
+				(status, s.fake.last().body)
+			}
+		};
+		let budget = |name: &str, amount: f64, hard: bool, key_id: &str| {
+			s.post(
+				"/ai/v1/admin/budgets",
+				json!({"name": name, "amount": amount, "period": "day", "hard": hard, "key_id": key_id}),
+			)
+			.send()
+		};
+
+		// No budget: nothing is added.
+		let (status, seen) = call(key.clone(), chat("ok-priced", false)).await;
+		assert_eq!(status, 200);
+		assert!(seen.get("max_tokens").is_none());
+
+		// A soft budget never refuses, so it adds nothing either.
+		assert_eq!(
+			budget("soft", 0.001, false, &id).await.unwrap().status(),
+			201
+		);
+		let (_, seen) = call(key.clone(), chat("ok-priced", false)).await;
+		assert!(seen.get("max_tokens").is_none());
+
+		// A roomy hard budget: the default cap, the one Anthropic is always sent.
+		assert_eq!(
+			budget("roomy", 10.0, true, &id).await.unwrap().status(),
+			201
+		);
+		let (status, seen) = call(key.clone(), chat("ok-priced", false)).await;
+		assert_eq!(status, 200);
+		assert_eq!(seen["max_tokens"], budgets::UNCAPPED_OUTPUT);
+		assert!(seen.get("max_completion_tokens").is_none());
+		// The caller's own cap is left alone.
+		let mut capped = chat("ok-priced", false);
+		capped["max_tokens"] = json!(12);
+		let (_, seen) = call(key.clone(), capped).await;
+		assert_eq!(seen["max_tokens"], 12);
+
+		// A tight one: $0.001 at $1 in and $2.50 out per million leaves room for a few hundred
+		// tokens after the prompt's bound, so the cap shrinks to fit and the call still runs.
+		let made: Value = s
+			.post("/ai/v1/admin/keys", json!({"name": "tight"}))
+			.send()
+			.await
+			.unwrap()
+			.json()
+			.await
+			.unwrap();
+		let tight = made["key"].as_str().unwrap().to_string();
+		let tight_id = made["id"].as_str().unwrap();
+		assert_eq!(
+			budget("tight", 0.001, true, tight_id)
+				.await
+				.unwrap()
+				.status(),
+			201
+		);
+		let (status, seen) = call(tight.clone(), chat("ok-priced", false)).await;
+		assert_eq!(status, 200);
+		let cap = seen["max_tokens"].as_u64().unwrap();
+		assert!(
+			(budgets::MIN_SENT_OUTPUT..budgets::UNCAPPED_OUTPUT).contains(&cap),
+			"{cap}"
+		);
+
+		// Under the shortest cap worth sending, the call is refused and never sent.
+		let sent = s.fake.count();
+		let mut long = chat("ok-priced", false);
+		long["messages"][0]["content"] = json!("x".repeat(400_000));
+		let (status, _) = call(tight, long).await;
+		assert_eq!(status, 429);
+		assert_eq!(s.fake.count(), sent);
+	}
+
+	#[test]
+	fn openai_s_own_api_takes_max_completion_tokens_and_the_rest_max_tokens() {
+		let provider = |kind: Kind, base: &str| Provider {
+			name: "p".into(),
+			kind,
+			base_url: url::Url::parse(base).unwrap(),
+			api_key: None,
+			aws: None,
+			region: None,
+		};
+		let openai = provider(Kind::Openai, "https://api.openai.com/v1");
+		assert_eq!(cap_field(&openai, Operation::Chat), "max_completion_tokens");
+		assert_eq!(cap_field(&openai, Operation::Completions), "max_tokens");
+		let azure = provider(Kind::Openai, "https://acme.openai.azure.com/openai/v1");
+		assert_eq!(cap_field(&azure, Operation::Chat), "max_completion_tokens");
+		let vllm = provider(Kind::Openai, "http://10.0.0.2:8000/v1");
+		assert_eq!(cap_field(&vllm, Operation::Chat), "max_tokens");
+		let bedrock = provider(
+			Kind::Bedrock,
+			"https://bedrock-runtime.us-west-2.amazonaws.com",
+		);
+		assert_eq!(cap_field(&bedrock, Operation::Chat), "max_tokens");
 	}
 
 	#[tokio::test]

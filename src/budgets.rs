@@ -15,11 +15,12 @@
 //! unspent; and a call whose provider reported no usage is charged its whole reservation here,
 //! but logged with no cost, so a restart forgets that charge.
 //!
-//! Two limits on "no overshoot", both written down rather than hidden: a soft budget never refuses
-//! (it is reported in the `x-psyche-budget-warning` header), and a call whose reply has no cap
-//! (an OpenAI-style provider asked without `max_tokens`, and no `max_output_tokens` in the model's
-//! entry) is reserved at [`UNCAPPED_OUTPUT`] tokens, so such a reply can overrun by the rest of
-//! itself, once, before the next call is refused.
+//! A reply with no cap of its own (the caller named none, and the model's entry names no
+//! `max_output_tokens`) is sent one when a hard budget applies: [`UNCAPPED_OUTPUT`] tokens, or what
+//! the tightest hard budget still has room for if that is less, so the provider cannot run past what
+//! was reserved. One limit on "no overshoot" is written down rather than hidden: a soft budget never
+//! refuses (it is reported in the `x-psyche-budget-warning` header), and a call under soft budgets
+//! only is sent no cap and reserved at [`UNCAPPED_OUTPUT`].
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -30,8 +31,13 @@ use crate::price::{Dollars, PICO};
 
 /// How far back spend is held: the longest window a budget may have.
 pub const HISTORY_DAYS: u32 = 366;
-/// The reply length reserved for a call that names no cap and whose model's entry names none.
+/// The reply cap sent, under a hard budget, for a call that names none and whose model's entry
+/// names none; and what such a call is reserved at under soft budgets. The same 4096 Anthropic is
+/// always sent (`anthropic::DEFAULT_MAX_TOKENS`).
 pub const UNCAPPED_OUTPUT: u64 = 4096;
+/// The shortest cap sent when a hard budget is nearly spent. A call whose prompt leaves less room
+/// than this is refused rather than sent for a reply too short to use.
+pub const MIN_SENT_OUTPUT: u64 = 256;
 
 const SECONDS_PER_DAY: u64 = 86_400;
 
@@ -156,6 +162,27 @@ impl Budgets {
 		let mut ledger = self.ledger();
 		let bucket = ledger.spent.entry((subject, day)).or_insert(0);
 		*bucket = bucket.saturating_add(picodollars);
+	}
+
+	/// What the tightest hard budget over a call by `key` still has room for, in picodollars;
+	/// `None` when no hard budget applies.
+	pub fn room(&self, key: Option<KeyId>, now: SystemTime) -> Option<u64> {
+		let today = day_of(now);
+		let subjects = subjects(key);
+		let ledger = self.ledger();
+		ledger
+			.budgets
+			.iter()
+			.filter(|b| b.hard && subjects.contains(&b.subject))
+			.map(|b| {
+				let reserved = ledger.reserved.get(&b.subject).copied().unwrap_or(0);
+				b.limit.saturating_sub(
+					ledger
+						.spent(b.subject, b.period, today)
+						.saturating_add(reserved),
+				)
+			})
+			.min()
 	}
 
 	/// Reserves `amount` picodollars for a call by `key`, or refuses it. A soft budget it would not
@@ -420,6 +447,34 @@ mod tests {
 		// Settled at what it really cost, the room comes back.
 		first.settle(Some(PICO / 10), now);
 		assert!(budgets.reserve(Some(key), PICO * 6 / 10, now).is_ok());
+	}
+
+	#[test]
+	fn room_is_the_tightest_hard_budget_less_what_is_spent_and_held() {
+		let budgets = Budgets::default();
+		let key = KeyId([7; 16]);
+		let now = SystemTime::now();
+		assert_eq!(budgets.room(Some(key), now), None);
+		budgets.replace(vec![
+			budget("soft", Subject::Key(key), 1, Period::Day, false),
+			budget("project", Subject::Project, 5, Period::Month, true),
+			budget("key", Subject::Key(key), 2, Period::Day, true),
+		]);
+		assert_eq!(budgets.room(Some(key), now), Some(2 * PICO));
+		assert_eq!(budgets.room(None, now), Some(5 * PICO));
+		let held = budgets.reserve(Some(key), PICO / 2, now).unwrap();
+		assert_eq!(budgets.room(Some(key), now), Some(PICO * 3 / 2));
+		held.settle(Some(PICO), now);
+		assert_eq!(budgets.room(Some(key), now), Some(PICO));
+		assert_eq!(budgets.room(None, now), Some(4 * PICO));
+		budgets.replace(vec![budget(
+			"soft",
+			Subject::Project,
+			1,
+			Period::Day,
+			false,
+		)]);
+		assert_eq!(budgets.room(None, now), None, "a soft budget sets no room");
 	}
 
 	#[test]
