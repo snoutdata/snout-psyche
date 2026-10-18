@@ -34,6 +34,8 @@ pub enum Class {
 	Transport,
 	/// The egress rules refused the provider's address (`net.rs`).
 	EgressRefused,
+	/// A hard budget has no room for the call (`budgets.rs`); nothing was sent.
+	Budget,
 }
 
 impl Class {
@@ -50,6 +52,7 @@ impl Class {
 			Class::Timeout => "timeout",
 			Class::Transport => "transport",
 			Class::EgressRefused => "egress_refused",
+			Class::Budget => "budget_exceeded",
 		}
 	}
 
@@ -60,6 +63,8 @@ impl Class {
 			Class::Unauthorized => "authentication_error",
 			Class::Forbidden => "permission_error",
 			Class::RateLimited => "rate_limit_error",
+			// OpenAI's name for a spending limit reached, which clients already handle.
+			Class::Budget => "insufficient_quota",
 			_ => "api_error",
 		}
 	}
@@ -70,7 +75,7 @@ impl Class {
 			Class::Unauthorized => StatusCode::UNAUTHORIZED,
 			Class::Forbidden => StatusCode::FORBIDDEN,
 			Class::ModelNotFound => StatusCode::NOT_FOUND,
-			Class::RateLimited => StatusCode::TOO_MANY_REQUESTS,
+			Class::RateLimited | Class::Budget => StatusCode::TOO_MANY_REQUESTS,
 			Class::Timeout => StatusCode::GATEWAY_TIMEOUT,
 			Class::ProviderAuth | Class::Upstream | Class::Transport | Class::EgressRefused => {
 				StatusCode::BAD_GATEWAY

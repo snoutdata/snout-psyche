@@ -22,7 +22,7 @@ pub const RELOAD_EVERY: Duration = Duration::from_secs(60);
 const RECONNECT_AFTER: Duration = Duration::from_secs(5);
 
 /// A key's id, a uuid.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct KeyId(pub [u8; 16]);
 
 impl KeyId {
@@ -210,10 +210,15 @@ pub async fn load(client: &Client) -> Result<HashMap<Hash, Arc<Key>>, tokio_post
 /// Keeps `store` in step with `psyche.keys` for as long as the process runs: loads it, then
 /// reloads on every `psyche_changed` and every [`RELOAD_EVERY`], reconnecting when the connection
 /// is lost. `ready` is told after the first load.
-pub async fn watch(url: String, store: Store, ready: Option<tokio::sync::oneshot::Sender<()>>) {
+pub async fn watch(
+	url: String,
+	store: Store,
+	budgets: Option<crate::budgets::Budgets>,
+	ready: Option<tokio::sync::oneshot::Sender<()>>,
+) {
 	let mut ready = ready;
 	loop {
-		if let Err(error) = listen(&url, &store, &mut ready).await {
+		if let Err(error) = listen(&url, &store, budgets.as_ref(), &mut ready).await {
 			tracing::warn!(error = %crate::db_message(&error), "the keys' connection failed; the keys held are kept until it is back");
 		}
 		tokio::time::sleep(RECONNECT_AFTER).await;
@@ -223,8 +228,18 @@ pub async fn watch(url: String, store: Store, ready: Option<tokio::sync::oneshot
 async fn listen(
 	url: &str,
 	store: &Store,
+	budgets: Option<&crate::budgets::Budgets>,
 	ready: &mut Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<(), tokio_postgres::Error> {
+	// Keys and budgets are reloaded together: there are few of each, and one notification name
+	// serves every table.
+	let reload = async |client: &Client| -> Result<(), tokio_postgres::Error> {
+		store.replace(load(client).await?);
+		if let Some(budgets) = budgets {
+			budgets.replace(crate::budgets::load(client).await?);
+		}
+		Ok(())
+	};
 	let mut config: tokio_postgres::Config = url.parse()?;
 	config.application_name("snout-psyche keys");
 	let (client, mut connection) = config.connect(NoTls).await?;
@@ -248,7 +263,7 @@ async fn listen(
 	});
 	let result = async {
 		client.batch_execute("LISTEN psyche_changed").await?;
-		store.replace(load(&client).await?);
+		reload(&client).await?;
 		if let Some(ready) = ready.take() {
 			let _ = ready.send(());
 		}
@@ -265,7 +280,7 @@ async fn listen(
 				}
 				_ = tick.tick() => {}
 			}
-			store.replace(load(&client).await?);
+			reload(&client).await?;
 		}
 	}
 	.await;

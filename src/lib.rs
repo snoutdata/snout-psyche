@@ -12,6 +12,7 @@
 
 pub mod anthropic;
 pub mod bedrock;
+pub mod budgets;
 pub mod config;
 pub mod embeddings;
 pub mod error;

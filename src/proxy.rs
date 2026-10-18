@@ -40,6 +40,7 @@ use axum::routing::{delete, get, post};
 use futures_util::{Stream, StreamExt, TryStreamExt};
 use serde_json::{Map, Value, json};
 
+use crate::budgets::{self, Budgets, Reservation};
 use crate::config::Timeouts;
 use crate::error::{ApiError, Class, scrub};
 use crate::jwt::{self, Role};
@@ -71,6 +72,8 @@ pub struct Proxy {
 	pub calls: Option<tokio::sync::mpsc::UnboundedSender<Call>>,
 	/// Keys (`keys.rs`), when there is a database to keep them in.
 	pub keys: Option<Keys>,
+	/// Budgets (`budgets.rs`), likewise.
+	pub budgets: Option<Budgets>,
 }
 
 /// The keys in memory, and the database they are kept in, which the admin API writes to.
@@ -262,6 +265,47 @@ impl Inbound {
 	}
 }
 
+/// The most a reply can be, in tokens: what is sent as its cap (Anthropic always gets one, Bedrock
+/// when one is named), else the caller's own, else the model's entry, else [`budgets::UNCAPPED_OUTPUT`].
+fn output_cap(inbound: &Inbound, upstream: &[u8], model: &Model) -> u64 {
+	let sent =
+		match model.provider.kind {
+			Kind::Openai => None,
+			Kind::Anthropic | Kind::Bedrock => serde_json::from_slice::<Value>(upstream)
+				.ok()
+				.and_then(|v| {
+					v.get("max_tokens")
+						.or_else(|| v.pointer("/inferenceConfig/maxTokens"))
+						.and_then(Value::as_u64)
+				}),
+		};
+	sent.or_else(|| {
+		["max_completion_tokens", "max_tokens"]
+			.iter()
+			.find_map(|f| inbound.body.get(*f).and_then(Value::as_u64))
+	})
+	.or(model.max_output_tokens)
+	.unwrap_or(budgets::UNCAPPED_OUTPUT)
+}
+
+/// The soft budgets a reservation goes over, for the response's header.
+fn warned(reservation: &Option<Reservation>) -> Option<HeaderValue> {
+	let names = &reservation.as_ref()?.warnings;
+	if names.is_empty() {
+		return None;
+	}
+	HeaderValue::from_str(&names.join(", ")).ok()
+}
+
+fn warn(mut response: Response, warned: Option<HeaderValue>) -> Response {
+	if let Some(names) = warned {
+		response
+			.headers_mut()
+			.insert("x-psyche-budget-warning", names);
+	}
+	response
+}
+
 /// Removes every `cache_control` breakpoint from a chat request: on a message, on a content part,
 /// on a tool (a model that does not cache can answer a request that carries one with an error,
 /// whatever the gateway's settings say).
@@ -288,7 +332,9 @@ pub fn router(proxy: Arc<Proxy>) -> Router {
 		.route("/embeddings", post(embed))
 		.route("/models", get(models))
 		.route("/admin/keys", get(list_keys).post(create_key))
-		.route("/admin/keys/{id}", delete(revoke_key));
+		.route("/admin/keys/{id}", delete(revoke_key))
+		.route("/admin/budgets", get(list_budgets).post(create_budget))
+		.route("/admin/budgets/{id}", delete(delete_budget));
 	let limit = proxy.max_request_bytes;
 	Router::new()
 		.nest("/ai/v1", api.clone())
@@ -470,7 +516,196 @@ async fn revoke_key(
 	}
 }
 
+/// What the admin API makes a budget from.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NewBudget {
+	name: String,
+	/// US dollars.
+	amount: f64,
+	period: String,
+	#[serde(default)]
+	days: Option<i32>,
+	#[serde(default)]
+	key_id: Option<String>,
+	#[serde(default = "yes")]
+	hard: bool,
+}
+
+fn yes() -> bool {
+	true
+}
+
+/// Reads the budgets again after the admin API changed them, so the change holds from the next
+/// call rather than from the notification.
+async fn reload_budgets(proxy: &Proxy, client: &tokio_postgres::Client) {
+	if let Some(budgets) = &proxy.budgets {
+		match budgets::load(client).await {
+			Ok(list) => budgets.replace(list),
+			Err(error) => {
+				tracing::warn!(error = %crate::db_message(&error), "could not reload the budgets")
+			}
+		}
+	}
+}
+
+async fn list_budgets(State(proxy): State<Arc<Proxy>>, headers: HeaderMap) -> Response {
+	let result = async {
+		let (_, client) = admin(&proxy, &headers).await?;
+		let rows = client
+			.query(
+				"SELECT id::text, name, key_id::text, amount::text, period, days, hard, created_at \
+				 FROM psyche.budgets ORDER BY created_at, id",
+				&[],
+			)
+			.await
+			.map_err(|e| database_error(&e))?;
+		Ok::<_, ApiError>(
+			rows.iter()
+				.map(|row| {
+					json!({
+						"id": row.get::<_, String>(0),
+						"name": row.get::<_, String>(1),
+						"key_id": row.get::<_, Option<String>>(2),
+						"amount": row.get::<_, String>(3),
+						"period": row.get::<_, String>(4),
+						"days": row.get::<_, Option<i32>>(5),
+						"hard": row.get::<_, bool>(6),
+						"created_at": row.get::<_, SystemTime>(7).duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs()),
+					})
+				})
+				.collect::<Vec<_>>(),
+		)
+	}
+	.await;
+	match result {
+		Ok(data) => axum::Json(json!({"object": "list", "data": data})).into_response(),
+		Err(error) => error.into_response(),
+	}
+}
+
+async fn create_budget(
+	State(proxy): State<Arc<Proxy>>,
+	headers: HeaderMap,
+	body: Result<Bytes, BytesRejection>,
+) -> Response {
+	let result = async {
+		let (_, client) = admin(&proxy, &headers).await?;
+		let body = body.map_err(|r| ApiError::new(Class::BadRequest, r.body_text()))?;
+		let new: NewBudget = serde_json::from_slice(&body).map_err(|e| {
+			ApiError::new(
+				Class::BadRequest,
+				format!("A budget is made from {{\"name\", \"amount\", \"period\", \"days\", \"key_id\", \"hard\"}}: {e}"),
+			)
+		})?;
+		if !new.amount.is_finite() || !(0.0..1_000_000.0).contains(&new.amount) {
+			return Err(ApiError::new(
+				Class::BadRequest,
+				"amount is US dollars, from 0 to under 1,000,000.",
+			));
+		}
+		let key = match &new.key_id {
+			None => None,
+			Some(id) => Some(
+				KeyId::parse(id)
+					.ok_or_else(|| ApiError::new(Class::BadRequest, "key_id is a key's id, a uuid."))?,
+			),
+		};
+		// Six decimals is a millionth of a dollar, finer than any budget needs; numeric takes it
+		// exactly from text.
+		let amount = format!("{:.6}", new.amount);
+		let row = client
+			.query_one(
+				"INSERT INTO psyche.budgets (name, amount, period, days, key_id, hard) \
+				 VALUES ($1, $2::text::numeric, $3, $4, $5, $6) RETURNING id::text",
+				&[&new.name.trim(), &amount, &new.period, &new.days, &key, &new.hard],
+			)
+			.await
+			.map_err(|e| match e.as_db_error() {
+				// A broken rule of the table (a period it does not know, a key that does not exist,
+				// a name used twice) is the caller's to fix, in Postgres's words.
+				Some(db) if db.code().code().starts_with("23") => {
+					ApiError::new(Class::BadRequest, db.message().to_string())
+				}
+				_ => database_error(&e),
+			})?;
+		reload_budgets(&proxy, &client).await;
+		Ok(json!({"id": row.get::<_, String>(0), "name": new.name.trim(), "amount": amount,
+			"period": new.period, "days": new.days, "key_id": new.key_id, "hard": new.hard}))
+	}
+	.await;
+	match result {
+		Ok(made) => (StatusCode::CREATED, axum::Json(made)).into_response(),
+		Err(error) => error.into_response(),
+	}
+}
+
+async fn delete_budget(
+	State(proxy): State<Arc<Proxy>>,
+	headers: HeaderMap,
+	Path(id): Path<String>,
+) -> Response {
+	let result = async {
+		let (_, client) = admin(&proxy, &headers).await?;
+		let id = KeyId::parse(&id)
+			.ok_or_else(|| ApiError::new(Class::BadRequest, "A budget's id is a uuid."))?;
+		let deleted = client
+			.execute("DELETE FROM psyche.budgets WHERE id = $1", &[&id])
+			.await
+			.map_err(|e| database_error(&e))?;
+		reload_budgets(&proxy, &client).await;
+		if deleted == 0 {
+			let mut error = ApiError::new(Class::BadRequest, "There is no budget with that id.");
+			error.status = Some(StatusCode::NOT_FOUND);
+			return Err(error);
+		}
+		Ok(())
+	}
+	.await;
+	match result {
+		Ok(()) => StatusCode::NO_CONTENT.into_response(),
+		Err(error) => error.into_response(),
+	}
+}
+
 impl Proxy {
+	/// Holds room for a call in every budget that applies to it, or refuses it. `prompt_bound` is
+	/// `None` when no budget applies.
+	fn reserve(
+		&self,
+		key: Option<KeyId>,
+		model: &Model,
+		prompt_bound: Option<u64>,
+		output: u64,
+	) -> Result<Option<Reservation>, ApiError> {
+		let (Some(budgets), Some(prompt)) = (&self.budgets, prompt_bound) else {
+			return Ok(None);
+		};
+		let Some(price) = model.price else {
+			return Err(ApiError::new(
+				Class::Budget,
+				format!(
+					"{} has no price, so a budget cannot be kept for it. Give it a price in the providers file.",
+					model.name
+				),
+			));
+		};
+		// The worst case: every prompt token at the dearer of the plain and cache-write prices.
+		let worst = |write: bool| {
+			price.cost(&Usage {
+				prompt_tokens: prompt,
+				completion_tokens: output,
+				cache_write_tokens: write.then_some(prompt),
+				..Usage::default()
+			})
+		};
+		let amount = worst(false).max(worst(true));
+		budgets
+			.reserve(key, amount, SystemTime::now())
+			.map(Some)
+			.map_err(|over| ApiError::new(Class::Budget, over.message))
+	}
+
 	/// The caller, from `Authorization: Bearer` or the `apikey` header (the front door sends both):
 	/// a Psyche key, or the project's service key. A signed-in user's token comes with budgets.
 	fn authorize(&self, headers: &HeaderMap) -> Result<Caller, ApiError> {
@@ -556,6 +791,12 @@ impl Proxy {
 				format!("This key may not use {}.", model.name),
 			));
 		}
+		// The prompt's upper bound, from what the caller sent, for a call a budget applies to.
+		let prompt_bound = self
+			.budgets
+			.as_ref()
+			.filter(|b| b.applies(key))
+			.map(|_| budgets::prompt_bound(&body));
 		let provider = &model.provider;
 		if operation == Operation::Embeddings {
 			if inbound.stream {
@@ -573,11 +814,25 @@ impl Proxy {
 					));
 				}
 				Kind::Bedrock => {
-					return Ok(labelled(self.embed(&inbound, &model, key).await?, &model));
+					let reservation = self.reserve(key, &model, prompt_bound, 0)?;
+					let warned = warned(&reservation);
+					let out = self.embed(&inbound, &model, key, reservation).await?;
+					return Ok(warn(labelled(out, &model), warned));
 				}
 			}
 		}
 		let body = inbound.upstream(&model, operation)?;
+		let reservation = match prompt_bound {
+			None => None,
+			Some(_) if operation == Operation::Embeddings => {
+				self.reserve(key, &model, prompt_bound, 0)?
+			}
+			Some(_) => {
+				let output = output_cap(&inbound, &body, &model);
+				self.reserve(key, &model, prompt_bound, output)?
+			}
+		};
+		let warned = warned(&reservation);
 		let (path, accept) = match provider.kind {
 			Kind::Openai => (operation.path().to_string(), "text/event-stream"),
 			Kind::Anthropic => ("messages".to_string(), "text/event-stream"),
@@ -632,6 +887,8 @@ impl Proxy {
 				total: Duration::ZERO,
 			},
 			started,
+			reservation,
+			billable: false,
 		};
 		let response = match tokio::time::timeout(self.timeouts.first_byte, request.send()).await {
 			Err(_) => {
@@ -656,12 +913,15 @@ impl Proxy {
 			let error = self.provider_error(response, &model).await;
 			return Err(record.fail(error));
 		}
+		// From here the provider may be producing tokens, so a call that ends with no usage counted
+		// is charged its whole reservation.
+		record.billable = true;
 		let out = if inbound.stream {
 			self.stream(response, &model, inbound.wants_usage, record)
 		} else {
 			self.whole(response, &model, record).await?
 		};
-		Ok(labelled(out, &model))
+		Ok(warn(labelled(out, &model), warned))
 	}
 
 	/// Embeddings from a Bedrock model, in the InvokeModel body the catalogue names for it: every
@@ -673,6 +933,7 @@ impl Proxy {
 		inbound: &Inbound,
 		model: &Model,
 		key: Option<KeyId>,
+		reservation: Option<Reservation>,
 	) -> Result<Response, ApiError> {
 		let provider = &model.provider;
 		let family = model.embeddings.ok_or_else(|| {
@@ -710,6 +971,9 @@ impl Proxy {
 				total: Duration::ZERO,
 			},
 			started: Instant::now(),
+			reservation,
+			// Each text is its own call, and some may be billed before another fails.
+			billable: true,
 		};
 		let calls = request
 			.bodies(family)
@@ -1117,6 +1381,12 @@ struct Record {
 	sink: Option<tokio::sync::mpsc::UnboundedSender<Call>>,
 	call: Call,
 	started: Instant,
+	/// The room held in the call's budgets, settled when this is dropped.
+	reservation: Option<Reservation>,
+	/// Whether the provider may have produced anything it bills for: false until a successful
+	/// response starts, so a refused or failed request releases its reservation and is charged
+	/// nothing.
+	billable: bool,
 }
 
 impl Record {
@@ -1150,6 +1420,13 @@ impl Drop for Record {
 			first_byte_ms = call.first_byte.as_millis() as u64,
 			total_ms = call.total.as_millis() as u64,
 		);
+		if let Some(reservation) = self.reservation.take() {
+			let charge = match (self.billable, self.call.cost()) {
+				(false, _) => Some(0),
+				(true, cost) => cost.map(|c| c.0),
+			};
+			reservation.settle(charge, SystemTime::now());
+		}
 		if let Some(sink) = &self.sink {
 			let _ = sink.send(self.call.clone());
 		}
@@ -1335,10 +1612,15 @@ mod tests {
 
 		/// Psyche in front of a fake provider, presenting `key` to it.
 		async fn with(key: &str, timeouts: Timeouts) -> Self {
-			Self::build(key, timeouts, None).await
+			Self::build(key, timeouts, None, None).await
 		}
 
-		async fn build(key: &str, mut timeouts: Timeouts, keys: Option<Keys>) -> Self {
+		async fn build(
+			key: &str,
+			mut timeouts: Timeouts,
+			keys: Option<Keys>,
+			budgets: Option<Budgets>,
+		) -> Self {
 			let fake = Fake::start().await;
 			let catalogue = Catalogue::from_json(
 				&format!(
@@ -1403,6 +1685,7 @@ mod tests {
 				max_request_bytes: 1024 * 1024,
 				calls: Some(tx),
 				keys,
+				budgets,
 			});
 			let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
 			let base = format!("http://{}", listener.local_addr().unwrap());
@@ -1549,7 +1832,7 @@ mod tests {
 		};
 		let store = keys::Store::default();
 		let (ready, loaded) = tokio::sync::oneshot::channel();
-		tokio::spawn(keys::watch(url.clone(), store.clone(), Some(ready)));
+		tokio::spawn(keys::watch(url.clone(), store.clone(), None, Some(ready)));
 		loaded.await.unwrap();
 		let mut s = Setup::build(
 			Fake::KEY,
@@ -1558,6 +1841,7 @@ mod tests {
 				store,
 				database_url: url,
 			}),
+			None,
 		)
 		.await;
 
@@ -1677,6 +1961,226 @@ mod tests {
 			.await
 			.unwrap();
 		assert_eq!(again.status(), 404, "already revoked");
+	}
+
+	/// Psyche with keys and budgets, on a fresh database, and a key of its own.
+	async fn with_budgets(name: &str) -> Option<(Setup, tokio_postgres::Client, String, String)> {
+		let (db, url) = crate::log::tests::fresh_database(name).await?;
+		let store = keys::Store::default();
+		let budgets = Budgets::default();
+		let (ready, loaded) = tokio::sync::oneshot::channel();
+		tokio::spawn(keys::watch(
+			url.clone(),
+			store.clone(),
+			Some(budgets.clone()),
+			Some(ready),
+		));
+		loaded.await.unwrap();
+		let s = Setup::build(
+			Fake::KEY,
+			Timeouts::default(),
+			Some(Keys {
+				store,
+				database_url: url,
+			}),
+			Some(budgets),
+		)
+		.await;
+		let made: Value = s
+			.post("/ai/v1/admin/keys", json!({"name": "app"}))
+			.send()
+			.await
+			.unwrap()
+			.json()
+			.await
+			.unwrap();
+		let key = made["key"].as_str().unwrap().to_string();
+		let id = made["id"].as_str().unwrap().to_string();
+		Some((s, db, key, id))
+	}
+
+	#[tokio::test]
+	async fn budgets_hold_under_concurrency_and_a_long_reply_is_refused_before_it_is_sent() {
+		let Some((mut s, _db, key, id)) = with_budgets("budget_race").await else {
+			return;
+		};
+		// ok-priced: $1 in and $2.50 out per million. A call below reserves its body's bytes as
+		// prompt tokens and 8 out, about $0.0001; it costs 9 in and 4 out, $0.000019. So $0.001
+		// fits about fifty calls, and only a few can be in flight at once.
+		let made = s
+			.post(
+				"/ai/v1/admin/budgets",
+				json!({"name": "app daily", "amount": 0.001, "period": "day", "key_id": id}),
+			)
+			.send()
+			.await
+			.unwrap();
+		assert_eq!(made.status(), 201, "{}", made.text().await.unwrap());
+		let limit = crate::price::PICO / 1000;
+
+		let request = json!({"model": "ok-priced", "max_tokens": 8, "messages": [{"role": "user", "content": "hi"}]});
+		let sends = (0..300).map(|_| {
+			s.client
+				.post(format!("{}/ai/v1/chat/completions", s.base))
+				.bearer_auth(&key)
+				.json(&request)
+				.send()
+		});
+		let replies = futures_util::future::join_all(sends).await;
+		let mut ok = 0;
+		let mut refused = 0;
+		for reply in replies {
+			let reply = reply.unwrap();
+			match reply.status().as_u16() {
+				200 => ok += 1,
+				429 => {
+					let body: Value = reply.json().await.unwrap();
+					assert_eq!(body["error"]["code"], "budget_exceeded");
+					assert!(
+						body["error"]["message"]
+							.as_str()
+							.unwrap()
+							.contains("app daily")
+					);
+					refused += 1;
+				}
+				other => panic!("{other}"),
+			}
+		}
+		assert_eq!(ok + refused, 300);
+		assert!(ok > 10 && refused > 0, "{ok} answered, {refused} refused");
+		let mut spent = 0;
+		for _ in 0..ok {
+			spent += s.call().await.cost().unwrap().0;
+		}
+		assert!(spent <= limit, "spent {spent} of {limit} picodollars");
+		eprintln!(
+			"300 at once: {ok} answered, {refused} refused, {spent} of {limit} picodollars spent"
+		);
+		assert_eq!(
+			s.fake.count(),
+			ok,
+			"a refused call never reached the provider"
+		);
+
+		// A reply that could be longer than the whole budget is refused before it is sent.
+		let sent = s.fake.count();
+		let long = s
+			.client
+			.post(format!("{}/ai/v1/chat/completions", s.base))
+			.bearer_auth(&key)
+			.json(&json!({"model": "ok-priced", "max_tokens": 1_000_000, "messages": [{"role": "user", "content": "hi"}]}))
+			.send()
+			.await
+			.unwrap();
+		assert_eq!(long.status(), 429);
+		assert!(long.text().await.unwrap().contains("could cost up to $2.5"));
+		assert_eq!(s.fake.count(), sent);
+
+		// The service key is not held by the key's budget; an unpriced model cannot be budgeted.
+		assert_eq!(
+			s.post("/ai/v1/chat/completions", chat("ok-priced", false))
+				.send()
+				.await
+				.unwrap()
+				.status(),
+			200
+		);
+		let unpriced = s
+			.client
+			.post(format!("{}/ai/v1/chat/completions", s.base))
+			.bearer_auth(&key)
+			.json(&chat("ok", false))
+			.send()
+			.await
+			.unwrap();
+		assert_eq!(unpriced.status(), 429);
+		assert!(unpriced.text().await.unwrap().contains("has no price"));
+	}
+
+	#[tokio::test]
+	async fn a_soft_budget_warns_and_a_deleted_budget_stops_at_once() {
+		let Some((s, _db, _key, _id)) = with_budgets("budget_soft").await else {
+			return;
+		};
+		let made: Value = s
+			.post(
+				"/ai/v1/admin/budgets",
+				json!({"name": "watch", "amount": 0, "period": "rolling", "days": 7, "hard": false}),
+			)
+			.send()
+			.await
+			.unwrap()
+			.json()
+			.await
+			.unwrap();
+		let reply = s
+			.post("/ai/v1/chat/completions", chat("ok-priced", false))
+			.send()
+			.await
+			.unwrap();
+		assert_eq!(reply.status(), 200);
+		assert_eq!(reply.headers()["x-psyche-budget-warning"], "watch");
+
+		let hard = s
+			.post(
+				"/ai/v1/admin/budgets",
+				json!({"name": "stop", "amount": 0, "period": "month"}),
+			)
+			.send()
+			.await
+			.unwrap();
+		assert_eq!(hard.status(), 201);
+		let hard: Value = hard.json().await.unwrap();
+		assert_eq!(
+			s.post("/ai/v1/chat/completions", chat("ok-priced", false))
+				.send()
+				.await
+				.unwrap()
+				.status(),
+			429
+		);
+		let gone = s
+			.client
+			.delete(format!(
+				"{}/ai/v1/admin/budgets/{}",
+				s.base,
+				hard["id"].as_str().unwrap()
+			))
+			.bearer_auth(jwt::sign(&json!({"role": "service_role"}), SECRET))
+			.send()
+			.await
+			.unwrap();
+		assert_eq!(gone.status(), 204);
+		assert_eq!(
+			s.post("/ai/v1/chat/completions", chat("ok-priced", false))
+				.send()
+				.await
+				.unwrap()
+				.status(),
+			200
+		);
+		let bad = s
+			.post(
+				"/ai/v1/admin/budgets",
+				json!({"name": "x", "amount": 1, "period": "week"}),
+			)
+			.send()
+			.await
+			.unwrap();
+		assert_eq!(bad.status(), 400, "a period the table does not know");
+		let listed: Value = s
+			.client
+			.get(format!("{}/ai/v1/admin/budgets", s.base))
+			.bearer_auth(jwt::sign(&json!({"role": "service_role"}), SECRET))
+			.send()
+			.await
+			.unwrap()
+			.json()
+			.await
+			.unwrap();
+		assert_eq!(listed["data"].as_array().unwrap().len(), 1);
+		assert_eq!(listed["data"][0]["id"], made["id"]);
 	}
 
 	#[tokio::test]

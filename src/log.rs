@@ -150,7 +150,13 @@ struct Totals {
 	unpriced: i64,
 }
 
-type Key = (Day, &'static str, String, String);
+type Key = (
+	Day,
+	&'static str,
+	String,
+	String,
+	Option<crate::keys::KeyId>,
+);
 
 fn totals(batch: &[Call]) -> BTreeMap<Key, Totals> {
 	let mut out: BTreeMap<Key, Totals> = BTreeMap::new();
@@ -160,6 +166,7 @@ fn totals(batch: &[Call]) -> BTreeMap<Key, Totals> {
 			call.operation.name(),
 			call.model.clone(),
 			call.provider.clone(),
+			call.key,
 		);
 		let t = out.entry(key).or_default();
 		t.requests += 1;
@@ -264,7 +271,9 @@ async fn write(client: &mut Client, batch: &[Call]) -> Result<(), tokio_postgres
 	let mut columns: (Vec<String>, Vec<&str>, Vec<&str>, Vec<&str>) = Default::default();
 	let mut counts: [Vec<i64>; 10] = Default::default();
 	let mut costs: Vec<Dollars> = Vec::new();
-	for ((day, operation, model, provider), t) in &totals {
+	let mut keys: Vec<Option<crate::keys::KeyId>> = Vec::new();
+	for ((day, operation, model, provider, key), t) in &totals {
+		keys.push(*key);
 		columns.0.push(day.iso());
 		columns.1.push(operation);
 		columns.2.push(model);
@@ -289,12 +298,13 @@ async fn write(client: &mut Client, batch: &[Call]) -> Result<(), tokio_postgres
 	tx.execute(
 		"INSERT INTO psyche.usage_daily AS u (day, operation, model, provider, requests, failed, \
 		 cancelled, uncounted, prompt_tokens, completion_tokens, cached_tokens, cache_write_tokens, \
-		 reasoning_tokens, unpriced, cost) \
-		 SELECT d::date, o, m, p, r, f, c, un, pt, ct, cr, cw, rt, up, co FROM unnest($1::text[], $2::text[], \
+		 reasoning_tokens, unpriced, cost, key_id) \
+		 SELECT d::date, o, m, p, r, f, c, un, pt, ct, cr, cw, rt, up, co, k FROM unnest($1::text[], $2::text[], \
 		 $3::text[], $4::text[], $5::int8[], $6::int8[], $7::int8[], $8::int8[], $9::int8[], \
-		 $10::int8[], $11::int8[], $12::int8[], $13::int8[], $14::int8[], $15::numeric[]) \
-		 AS t(d, o, m, p, r, f, c, un, pt, ct, cr, cw, rt, up, co) \
-		 ON CONFLICT (day, operation, model, provider) DO UPDATE SET \
+		 $10::int8[], $11::int8[], $12::int8[], $13::int8[], $14::int8[], $15::numeric[], $16::uuid[]) \
+		 AS t(d, o, m, p, r, f, c, un, pt, ct, cr, cw, rt, up, co, k) \
+		 ON CONFLICT (day, operation, model, provider, \
+		 (coalesce(key_id, '00000000-0000-0000-0000-000000000000'::uuid))) DO UPDATE SET \
 		 requests = u.requests + excluded.requests, failed = u.failed + excluded.failed, \
 		 cancelled = u.cancelled + excluded.cancelled, uncounted = u.uncounted + excluded.uncounted, \
 		 prompt_tokens = u.prompt_tokens + excluded.prompt_tokens, \
@@ -306,6 +316,7 @@ async fn write(client: &mut Client, batch: &[Call]) -> Result<(), tokio_postgres
 		&[
 			&columns.0, &columns.1, &columns.2, &columns.3, r, f, c, un, pt, ct, cr, cw, rt, up,
 			&costs,
+			&keys,
 		],
 	)
 	.await?;
@@ -586,7 +597,7 @@ pub(crate) mod tests {
 		];
 		let totals = totals(&batch);
 		assert_eq!(totals.len(), 3);
-		let a = totals[&(Day::of(today), "chat", "a".into(), "bedrock".into())];
+		let a = totals[&(Day::of(today), "chat", "a".into(), "bedrock".into(), None)];
 		assert_eq!(
 			a,
 			Totals {

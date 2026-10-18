@@ -159,6 +159,37 @@ that is not set, an http URL under `public` egress) stops the server at start wi
 Each finished call is logged under the `psyche::call` target: operation, model, provider, outcome
 (completed, cancelled, or failed with a class), tokens, cost, time to first byte and total time.
 
+### Budgets
+
+A budget caps what the project, or one key, spends in a calendar day or month (UTC) or the last N
+days. A hard budget refuses a call that would not fit, before anything is sent; a soft one lets it
+through and names itself in the `x-psyche-budget-warning` header.
+
+```sh
+curl -X POST $PSYCHE/ai/v1/admin/budgets -H "Authorization: Bearer $SERVICE_KEY" \
+  -d '{"name": "ci daily", "amount": 5, "period": "day", "key_id": "<key id>"}'
+# period: day, month, or rolling with "days": 1-366; "hard": false for a soft budget;
+# no key_id for the project's own. GET lists them, DELETE /ai/v1/admin/budgets/<id> removes one.
+```
+
+A budget is kept by **reserving, then settling**. Before a call goes to its provider, its worst
+case is reserved against every budget in its scope: the prompt's upper bound (its bytes, since a
+token is at least a byte; an inline image counts 2,000 tokens) and the reply's cap (`max_tokens`, or
+the model's `max_output_tokens`), at the model's price. When it ends, the reservation becomes what
+the provider reported. So two calls that each fit cannot both be sent into room for one, and a long
+reply cannot run through a budget: its room was taken before it started. A refusal is a 429 with
+the code `budget_exceeded` (OpenAI's type `insufficient_quota`) and a sentence naming the budget,
+what it has left and what the call could cost. A model with no price cannot be budgeted, so a call
+to one that a budget covers is refused.
+
+Spend is held in memory, per day, and read at start from `psyche.usage_daily` (which keeps each
+key's totals for good), so a restart resumes where it was. What it can miss, stated rather than
+hidden: the rows a crash did not write (see the request log), and a reply with no cap at all (an
+OpenAI-style provider called without `max_tokens`, for a model with no `max_output_tokens`), which
+is reserved at 4,096 tokens and can run past that once. Measured against the fake provider, 300
+calls at once on a key with a $0.001 day: 18 answered, 282 refused, $0.000342 spent. The bound is
+generous where prompts are short, so near its end a budget refuses some calls that would have fit.
+
 ### Prices
 
 A call's cost is the tokens the provider reported at the model's price. The price comes from the
