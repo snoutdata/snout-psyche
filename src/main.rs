@@ -5,7 +5,7 @@ use std::sync::Arc;
 use axum::serve::ListenerExt;
 use snout_psyche::config::Config;
 use snout_psyche::providers::Catalogue;
-use snout_psyche::proxy::{Proxy, router};
+use snout_psyche::proxy::{Keys, Proxy, router};
 
 #[tokio::main]
 async fn main() {
@@ -45,8 +45,8 @@ async fn main() {
 	// The request log: the schema migrated before the first call, then a task of its own that the
 	// calls are handed to. A database that cannot be migrated stops the start, since a log that
 	// silently is not kept is worse than none.
-	let (calls, log) = match &config.log {
-		None => (None, None),
+	let (calls, log, keys) = match &config.log {
+		None => (None, None, None),
 		Some(settings) => {
 			let mut client = snout_psyche::log::connect(&settings.database_url)
 				.await
@@ -63,7 +63,22 @@ async fn main() {
 			drop(client);
 			let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 			let task = tokio::spawn(snout_psyche::log::run(settings.clone(), rx));
-			(Some(tx), Some(task))
+			// The keys are loaded before the first call is taken, so a key that works works at once.
+			let keys = Keys {
+				store: Default::default(),
+				database_url: settings.database_url.clone(),
+			};
+			let (ready, loaded) = tokio::sync::oneshot::channel();
+			tokio::spawn(snout_psyche::keys::watch(
+				settings.database_url.clone(),
+				keys.store.clone(),
+				Some(ready),
+			));
+			if loaded.await.is_err() {
+				fail(1, "the keys could not be loaded");
+			}
+			tracing::info!(keys = keys.store.len(), "loaded the keys");
+			(Some(tx), Some(task), Some(keys))
 		}
 	};
 	let proxy = Arc::new(Proxy {
@@ -73,6 +88,7 @@ async fn main() {
 		timeouts: config.timeouts,
 		max_request_bytes: config.max_request_bytes,
 		calls,
+		keys,
 	});
 	let listener = tokio::net::TcpListener::bind(config.addr)
 		.await

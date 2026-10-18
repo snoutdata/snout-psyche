@@ -17,6 +17,7 @@ pub mod embeddings;
 pub mod error;
 pub mod eventstream;
 pub mod jwt;
+pub mod keys;
 pub mod layout;
 pub mod log;
 pub mod migrations;
@@ -103,8 +104,14 @@ pub(crate) fn b64url_decode(text: &str) -> Option<Vec<u8>> {
 		.ok()
 }
 
-#[cfg(any(test, feature = "fake"))]
 pub(crate) fn b64url(bytes: &[u8]) -> String {
 	use base64::Engine;
 	base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+}
+
+/// A database error as Postgres worded it, rather than tokio-postgres's "db error".
+pub(crate) fn db_message(error: &tokio_postgres::Error) -> String {
+	error
+		.as_db_error()
+		.map_or_else(|| error.to_string(), |e| e.message().to_string())
 }

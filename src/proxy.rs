@@ -33,16 +33,17 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use axum::Router;
 use axum::body::{Body, Bytes};
 use axum::extract::rejection::BytesRejection;
-use axum::extract::{DefaultBodyLimit, State};
+use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use futures_util::{Stream, StreamExt, TryStreamExt};
 use serde_json::{Map, Value, json};
 
 use crate::config::Timeouts;
 use crate::error::{ApiError, Class, scrub};
 use crate::jwt::{self, Role};
+use crate::keys::{self, Key, KeyId, Refusal};
 use crate::net;
 use crate::price::{Dollars, Price};
 use crate::providers::{Catalogue, Kind, Model};
@@ -68,6 +69,39 @@ pub struct Proxy {
 	/// Where each finished call is sent: the request log (`log.rs`) when there is a database, and in
 	/// tests whoever listens. Every call is also logged (`psyche::call`).
 	pub calls: Option<tokio::sync::mpsc::UnboundedSender<Call>>,
+	/// Keys (`keys.rs`), when there is a database to keep them in.
+	pub keys: Option<Keys>,
+}
+
+/// The keys in memory, and the database they are kept in, which the admin API writes to.
+#[derive(Clone)]
+pub struct Keys {
+	pub store: keys::Store,
+	pub database_url: String,
+}
+
+/// Who is calling.
+#[derive(Debug, Clone)]
+pub enum Caller {
+	/// The project's service key: every model, and the admin API.
+	Service,
+	Key(Arc<Key>),
+}
+
+impl Caller {
+	fn key(&self) -> Option<KeyId> {
+		match self {
+			Caller::Service => None,
+			Caller::Key(key) => Some(key.id),
+		}
+	}
+
+	fn may_use(&self, model: &str) -> bool {
+		match self {
+			Caller::Service => true,
+			Caller::Key(key) => key.allows(model),
+		}
+	}
 }
 
 /// One call, as the request log will hold it.
@@ -83,6 +117,8 @@ pub struct Call {
 	pub usage: Option<Usage>,
 	/// The model's price, so the log can cost the call; `None` when nothing prices it.
 	pub price: Option<Price>,
+	/// The key that made the call; `None` for the service key.
+	pub key: Option<KeyId>,
 	/// From sending the request to the provider's response headers.
 	pub first_byte: Duration,
 	pub total: Duration,
@@ -250,7 +286,9 @@ pub fn router(proxy: Arc<Proxy>) -> Router {
 		.route("/chat/completions", post(chat))
 		.route("/completions", post(completions))
 		.route("/embeddings", post(embed))
-		.route("/models", get(models));
+		.route("/models", get(models))
+		.route("/admin/keys", get(list_keys).post(create_key))
+		.route("/admin/keys/{id}", delete(revoke_key));
 	let limit = proxy.max_request_bytes;
 	Router::new()
 		.nest("/ai/v1", api.clone())
@@ -294,13 +332,15 @@ async fn embed(
 }
 
 async fn models(State(proxy): State<Arc<Proxy>>, headers: HeaderMap) -> Response {
-	if let Err(error) = proxy.authorize(&headers) {
-		return error.into_response();
-	}
+	let caller = match proxy.authorize(&headers) {
+		Ok(caller) => caller,
+		Err(error) => return error.into_response(),
+	};
 	let data: Vec<Value> = proxy
 		.catalogue
 		.models()
 		.iter()
+		.filter(|m| caller.may_use(&m.name))
 		.map(
 			|m| json!({"id": m.name, "object": "model", "created": 0, "owned_by": m.provider.name}),
 		)
@@ -315,10 +355,125 @@ fn now() -> u64 {
 		.unwrap_or(0)
 }
 
+/// The admin API's database connection, for the service key only.
+async fn admin(
+	proxy: &Proxy,
+	headers: &HeaderMap,
+) -> Result<(Keys, tokio_postgres::Client), ApiError> {
+	if !matches!(proxy.authorize(headers)?, Caller::Service) {
+		return Err(ApiError::new(
+			Class::Forbidden,
+			"Only the project's service key may manage keys.",
+		));
+	}
+	let keys = proxy.keys.clone().ok_or_else(|| {
+		ApiError::new(
+			Class::BadRequest,
+			"This Psyche has no database (DATABASE_URL), so it keeps no keys.",
+		)
+	})?;
+	let client = crate::log::connect(&keys.database_url)
+		.await
+		.map_err(|e| database_error(&e))?;
+	Ok((keys, client))
+}
+
+fn database_error(error: &tokio_postgres::Error) -> ApiError {
+	tracing::warn!(error = %crate::db_message(error), "an admin call's database work failed");
+	let mut out = ApiError::new(
+		Class::Upstream,
+		"Psyche's database could not do that just now.",
+	);
+	out.status = Some(StatusCode::SERVICE_UNAVAILABLE);
+	out
+}
+
+async fn list_keys(State(proxy): State<Arc<Proxy>>, headers: HeaderMap) -> Response {
+	let result = async {
+		let (_, client) = admin(&proxy, &headers).await?;
+		keys::list(&client).await.map_err(|e| database_error(&e))
+	}
+	.await;
+	match result {
+		Ok(data) => axum::Json(json!({"object": "list", "data": data})).into_response(),
+		Err(error) => error.into_response(),
+	}
+}
+
+async fn create_key(
+	State(proxy): State<Arc<Proxy>>,
+	headers: HeaderMap,
+	body: Result<Bytes, BytesRejection>,
+) -> Response {
+	let result = async {
+		let (keys, client) = admin(&proxy, &headers).await?;
+		let body = body.map_err(|r| ApiError::new(Class::BadRequest, r.body_text()))?;
+		let new: keys::NewKey = serde_json::from_slice(&body).map_err(|e| {
+			ApiError::new(
+				Class::BadRequest,
+				format!(
+					"A key is made from {{\"name\", \"models\", \"expires_in\", \"owner\"}}: {e}"
+				),
+			)
+		})?;
+		if let Some(unknown) = new
+			.models
+			.iter()
+			.flatten()
+			.find(|m| proxy.catalogue.model(m).is_none())
+		{
+			return Err(ApiError::new(
+				Class::BadRequest,
+				format!("There is no model named {unknown} here. GET /ai/v1/models lists them."),
+			));
+		}
+		keys::create(&client, &keys.store, new)
+			.await
+			.map_err(|e| match e {
+				keys::CreateError::Invalid(message) => ApiError::new(Class::BadRequest, message),
+				keys::CreateError::Database(e) => database_error(&e),
+			})
+	}
+	.await;
+	match result {
+		Ok(made) => (StatusCode::CREATED, axum::Json(made)).into_response(),
+		Err(error) => error.into_response(),
+	}
+}
+
+async fn revoke_key(
+	State(proxy): State<Arc<Proxy>>,
+	headers: HeaderMap,
+	Path(id): Path<String>,
+) -> Response {
+	let result = async {
+		let (keys, client) = admin(&proxy, &headers).await?;
+		let id = KeyId::parse(&id)
+			.ok_or_else(|| ApiError::new(Class::BadRequest, "A key's id is a uuid."))?;
+		match keys::revoke(&client, &keys.store, id).await {
+			Ok(true) => Ok(()),
+			Ok(false) => {
+				let mut error = ApiError::new(
+					Class::BadRequest,
+					"There is no key with that id that is not already revoked.",
+				);
+				error.status = Some(StatusCode::NOT_FOUND);
+				Err(error)
+			}
+			Err(e) => Err(database_error(&e)),
+		}
+	}
+	.await;
+	match result {
+		Ok(()) => StatusCode::NO_CONTENT.into_response(),
+		Err(error) => error.into_response(),
+	}
+}
+
 impl Proxy {
-	/// The caller's token, from `Authorization: Bearer` or the `apikey` header (the front door
-	/// sends both). Until keys and budgets exist (Phase 3) only the service role may call.
-	fn authorize(&self, headers: &HeaderMap) -> Result<jwt::Caller, ApiError> {
+	/// The caller, from `Authorization: Bearer` or the `apikey` header (the front door sends both):
+	/// a Psyche key, or the project's service key. A signed-in user's token comes with budgets.
+	fn authorize(&self, headers: &HeaderMap) -> Result<Caller, ApiError> {
 		let bearer = headers
 			.get(header::AUTHORIZATION)
 			.and_then(|v| v.to_str().ok())
@@ -333,18 +488,36 @@ impl Proxy {
 			.ok_or_else(|| {
 				ApiError::new(
 					Class::Unauthorized,
-					"Send the project's service key as a Bearer token.",
+					"Send a Psyche key (psy_…) or the project's service key as a Bearer token.",
 				)
 			})?;
+		if token.starts_with(keys::PREFIX) {
+			let Some(keys) = &self.keys else {
+				return Err(ApiError::new(
+					Class::Unauthorized,
+					"This Psyche has no database, so it has no keys. Use the project's service key.",
+				));
+			};
+			return match keys.store.find(token, SystemTime::now()) {
+				Ok(key) => Ok(Caller::Key(key)),
+				Err(Refusal::Unknown) => Err(ApiError::new(
+					Class::Unauthorized,
+					"This key is not one Psyche knows: it was never made here, or it was revoked.",
+				)),
+				Err(Refusal::Expired) => {
+					Err(ApiError::new(Class::Unauthorized, "This key has expired."))
+				}
+			};
+		}
 		let caller = jwt::verify(token, &self.jwt_secret, now())
 			.map_err(|e| ApiError::new(Class::Unauthorized, e.0))?;
 		if caller.role != Role::Service {
 			return Err(ApiError::new(
 				Class::Forbidden,
-				"Only the project's service key may call a model until keys and budgets are set up.",
+				"Only the project's service key or a Psyche key may call a model until budgets are set up.",
 			));
 		}
-		Ok(caller)
+		Ok(Caller::Service)
 	}
 
 	async fn forward(
@@ -353,7 +526,8 @@ impl Proxy {
 		body: Result<Bytes, BytesRejection>,
 		operation: Operation,
 	) -> Result<Response, ApiError> {
-		self.authorize(headers)?;
+		let caller = self.authorize(headers)?;
+		let key = caller.key();
 		let body = body.map_err(|rejection| {
 			let mut error = ApiError::new(
 				Class::BadRequest,
@@ -376,6 +550,12 @@ impl Proxy {
 					),
 				)
 			})?;
+		if !caller.may_use(&model.name) {
+			return Err(ApiError::new(
+				Class::Forbidden,
+				format!("This key may not use {}.", model.name),
+			));
+		}
 		let provider = &model.provider;
 		if operation == Operation::Embeddings {
 			if inbound.stream {
@@ -392,7 +572,9 @@ impl Proxy {
 						format!("{}'s provider has no embeddings API.", model.name),
 					));
 				}
-				Kind::Bedrock => return Ok(labelled(self.embed(&inbound, &model).await?, &model)),
+				Kind::Bedrock => {
+					return Ok(labelled(self.embed(&inbound, &model, key).await?, &model));
+				}
 			}
 		}
 		let body = inbound.upstream(&model, operation)?;
@@ -445,6 +627,7 @@ impl Proxy {
 				outcome: Outcome::Cancelled,
 				usage: None,
 				price: model.price,
+				key,
 				first_byte: Duration::ZERO,
 				total: Duration::ZERO,
 			},
@@ -485,7 +668,12 @@ impl Proxy {
 	/// call made (a few at a time), the vectors put back in the order of the texts, and the input
 	/// counted from what each call reported. Any call failing fails the request; the rest are
 	/// dropped, and with them their connections.
-	async fn embed(&self, inbound: &Inbound, model: &Model) -> Result<Response, ApiError> {
+	async fn embed(
+		&self,
+		inbound: &Inbound,
+		model: &Model,
+		key: Option<KeyId>,
+	) -> Result<Response, ApiError> {
 		let provider = &model.provider;
 		let family = model.embeddings.ok_or_else(|| {
 			ApiError::new(
@@ -517,6 +705,7 @@ impl Proxy {
 				outcome: Outcome::Cancelled,
 				usage: None,
 				price: model.price,
+				key,
 				first_byte: Duration::ZERO,
 				total: Duration::ZERO,
 			},
@@ -1145,7 +1334,11 @@ mod tests {
 		}
 
 		/// Psyche in front of a fake provider, presenting `key` to it.
-		async fn with(key: &str, mut timeouts: Timeouts) -> Self {
+		async fn with(key: &str, timeouts: Timeouts) -> Self {
+			Self::build(key, timeouts, None).await
+		}
+
+		async fn build(key: &str, mut timeouts: Timeouts, keys: Option<Keys>) -> Self {
 			let fake = Fake::start().await;
 			let catalogue = Catalogue::from_json(
 				&format!(
@@ -1209,6 +1402,7 @@ mod tests {
 				timeouts,
 				max_request_bytes: 1024 * 1024,
 				calls: Some(tx),
+				keys,
 			});
 			let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
 			let base = format!("http://{}", listener.local_addr().unwrap());
@@ -1346,6 +1540,143 @@ mod tests {
 		let call = s.call().await;
 		assert!(call.usage.is_some());
 		assert_eq!(call.cost(), None, "nothing prices fake-ok");
+	}
+
+	#[tokio::test]
+	async fn a_key_is_made_used_within_its_models_and_revoked() {
+		let Some((db, url)) = crate::log::tests::fresh_database("keys").await else {
+			return;
+		};
+		let store = keys::Store::default();
+		let (ready, loaded) = tokio::sync::oneshot::channel();
+		tokio::spawn(keys::watch(url.clone(), store.clone(), Some(ready)));
+		loaded.await.unwrap();
+		let mut s = Setup::build(
+			Fake::KEY,
+			Timeouts::default(),
+			Some(Keys {
+				store,
+				database_url: url,
+			}),
+		)
+		.await;
+
+		let made = s
+			.post("/ai/v1/admin/keys", json!({"name": "ci", "models": ["ok"]}))
+			.send()
+			.await
+			.unwrap();
+		assert_eq!(made.status(), 201);
+		let made: Value = made.json().await.unwrap();
+		let key = made["key"].as_str().unwrap().to_string();
+		let id = made["id"].as_str().unwrap().to_string();
+		assert!(key.starts_with("psy_"));
+		let stored: Vec<u8> = db
+			.query_one("SELECT hash FROM psyche.keys", &[])
+			.await
+			.unwrap()
+			.get(0);
+		assert_eq!(stored, keys::hash(&key), "only the hash is kept");
+
+		let (client, base) = (s.client.clone(), s.base.clone());
+		let with_key = |path: &str, body: Value| {
+			client
+				.post(format!("{base}{path}"))
+				.bearer_auth(&key)
+				.json(&body)
+		};
+		let ok = with_key("/ai/v1/chat/completions", chat("ok", false))
+			.send()
+			.await
+			.unwrap();
+		assert_eq!(ok.status(), 200);
+		let refused = with_key("/ai/v1/chat/completions", chat("claude", false))
+			.send()
+			.await
+			.unwrap();
+		assert_eq!(refused.status(), 403);
+		assert!(refused.text().await.unwrap().contains("may not use claude"));
+		let call = s.call().await;
+		assert_eq!(call.key.map(|k| k.to_string()), Some(id.clone()));
+
+		let listed: Value = s
+			.client
+			.get(format!("{}/ai/v1/models", s.base))
+			.bearer_auth(&key)
+			.send()
+			.await
+			.unwrap()
+			.json()
+			.await
+			.unwrap();
+		assert_eq!(listed["data"].as_array().unwrap().len(), 1, "{listed}");
+		assert_eq!(listed["data"][0]["id"], "ok");
+
+		let admin_with_key = s
+			.client
+			.get(format!("{}/ai/v1/admin/keys", s.base))
+			.bearer_auth(&key)
+			.send()
+			.await
+			.unwrap();
+		assert_eq!(admin_with_key.status(), 403, "a key cannot manage keys");
+		let unknown_model = s
+			.post(
+				"/ai/v1/admin/keys",
+				json!({"name": "x", "models": ["nope"]}),
+			)
+			.send()
+			.await
+			.unwrap();
+		assert_eq!(unknown_model.status(), 400);
+
+		// Revoked in SQL, by anyone: the notification reaches Psyche and the key stops.
+		db.execute("UPDATE psyche.keys SET revoked_at = now()", &[])
+			.await
+			.unwrap();
+		let mut status = 200;
+		for _ in 0..50 {
+			status = with_key("/ai/v1/chat/completions", chat("ok", false))
+				.send()
+				.await
+				.unwrap()
+				.status()
+				.as_u16();
+			if status == 401 {
+				break;
+			}
+			tokio::time::sleep(Duration::from_millis(20)).await;
+		}
+		assert_eq!(
+			status, 401,
+			"a revoke reaches Psyche without waiting for the reload"
+		);
+
+		let listed: Value = s
+			.client
+			.get(format!("{}/ai/v1/admin/keys", s.base))
+			.bearer_auth(jwt::sign(&json!({"role": "service_role"}), SECRET))
+			.send()
+			.await
+			.unwrap()
+			.json()
+			.await
+			.unwrap();
+		let row = &listed["data"][0];
+		assert_eq!(row["id"], id.as_str());
+		assert!(row["revoked_at"].is_u64());
+		assert!(
+			!listed.to_string().contains(&key),
+			"a list never shows a key"
+		);
+		let again = s
+			.client
+			.delete(format!("{}/ai/v1/admin/keys/{id}", s.base))
+			.bearer_auth(jwt::sign(&json!({"role": "service_role"}), SECRET))
+			.send()
+			.await
+			.unwrap();
+		assert_eq!(again.status(), 404, "already revoked");
 	}
 
 	#[tokio::test]

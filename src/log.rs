@@ -211,7 +211,7 @@ async fn write(client: &mut Client, batch: &[Call]) -> Result<(), tokio_postgres
 		.copy_in(
 			"COPY psyche.requests (at, operation, model, provider, streamed, outcome, \
 			 prompt_tokens, completion_tokens, cached_tokens, cache_write_tokens, reasoning_tokens, \
-			 first_byte_ms, total_ms, cost) FROM STDIN BINARY",
+			 first_byte_ms, total_ms, cost, key_id) FROM STDIN BINARY",
 		)
 		.await?;
 	let writer = BinaryCopyInWriter::new(
@@ -231,6 +231,7 @@ async fn write(client: &mut Client, batch: &[Call]) -> Result<(), tokio_postgres
 			Type::INT4,
 			Type::INT4,
 			Type::NUMERIC,
+			Type::UUID,
 		],
 	);
 	let mut writer = std::pin::pin!(writer);
@@ -253,6 +254,7 @@ async fn write(client: &mut Client, batch: &[Call]) -> Result<(), tokio_postgres
 				&millis(call.first_byte),
 				&millis(call.total),
 				&call.cost(),
+				&call.key,
 			])
 			.await?;
 	}
@@ -523,7 +525,7 @@ impl Writer {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
 	use super::*;
 	use crate::error::Class;
 	use crate::proxy::Operation;
@@ -544,6 +546,7 @@ mod tests {
 			outcome,
 			usage,
 			price: None,
+			key: None,
 			first_byte: Duration::from_millis(120),
 			total: Duration::from_millis(900),
 		}
@@ -631,7 +634,7 @@ mod tests {
 
 	/// A fresh, migrated database of its own for one test, or `None` when `PSYCHE_TEST_DATABASE_URL`
 	/// is not set (tests/db.sh sets it). Returns the client and the database's URL.
-	async fn fresh_database(name: &str) -> Option<(Client, String)> {
+	pub(crate) async fn fresh_database(name: &str) -> Option<(Client, String)> {
 		let admin_url = std::env::var("PSYCHE_TEST_DATABASE_URL").ok()?;
 		let admin = connect(&admin_url).await.unwrap();
 		let database = format!("psyche_{name}_{}", std::process::id());
@@ -863,7 +866,7 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn nobody_but_psyche_reads_the_log() {
+	async fn nobody_but_psyche_reads_the_log_or_the_keys() {
 		let Some((client, _)) = fresh_database("grants").await else {
 			return;
 		};
@@ -874,7 +877,7 @@ mod tests {
 			)
 			.await
 			.unwrap();
-		for table in ["psyche.requests", "psyche.usage_daily"] {
+		for table in ["psyche.requests", "psyche.usage_daily", "psyche.keys"] {
 			let error = client
 				.batch_execute(&format!(
 					"BEGIN; SET LOCAL ROLE psyche_test_reader; SELECT * FROM {table}; COMMIT"

@@ -69,8 +69,33 @@ Keys and budgets, more providers and automatic routing are being built.
   no redirects, https only, unless you run it with `PSYCHE_EGRESS=private` beside your own model
   servers.
 
-Callers authenticate with the project's service key (an HS256 JWT with `role: service_role`) as a
-Bearer token or an `apikey` header. Keys of its own, with budgets, come next.
+Callers authenticate as a Bearer token or an `apikey` header, with the project's service key (an
+HS256 JWT with `role: service_role`) or, when there is a database, a Psyche key (below). Budgets
+come next.
+
+### Keys
+
+A Psyche key (`psy_` and 256 random bits) is for a person, an app or an agent: give each its own,
+limit it to the models it needs, and revoke it alone. The service key manages them:
+
+```sh
+curl -X POST $PSYCHE/ai/v1/admin/keys -H "Authorization: Bearer $SERVICE_KEY" \
+  -d '{"name": "ci", "models": ["sonnet"], "expires_in": 2592000}'
+# {"id": "…", "key": "psy_…", "hint": "psy_Ab3x…9QzT", …}   the key is shown this once
+curl $PSYCHE/ai/v1/admin/keys -H "Authorization: Bearer $SERVICE_KEY"            # list
+curl -X DELETE $PSYCHE/ai/v1/admin/keys/<id> -H "Authorization: Bearer $SERVICE_KEY"  # revoke
+```
+
+Only a key's SHA-256 is stored (`psyche.keys`), so a lost key is replaced, not recovered. `models`
+left out allows every model; `expires_in` is seconds; `owner` is a user's id, for a key that belongs to
+someone. `GET /ai/v1/models` with a key lists only the models it may use, and a call to any other is
+refused (403). Each row of the request log names the key that made it (`key_id`).
+
+Psyche holds the live keys in memory, so checking one costs a hash and a lookup, never a query. It
+listens for `psyche_changed`, which a trigger on the table sends on every change, so a key made or
+revoked anywhere (this API, SQL, another Psyche) takes effect at once; it also reloads every minute
+in case a notification was missed while its connection was down. Without `DATABASE_URL` there are no
+keys, and only the service key works.
 
 ## Configuration
 
