@@ -1,14 +1,15 @@
 //! Budgets: reserve before a call is sent, settle when it ends (PS8).
 //!
-//! A budget caps what the project, or one key, may spend in a window: a calendar day or month (UTC),
-//! or the last N days. Before a call goes to its provider, its worst-case cost (the prompt's upper
+//! A budget caps what the project, one key, each signed-in user, one user or a group may spend in a
+//! window (`who.rs`): a calendar day or month (UTC), or the last N days. Before a call goes to its provider, its worst-case cost (the prompt's upper
 //! bound and the reply's cap, at the model's price) is reserved against every budget in its scope,
 //! under one lock, and a hard budget it would not fit refuses it with a sentence that names the
 //! budget. When the call ends the reservation is replaced by what the provider reported, so the
 //! next call sees what this one really cost, and a long reply can never run through a budget
 //! because the room for it was taken first.
 //!
-//! Spend is held in memory as one bucket per subject (the project, each key) per UTC day, read at
+//! Spend is held in memory as one bucket per subject (the project, each key, user and group) per UTC
+//! day, kept for every subject of a call any budget applies to, and read at
 //! start from `psyche.usage_daily` (kept for good, unlike the request log) for the last
 //! [`HISTORY_DAYS`]. In memory is the whole truth while the process runs (PS7: one process per
 //! project). What it can miss is a crash's unwritten log rows (`log.rs`), which a restart reads as
@@ -22,12 +23,14 @@
 //! refuses (it is reported in the `x-psyche-budget-warning` header), and a call under soft budgets
 //! only is sent no cap and reserved at [`UNCAPPED_OUTPUT`].
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 use crate::keys::KeyId;
 use crate::price::{Dollars, PICO};
+pub use crate::who::Subject;
+use crate::who::{Scope, UserId, Who, subjects};
 
 /// How far back spend is held: the longest window a budget may have.
 pub const HISTORY_DAYS: u32 = 366;
@@ -63,12 +66,6 @@ fn month_start(day: Day) -> Day {
 	day - (day_of_month - 1) as Day
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Subject {
-	Project,
-	Key(KeyId),
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Period {
 	Day,
@@ -101,7 +98,7 @@ impl Period {
 pub struct Budget {
 	pub id: KeyId,
 	pub name: String,
-	pub subject: Subject,
+	pub scope: Scope,
 	/// Picodollars.
 	pub limit: u64,
 	pub period: Period,
@@ -112,6 +109,8 @@ pub struct Budget {
 #[derive(Default)]
 struct Ledger {
 	budgets: Vec<Budget>,
+	/// The users a budget names one by one, whom the every-user budgets leave alone.
+	overridden: HashSet<UserId>,
 	/// Picodollars settled, per subject per day.
 	spent: HashMap<(Subject, Day), u64>,
 	/// Picodollars reserved by calls in flight, per subject.
@@ -121,6 +120,13 @@ struct Ledger {
 }
 
 impl Ledger {
+	/// The budgets that hold a call by `who`, each with what it holds it to.
+	fn over(&self, who: &Who) -> impl Iterator<Item = (&Budget, Subject)> {
+		self.budgets
+			.iter()
+			.filter_map(|b| Some((b, b.scope.subject(who, &self.overridden)?)))
+	}
+
 	fn spent(&self, subject: Subject, period: Period, today: Day) -> u64 {
 		(period.start(today)..=today)
 			.map(|day| self.spent.get(&(subject, day)).copied().unwrap_or(0))
@@ -145,16 +151,37 @@ impl Budgets {
 	}
 
 	pub fn replace(&self, budgets: Vec<Budget>) {
-		self.ledger().budgets = budgets;
+		let mut ledger = self.ledger();
+		ledger.overridden = crate::who::overridden(budgets.iter().map(|b| b.scope));
+		ledger.budgets = budgets;
 	}
 
-	/// Whether any budget would apply to a call by `key`.
-	pub fn applies(&self, key: Option<KeyId>) -> bool {
-		let subjects = subjects(key);
-		self.ledger()
-			.budgets
-			.iter()
-			.any(|b| subjects.contains(&b.subject))
+	/// Whether any budget would apply to a call by `who`.
+	pub fn applies(&self, who: &Who) -> bool {
+		self.ledger().over(who).next().is_some()
+	}
+
+	/// Why a signed-in user may not call yet, if they may not: the anon path takes no call until
+	/// the project has a hard budget of its own and a hard one for this user (every user's, or
+	/// theirs), so an app open to the world cannot spend without a cap (PS10b).
+	pub fn admits(&self, user: UserId) -> Result<(), &'static str> {
+		let ledger = self.ledger();
+		let who = Who {
+			user: Some(user),
+			..Who::default()
+		};
+		let hard = |subject: Subject| ledger.over(&who).any(|(b, s)| b.hard && s == subject);
+		if !hard(Subject::Project) {
+			return Err(
+				"Signed-in users can call models once the project has a hard budget of its own. Add one to psyche.budgets.",
+			);
+		}
+		if !hard(Subject::User(user)) {
+			return Err(
+				"Signed-in users can call models once each has a hard budget: add one with every_user set to psyche.budgets.",
+			);
+		}
+		Ok(())
 	}
 
 	/// Spend already settled (from the log, at start).
@@ -166,19 +193,17 @@ impl Budgets {
 
 	/// What the tightest hard budget over a call by `key` still has room for, in picodollars;
 	/// `None` when no hard budget applies.
-	pub fn room(&self, key: Option<KeyId>, now: SystemTime) -> Option<u64> {
+	pub fn room(&self, who: &Who, now: SystemTime) -> Option<u64> {
 		let today = day_of(now);
-		let subjects = subjects(key);
 		let ledger = self.ledger();
 		ledger
-			.budgets
-			.iter()
-			.filter(|b| b.hard && subjects.contains(&b.subject))
-			.map(|b| {
-				let reserved = ledger.reserved.get(&b.subject).copied().unwrap_or(0);
+			.over(who)
+			.filter(|(b, _)| b.hard)
+			.map(|(b, subject)| {
+				let reserved = ledger.reserved.get(&subject).copied().unwrap_or(0);
 				b.limit.saturating_sub(
 					ledger
-						.spent(b.subject, b.period, today)
+						.spent(subject, b.period, today)
 						.saturating_add(reserved),
 				)
 			})
@@ -187,23 +212,14 @@ impl Budgets {
 
 	/// Reserves `amount` picodollars for a call by `key`, or refuses it. A soft budget it would not
 	/// fit is named in the reservation's warnings instead.
-	pub fn reserve(
-		&self,
-		key: Option<KeyId>,
-		amount: u64,
-		now: SystemTime,
-	) -> Result<Reservation, Over> {
+	pub fn reserve(&self, who: &Who, amount: u64, now: SystemTime) -> Result<Reservation, Over> {
 		let today = day_of(now);
-		let subjects = subjects(key);
+		let subjects = subjects(who);
 		let mut ledger = self.ledger();
 		let mut warnings = Vec::new();
-		for budget in ledger
-			.budgets
-			.iter()
-			.filter(|b| subjects.contains(&b.subject))
-		{
-			let spent = ledger.spent(budget.subject, budget.period, today);
-			let reserved = ledger.reserved.get(&budget.subject).copied().unwrap_or(0);
+		for (budget, subject) in ledger.over(who) {
+			let spent = ledger.spent(subject, budget.period, today);
+			let reserved = ledger.reserved.get(&subject).copied().unwrap_or(0);
 			let used = spent.saturating_add(reserved);
 			if used.saturating_add(amount) <= budget.limit {
 				continue;
@@ -236,13 +252,6 @@ impl Budgets {
 			warnings,
 			settled: false,
 		})
-	}
-}
-
-fn subjects(key: Option<KeyId>) -> Vec<Subject> {
-	match key {
-		None => vec![Subject::Project],
-		Some(key) => vec![Subject::Project, Subject::Key(key)],
 	}
 }
 
@@ -294,6 +303,9 @@ impl Reservation {
 		for subject in &self.subjects {
 			if let Some(held) = ledger.reserved.get_mut(subject) {
 				*held = held.saturating_sub(self.amount);
+				if *held == 0 {
+					ledger.reserved.remove(subject);
+				}
 			}
 			let bucket = ledger.spent.entry((*subject, day)).or_insert(0);
 			*bucket = bucket.saturating_add(charge);
@@ -340,8 +352,8 @@ pub fn prompt_bound(body: &[u8]) -> u64 {
 pub async fn load(client: &tokio_postgres::Client) -> Result<Vec<Budget>, tokio_postgres::Error> {
 	let rows = client
 		.query(
-			"SELECT id::text, name, key_id::text, (amount * 1000000000000)::bigint, period, days, hard \
-			 FROM psyche.budgets",
+			"SELECT id::text, name, key_id::text, (amount * 1000000000000)::bigint, period, days, hard, \
+			 every_user, user_id::text, group_id::text FROM psyche.budgets",
 			&[],
 		)
 		.await?;
@@ -357,10 +369,7 @@ pub async fn load(client: &tokio_postgres::Client) -> Result<Vec<Budget>, tokio_
 			Some(Budget {
 				id: KeyId::parse(row.get(0))?,
 				name: row.get(1),
-				subject: match row.get::<_, Option<&str>>(2) {
-					None => Subject::Project,
-					Some(key) => Subject::Key(KeyId::parse(key)?),
-				},
+				scope: Scope::from_row(row.get(2), row.get(7), row.get(8), row.get(9))?,
 				limit: u64::try_from(row.get::<_, i64>(3)).unwrap_or(0),
 				period,
 				hard: row.get(6),
@@ -379,18 +388,23 @@ pub async fn load_spent(
 	let today = day_of(now);
 	let rows = client
 		.query(
-			"SELECT (day - date '1970-01-01')::int, key_id::text, \
+			"SELECT (day - date '1970-01-01')::int, key_id::text, user_id::text, group_id::text, \
 			 (sum(cost) * 1000000000000)::bigint FROM psyche.usage_daily \
-			 WHERE day >= date '1970-01-01' + $1::int GROUP BY 1, 2",
+			 WHERE day >= date '1970-01-01' + $1::int GROUP BY 1, 2, 3, 4",
 			&[&(today.saturating_sub(HISTORY_DAYS) as i32)],
 		)
 		.await?;
 	for row in rows {
 		let day = row.get::<_, i32>(0).max(0) as Day;
-		let spent = u64::try_from(row.get::<_, i64>(2)).unwrap_or(0);
-		budgets.add_spent(Subject::Project, day, spent);
-		if let Some(key) = row.get::<_, Option<&str>>(1).and_then(KeyId::parse) {
-			budgets.add_spent(Subject::Key(key), day, spent);
+		let spent = u64::try_from(row.get::<_, i64>(4)).unwrap_or(0);
+		let id = |n: usize| row.get::<_, Option<&str>>(n).and_then(KeyId::parse);
+		let who = Who {
+			key: id(1),
+			user: id(2),
+			group: id(3),
+		};
+		for subject in subjects(&who) {
+			budgets.add_spent(subject, day, spent);
 		}
 	}
 	Ok(())
@@ -401,11 +415,18 @@ mod tests {
 	use super::*;
 	use std::time::Duration;
 
-	fn budget(name: &str, subject: Subject, dollars: u64, period: Period, hard: bool) -> Budget {
+	fn by(key: KeyId) -> Who {
+		Who {
+			key: Some(key),
+			..Who::default()
+		}
+	}
+
+	fn budget(name: &str, scope: Scope, dollars: u64, period: Period, hard: bool) -> Budget {
 		Budget {
 			id: KeyId([name.len() as u8; 16]),
 			name: name.into(),
-			subject,
+			scope,
 			limit: dollars * PICO,
 			period,
 			hard,
@@ -427,10 +448,10 @@ mod tests {
 	fn a_call_that_would_not_fit_is_refused_and_names_the_budget() {
 		let budgets = Budgets::default();
 		let key = KeyId([7; 16]);
-		budgets.replace(vec![budget("ci", Subject::Key(key), 1, Period::Day, true)]);
+		budgets.replace(vec![budget("ci", Scope::Key(key), 1, Period::Day, true)]);
 		let now = SystemTime::now();
-		let first = budgets.reserve(Some(key), PICO * 6 / 10, now).unwrap();
-		let over = budgets.reserve(Some(key), PICO * 6 / 10, now).unwrap_err();
+		let first = budgets.reserve(&by(key), PICO * 6 / 10, now).unwrap();
+		let over = budgets.reserve(&by(key), PICO * 6 / 10, now).unwrap_err();
 		assert_eq!(over.budget, "ci");
 		assert!(
 			over.message.contains("$1.00 a day") && over.message.contains("$0.40 left"),
@@ -440,13 +461,73 @@ mod tests {
 		// Another key, and the service key, are not held by it.
 		assert!(
 			budgets
-				.reserve(Some(KeyId([8; 16])), PICO * 6 / 10, now)
+				.reserve(&by(KeyId([8; 16])), PICO * 6 / 10, now)
 				.is_ok()
 		);
-		assert!(budgets.reserve(None, PICO * 6 / 10, now).is_ok());
+		assert!(budgets.reserve(&Who::default(), PICO * 6 / 10, now).is_ok());
 		// Settled at what it really cost, the room comes back.
 		first.settle(Some(PICO / 10), now);
-		assert!(budgets.reserve(Some(key), PICO * 6 / 10, now).is_ok());
+		assert!(budgets.reserve(&by(key), PICO * 6 / 10, now).is_ok());
+	}
+
+	#[test]
+	fn each_user_has_their_own_room_a_group_shares_one_and_an_override_replaces_the_default() {
+		let budgets = Budgets::default();
+		let (alice, bob, carol, team) = (
+			KeyId([1; 16]),
+			KeyId([2; 16]),
+			KeyId([3; 16]),
+			KeyId([4; 16]),
+		);
+		let user = |id: KeyId, group: Option<KeyId>| Who {
+			key: None,
+			user: Some(id),
+			group,
+		};
+		let now = SystemTime::now();
+		assert!(budgets.admits(alice).is_err(), "no budgets yet");
+		budgets.replace(vec![budget(
+			"everyone",
+			Scope::EveryUser,
+			1,
+			Period::Day,
+			true,
+		)]);
+		assert!(
+			budgets.admits(alice).unwrap_err().contains("of its own"),
+			"a user budget alone is not enough"
+		);
+		budgets.replace(vec![
+			budget("project", Scope::Project, 100, Period::Month, true),
+			budget("everyone", Scope::EveryUser, 1, Period::Day, true),
+			budget("team", Scope::Group(team), 2, Period::Day, true),
+			budget("alice", Scope::User(alice), 5, Period::Day, true),
+		]);
+		assert!(budgets.admits(bob).is_ok());
+		// Each user spends from their own dollar.
+		let bob_spends = budgets.reserve(&user(bob, None), PICO, now).unwrap();
+		assert!(budgets.reserve(&user(bob, None), PICO / 10, now).is_err());
+		let carol_holds = budgets
+			.reserve(&user(carol, Some(team)), PICO, now)
+			.unwrap();
+		bob_spends.settle(Some(PICO), now);
+		// Alice's own budget replaces the default: five dollars, not one.
+		let over = budgets
+			.reserve(&user(alice, None), PICO * 6, now)
+			.unwrap_err();
+		assert_eq!(over.budget, "alice");
+		assert!(budgets.reserve(&user(alice, None), PICO * 4, now).is_ok());
+		assert!(budgets.admits(alice).is_ok());
+		// Carol's group has two dollars for all of its members, Carol and Dave hold one and a half.
+		let dave = KeyId([5; 16]);
+		let dave_holds = budgets
+			.reserve(&user(dave, Some(team)), PICO / 2, now)
+			.unwrap();
+		let over = budgets
+			.reserve(&user(KeyId([6; 16]), Some(team)), PICO * 6 / 10, now)
+			.unwrap_err();
+		assert_eq!(over.budget, "team");
+		drop((carol_holds, dave_holds));
 	}
 
 	#[test]
@@ -454,27 +535,25 @@ mod tests {
 		let budgets = Budgets::default();
 		let key = KeyId([7; 16]);
 		let now = SystemTime::now();
-		assert_eq!(budgets.room(Some(key), now), None);
+		assert_eq!(budgets.room(&by(key), now), None);
 		budgets.replace(vec![
-			budget("soft", Subject::Key(key), 1, Period::Day, false),
-			budget("project", Subject::Project, 5, Period::Month, true),
-			budget("key", Subject::Key(key), 2, Period::Day, true),
+			budget("soft", Scope::Key(key), 1, Period::Day, false),
+			budget("project", Scope::Project, 5, Period::Month, true),
+			budget("key", Scope::Key(key), 2, Period::Day, true),
 		]);
-		assert_eq!(budgets.room(Some(key), now), Some(2 * PICO));
-		assert_eq!(budgets.room(None, now), Some(5 * PICO));
-		let held = budgets.reserve(Some(key), PICO / 2, now).unwrap();
-		assert_eq!(budgets.room(Some(key), now), Some(PICO * 3 / 2));
+		assert_eq!(budgets.room(&by(key), now), Some(2 * PICO));
+		assert_eq!(budgets.room(&Who::default(), now), Some(5 * PICO));
+		let held = budgets.reserve(&by(key), PICO / 2, now).unwrap();
+		assert_eq!(budgets.room(&by(key), now), Some(PICO * 3 / 2));
 		held.settle(Some(PICO), now);
-		assert_eq!(budgets.room(Some(key), now), Some(PICO));
-		assert_eq!(budgets.room(None, now), Some(4 * PICO));
-		budgets.replace(vec![budget(
-			"soft",
-			Subject::Project,
-			1,
-			Period::Day,
-			false,
-		)]);
-		assert_eq!(budgets.room(None, now), None, "a soft budget sets no room");
+		assert_eq!(budgets.room(&by(key), now), Some(PICO));
+		assert_eq!(budgets.room(&Who::default(), now), Some(4 * PICO));
+		budgets.replace(vec![budget("soft", Scope::Project, 1, Period::Day, false)]);
+		assert_eq!(
+			budgets.room(&Who::default(), now),
+			None,
+			"a soft budget sets no room"
+		);
 	}
 
 	#[test]
@@ -483,38 +562,40 @@ mod tests {
 		let budgets = Budgets::default();
 		budgets.replace(vec![budget(
 			"project",
-			Subject::Project,
+			Scope::Project,
 			1,
 			Period::Month,
 			true,
 		)]);
 		let now = SystemTime::now();
-		let long = budgets.reserve(None, PICO * 9 / 10, now).unwrap();
+		let long = budgets
+			.reserve(&Who::default(), PICO * 9 / 10, now)
+			.unwrap();
 		assert!(
-			budgets.reserve(None, PICO / 5, now).is_err(),
+			budgets.reserve(&Who::default(), PICO / 5, now).is_err(),
 			"the room is taken"
 		);
 		long.settle(Some(PICO * 9 / 10), now);
 		assert!(
-			budgets.reserve(None, PICO / 5, now).is_err(),
+			budgets.reserve(&Who::default(), PICO / 5, now).is_err(),
 			"and then spent"
 		);
-		assert!(budgets.reserve(None, PICO / 10, now).is_ok());
+		assert!(budgets.reserve(&Who::default(), PICO / 10, now).is_ok());
 	}
 
 	#[test]
 	fn a_call_with_no_usage_is_charged_its_reservation_and_one_never_sent_nothing() {
 		let budgets = Budgets::default();
-		budgets.replace(vec![budget("p", Subject::Project, 1, Period::Day, true)]);
+		budgets.replace(vec![budget("p", Scope::Project, 1, Period::Day, true)]);
 		let now = SystemTime::now();
 		budgets
-			.reserve(None, PICO / 2, now)
+			.reserve(&Who::default(), PICO / 2, now)
 			.unwrap()
 			.settle(None, now);
-		drop(budgets.reserve(None, PICO / 4, now).unwrap());
-		let held = budgets.reserve(None, PICO / 2, now).unwrap();
+		drop(budgets.reserve(&Who::default(), PICO / 4, now).unwrap());
+		let held = budgets.reserve(&Who::default(), PICO / 2, now).unwrap();
 		assert!(
-			budgets.reserve(None, PICO / 100, now).is_err(),
+			budgets.reserve(&Who::default(), PICO / 100, now).is_err(),
 			"$0.50 charged, $0.50 held"
 		);
 		drop(held);
@@ -524,20 +605,20 @@ mod tests {
 	fn a_soft_budget_warns_and_windows_forget_old_days() {
 		let budgets = Budgets::default();
 		budgets.replace(vec![
-			budget("soft", Subject::Project, 1, Period::Rolling(7), false),
-			budget("day", Subject::Project, 5, Period::Day, true),
+			budget("soft", Scope::Project, 1, Period::Rolling(7), false),
+			budget("day", Scope::Project, 5, Period::Day, true),
 		]);
 		let now = SystemTime::now();
 		let today = day_of(now);
 		budgets.add_spent(Subject::Project, today - 7, PICO * 4);
 		budgets.add_spent(Subject::Project, today - 6, PICO);
-		let reservation = budgets.reserve(None, PICO / 10, now).unwrap();
+		let reservation = budgets.reserve(&Who::default(), PICO / 10, now).unwrap();
 		assert_eq!(reservation.warnings, vec!["soft".to_string()]);
 		drop(reservation);
 		let tomorrow = now + Duration::from_secs(SECONDS_PER_DAY);
 		assert!(
 			budgets
-				.reserve(None, PICO / 10, tomorrow)
+				.reserve(&Who::default(), PICO / 10, tomorrow)
 				.unwrap()
 				.warnings
 				.is_empty(),
@@ -563,15 +644,15 @@ mod tests {
 		load_spent(&db, &budgets, SystemTime::now()).await.unwrap();
 		let key = KeyId::parse(id).unwrap();
 		budgets.replace(vec![
-			budget("project", Subject::Project, 2, Period::Rolling(2), true),
-			budget("key", Subject::Key(key), 1, Period::Day, true),
+			budget("project", Scope::Project, 2, Period::Rolling(2), true),
+			budget("key", Scope::Key(key), 1, Period::Day, true),
 		]);
 		let now = SystemTime::now();
 		// The project has spent $1.25 in two days (the day 400 back is past the history), the key $0.75.
-		assert!(budgets.reserve(None, PICO * 3 / 4, now).is_ok());
-		assert!(budgets.reserve(None, PICO * 4 / 5, now).is_err());
-		assert!(budgets.reserve(Some(key), PICO / 4, now).is_ok());
-		assert!(budgets.reserve(Some(key), PICO * 3 / 10, now).is_err());
+		assert!(budgets.reserve(&Who::default(), PICO * 3 / 4, now).is_ok());
+		assert!(budgets.reserve(&Who::default(), PICO * 4 / 5, now).is_err());
+		assert!(budgets.reserve(&by(key), PICO / 4, now).is_ok());
+		assert!(budgets.reserve(&by(key), PICO * 3 / 10, now).is_err());
 	}
 
 	#[test]

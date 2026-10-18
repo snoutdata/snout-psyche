@@ -36,7 +36,7 @@ use axum::extract::rejection::BytesRejection;
 use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, post, put};
 use futures_util::{Stream, StreamExt, TryStreamExt};
 use serde_json::{Map, Value, json};
 
@@ -52,6 +52,7 @@ use crate::providers::{Catalogue, Kind, Model, Provider};
 use crate::sse::{Event, Parser};
 use crate::translate::{Out, Translator};
 use crate::usage::Usage;
+use crate::who::{Members, UserId, Who};
 use crate::{anthropic, bedrock, embeddings, sigv4};
 
 /// How much of a provider's error body is read. Errors are a few hundred bytes.
@@ -79,10 +80,12 @@ pub struct Proxy {
 	pub limits: Option<Limits>,
 }
 
-/// The keys in memory, and the database they are kept in, which the admin API writes to.
+/// The keys and memberships in memory, and the database they are kept in, which the admin API
+/// writes to.
 #[derive(Clone)]
 pub struct Keys {
 	pub store: keys::Store,
+	pub members: Members,
 	pub database_url: String,
 }
 
@@ -92,19 +95,32 @@ pub enum Caller {
 	/// The project's service key: every model, and the admin API.
 	Service,
 	Key(Arc<Key>),
+	/// A signed-in user of the project's app, with their own token (PS10b).
+	User(UserId),
 }
 
 impl Caller {
-	fn key(&self) -> Option<KeyId> {
-		match self {
-			Caller::Service => None,
-			Caller::Key(key) => Some(key.id),
+	/// Who the call is from, for budgets, limits and the log: a key's owner and a user's group
+	/// included.
+	fn who(&self, members: Option<&Members>) -> Who {
+		let (key, user) = match self {
+			Caller::Service => (None, None),
+			Caller::Key(key) => (Some(key.id), key.owner),
+			Caller::User(user) => (None, Some(*user)),
+		};
+		match members {
+			Some(members) => members.who(key, user),
+			None => Who {
+				key,
+				user,
+				group: None,
+			},
 		}
 	}
 
 	fn may_use(&self, model: &str) -> bool {
 		match self {
-			Caller::Service => true,
+			Caller::Service | Caller::User(_) => true,
 			Caller::Key(key) => key.allows(model),
 		}
 	}
@@ -123,8 +139,8 @@ pub struct Call {
 	pub usage: Option<Usage>,
 	/// The model's price, so the log can cost the call; `None` when nothing prices it.
 	pub price: Option<Price>,
-	/// The key that made the call; `None` for the service key.
-	pub key: Option<KeyId>,
+	/// Who made the call: its key, its user and the user's group; none of them for the service key.
+	pub who: Who,
 	/// From sending the request to the provider's response headers.
 	pub first_byte: Duration,
 	pub total: Duration,
@@ -376,7 +392,13 @@ pub fn router(proxy: Arc<Proxy>) -> Router {
 		.route("/admin/budgets", get(list_budgets).post(create_budget))
 		.route("/admin/budgets/{id}", delete(delete_budget))
 		.route("/admin/limits", get(list_limits).post(create_limit))
-		.route("/admin/limits/{id}", delete(delete_limit));
+		.route("/admin/limits/{id}", delete(delete_limit))
+		.route("/admin/groups", get(list_groups).post(create_group))
+		.route("/admin/groups/{id}", delete(delete_group))
+		.route(
+			"/admin/members/{user_id}",
+			put(set_member).delete(remove_member),
+		);
 	let limit = proxy.max_request_bytes;
 	Router::new()
 		.nest("/ai/v1", api.clone())
@@ -451,7 +473,7 @@ async fn admin(
 	if !matches!(proxy.authorize(headers)?, Caller::Service) {
 		return Err(ApiError::new(
 			Class::Forbidden,
-			"Only the project's service key may manage keys.",
+			"Only the project's service key may use the admin API.",
 		));
 	}
 	let keys = proxy.keys.clone().ok_or_else(|| {
@@ -560,7 +582,6 @@ async fn revoke_key(
 
 /// What the admin API makes a budget from.
 #[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
 struct NewBudget {
 	name: String,
 	/// US dollars.
@@ -568,8 +589,8 @@ struct NewBudget {
 	period: String,
 	#[serde(default)]
 	days: Option<i32>,
-	#[serde(default)]
-	key_id: Option<String>,
+	#[serde(flatten)]
+	whom: Whom,
 	#[serde(default = "yes")]
 	hard: bool,
 }
@@ -578,13 +599,82 @@ fn yes() -> bool {
 	true
 }
 
-/// What the admin API makes a rate limit from.
-#[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct NewLimit {
-	name: String,
+/// Whom a new budget or limit is for, as the admin API takes it: at most one of these (none is the
+/// project).
+#[derive(serde::Deserialize, Default)]
+struct Whom {
 	#[serde(default)]
 	key_id: Option<String>,
+	#[serde(default)]
+	every_user: bool,
+	#[serde(default)]
+	user_id: Option<String>,
+	#[serde(default)]
+	group_id: Option<String>,
+}
+
+/// The four columns that say whom a row is for.
+type WhomColumns = (Option<KeyId>, bool, Option<KeyId>, Option<KeyId>);
+
+impl Whom {
+	fn columns(&self) -> Result<WhomColumns, ApiError> {
+		let id = |text: &Option<String>, what: &str| match text {
+			None => Ok(None),
+			Some(text) => KeyId::parse(text)
+				.map(Some)
+				.ok_or_else(|| ApiError::new(Class::BadRequest, format!("{what} is a uuid."))),
+		};
+		let columns = (
+			id(&self.key_id, "key_id")?,
+			self.every_user,
+			id(&self.user_id, "user_id")?,
+			id(&self.group_id, "group_id")?,
+		);
+		let named = [
+			columns.0.is_some(),
+			columns.1,
+			columns.2.is_some(),
+			columns.3.is_some(),
+		];
+		if named.iter().filter(|n| **n).count() > 1 {
+			return Err(ApiError::new(
+				Class::BadRequest,
+				"Name one of key_id, every_user, user_id and group_id, or none for the project.",
+			));
+		}
+		Ok(columns)
+	}
+
+	fn json(&self) -> Value {
+		json!({"key_id": self.key_id, "every_user": self.every_user, "user_id": self.user_id,
+			"group_id": self.group_id})
+	}
+}
+
+/// The `whom` columns of a listed row, from `key_id::text, every_user, user_id::text,
+/// group_id::text` starting at `at`.
+fn whom_json(row: &tokio_postgres::Row, at: usize) -> Value {
+	json!({
+		"key_id": row.get::<_, Option<String>>(at),
+		"every_user": row.get::<_, bool>(at + 1),
+		"user_id": row.get::<_, Option<String>>(at + 2),
+		"group_id": row.get::<_, Option<String>>(at + 3),
+	})
+}
+
+fn merge(mut into: Value, from: Value) -> Value {
+	if let (Value::Object(into), Value::Object(from)) = (&mut into, from) {
+		into.extend(from);
+	}
+	into
+}
+
+/// What the admin API makes a rate limit from.
+#[derive(serde::Deserialize)]
+struct NewLimit {
+	name: String,
+	#[serde(flatten)]
+	whom: Whom,
 	#[serde(default)]
 	requests_per_minute: Option<i32>,
 	#[serde(default)]
@@ -599,6 +689,214 @@ async fn reload_limits(proxy: &Proxy, client: &tokio_postgres::Client) {
 				tracing::warn!(error = %crate::db_message(&error), "could not reload the limits")
 			}
 		}
+	}
+}
+
+const WHOM_FIELDS: [&str; 4] = ["key_id", "every_user", "user_id", "group_id"];
+const BUDGET_FIELDS: &[&str] = &["name", "amount", "period", "days", "hard"];
+const LIMIT_FIELDS: &[&str] = &["name", "requests_per_minute", "tokens_per_minute"];
+
+/// An admin body, refusing a field it does not know (which `deny_unknown_fields` cannot do next to
+/// a flattened struct).
+fn admin_body<T: serde::de::DeserializeOwned>(
+	body: &[u8],
+	fields: &[&str],
+	what: &str,
+) -> Result<T, ApiError> {
+	let known = || {
+		let all: Vec<&str> = fields.iter().copied().chain(WHOM_FIELDS).collect();
+		format!("{what} is made from {}", all.join(", "))
+	};
+	let value: Value = serde_json::from_slice(body)
+		.map_err(|e| ApiError::new(Class::BadRequest, format!("{}: {e}", known())))?;
+	if let Some(unknown) = value.as_object().and_then(|o| {
+		o.keys()
+			.find(|k| !fields.contains(&k.as_str()) && !WHOM_FIELDS.contains(&k.as_str()))
+	}) {
+		return Err(ApiError::new(
+			Class::BadRequest,
+			format!("{}, not {unknown}.", known()),
+		));
+	}
+	serde_json::from_value(value)
+		.map_err(|e| ApiError::new(Class::BadRequest, format!("{}: {e}", known())))
+}
+
+/// Reads the memberships again after the admin API changed them, so the next call sees it.
+async fn reload_members(keys: &Keys, client: &tokio_postgres::Client) {
+	match crate::who::load(client).await {
+		Ok(members) => keys.members.replace(members),
+		Err(error) => {
+			tracing::warn!(error = %crate::db_message(&error), "could not reload the members")
+		}
+	}
+}
+
+fn not_found(message: &str) -> ApiError {
+	let mut error = ApiError::new(Class::BadRequest, message);
+	error.status = Some(StatusCode::NOT_FOUND);
+	error
+}
+
+async fn list_groups(State(proxy): State<Arc<Proxy>>, headers: HeaderMap) -> Response {
+	let result = async {
+		let (_, client) = admin(&proxy, &headers).await?;
+		let rows = client
+			.query(
+				"SELECT g.id::text, g.name, count(m.user_id) FROM psyche.groups g \
+				 LEFT JOIN psyche.members m ON m.group_id = g.id GROUP BY g.id ORDER BY g.created_at, g.id",
+				&[],
+			)
+			.await
+			.map_err(|e| database_error(&e))?;
+		Ok::<_, ApiError>(
+			rows.iter()
+				.map(|row| {
+					json!({"id": row.get::<_, String>(0), "name": row.get::<_, String>(1),
+						"members": row.get::<_, i64>(2)})
+				})
+				.collect::<Vec<_>>(),
+		)
+	}
+	.await;
+	match result {
+		Ok(data) => axum::Json(json!({"object": "list", "data": data})).into_response(),
+		Err(error) => error.into_response(),
+	}
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NewGroup {
+	name: String,
+}
+
+async fn create_group(
+	State(proxy): State<Arc<Proxy>>,
+	headers: HeaderMap,
+	body: Result<Bytes, BytesRejection>,
+) -> Response {
+	let result = async {
+		let (_, client) = admin(&proxy, &headers).await?;
+		let body = body.map_err(|r| ApiError::new(Class::BadRequest, r.body_text()))?;
+		let new: NewGroup = serde_json::from_slice(&body).map_err(|e| {
+			ApiError::new(
+				Class::BadRequest,
+				format!("A group is made from {{\"name\"}}: {e}"),
+			)
+		})?;
+		let row = client
+			.query_one(
+				"INSERT INTO psyche.groups (name) VALUES ($1) RETURNING id::text",
+				&[&new.name.trim()],
+			)
+			.await
+			.map_err(|e| write_error(&e))?;
+		Ok::<_, ApiError>(json!({"id": row.get::<_, String>(0), "name": new.name.trim()}))
+	}
+	.await;
+	match result {
+		Ok(made) => (StatusCode::CREATED, axum::Json(made)).into_response(),
+		Err(error) => error.into_response(),
+	}
+}
+
+async fn delete_group(
+	State(proxy): State<Arc<Proxy>>,
+	headers: HeaderMap,
+	Path(id): Path<String>,
+) -> Response {
+	let result = async {
+		let (keys, client) = admin(&proxy, &headers).await?;
+		let id = KeyId::parse(&id)
+			.ok_or_else(|| ApiError::new(Class::BadRequest, "A group's id is a uuid."))?;
+		let deleted = client
+			.execute("DELETE FROM psyche.groups WHERE id = $1", &[&id])
+			.await
+			.map_err(|e| database_error(&e))?;
+		// Its members, budgets and limits went with it.
+		reload_members(&keys, &client).await;
+		reload_budgets(&proxy, &client).await;
+		reload_limits(&proxy, &client).await;
+		if deleted == 0 {
+			return Err(not_found("There is no group with that id."));
+		}
+		Ok(())
+	}
+	.await;
+	match result {
+		Ok(()) => StatusCode::NO_CONTENT.into_response(),
+		Err(error) => error.into_response(),
+	}
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Membership {
+	group_id: String,
+}
+
+/// Puts a user in a group, moving them out of any other.
+async fn set_member(
+	State(proxy): State<Arc<Proxy>>,
+	headers: HeaderMap,
+	Path(user): Path<String>,
+	body: Result<Bytes, BytesRejection>,
+) -> Response {
+	let result = async {
+		let (keys, client) = admin(&proxy, &headers).await?;
+		let user = KeyId::parse(&user)
+			.ok_or_else(|| ApiError::new(Class::BadRequest, "A user's id is a uuid."))?;
+		let body = body.map_err(|r| ApiError::new(Class::BadRequest, r.body_text()))?;
+		let membership: Membership = serde_json::from_slice(&body).map_err(|e| {
+			ApiError::new(
+				Class::BadRequest,
+				format!("A membership is {{\"group_id\"}}: {e}"),
+			)
+		})?;
+		let group = KeyId::parse(&membership.group_id)
+			.ok_or_else(|| ApiError::new(Class::BadRequest, "group_id is a uuid."))?;
+		client
+			.execute(
+				"INSERT INTO psyche.members (user_id, group_id) VALUES ($1, $2) \
+				 ON CONFLICT (user_id) DO UPDATE SET group_id = excluded.group_id",
+				&[&user, &group],
+			)
+			.await
+			.map_err(|e| write_error(&e))?;
+		reload_members(&keys, &client).await;
+		Ok::<_, ApiError>(json!({"user_id": user.to_string(), "group_id": group.to_string()}))
+	}
+	.await;
+	match result {
+		Ok(made) => axum::Json(made).into_response(),
+		Err(error) => error.into_response(),
+	}
+}
+
+async fn remove_member(
+	State(proxy): State<Arc<Proxy>>,
+	headers: HeaderMap,
+	Path(user): Path<String>,
+) -> Response {
+	let result = async {
+		let (keys, client) = admin(&proxy, &headers).await?;
+		let user = KeyId::parse(&user)
+			.ok_or_else(|| ApiError::new(Class::BadRequest, "A user's id is a uuid."))?;
+		let deleted = client
+			.execute("DELETE FROM psyche.members WHERE user_id = $1", &[&user])
+			.await
+			.map_err(|e| database_error(&e))?;
+		reload_members(&keys, &client).await;
+		if deleted == 0 {
+			return Err(not_found("That user is in no group."));
+		}
+		Ok(())
+	}
+	.await;
+	match result {
+		Ok(()) => StatusCode::NO_CONTENT.into_response(),
+		Err(error) => error.into_response(),
 	}
 }
 
@@ -618,7 +916,8 @@ async fn list_limits(State(proxy): State<Arc<Proxy>>, headers: HeaderMap) -> Res
 		let (_, client) = admin(&proxy, &headers).await?;
 		let rows = client
 			.query(
-				"SELECT id::text, name, key_id::text, requests_per_minute, tokens_per_minute \
+				"SELECT id::text, name, requests_per_minute, tokens_per_minute, \
+				 key_id::text, every_user, user_id::text, group_id::text \
 				 FROM psyche.limits ORDER BY created_at, id",
 				&[],
 			)
@@ -627,13 +926,15 @@ async fn list_limits(State(proxy): State<Arc<Proxy>>, headers: HeaderMap) -> Res
 		Ok::<_, ApiError>(
 			rows.iter()
 				.map(|row| {
-					json!({
-						"id": row.get::<_, String>(0),
-						"name": row.get::<_, String>(1),
-						"key_id": row.get::<_, Option<String>>(2),
-						"requests_per_minute": row.get::<_, Option<i32>>(3),
-						"tokens_per_minute": row.get::<_, Option<i32>>(4),
-					})
+					merge(
+						json!({
+							"id": row.get::<_, String>(0),
+							"name": row.get::<_, String>(1),
+							"requests_per_minute": row.get::<_, Option<i32>>(2),
+							"tokens_per_minute": row.get::<_, Option<i32>>(3),
+						}),
+						whom_json(row, 4),
+					)
 				})
 				.collect::<Vec<_>>(),
 		)
@@ -653,30 +954,22 @@ async fn create_limit(
 	let result = async {
 		let (_, client) = admin(&proxy, &headers).await?;
 		let body = body.map_err(|r| ApiError::new(Class::BadRequest, r.body_text()))?;
-		let new: NewLimit = serde_json::from_slice(&body).map_err(|e| {
-			ApiError::new(
-				Class::BadRequest,
-				format!("A limit is made from {{\"name\", \"key_id\", \"requests_per_minute\", \"tokens_per_minute\"}}: {e}"),
-			)
-		})?;
-		let key = match &new.key_id {
-			None => None,
-			Some(id) => Some(
-				KeyId::parse(id)
-					.ok_or_else(|| ApiError::new(Class::BadRequest, "key_id is a key's id, a uuid."))?,
-			),
-		};
+		let new: NewLimit = admin_body(&body, LIMIT_FIELDS, "A limit")?;
+		let (key, every_user, user, group) = new.whom.columns()?;
 		let row = client
 			.query_one(
-				"INSERT INTO psyche.limits (name, key_id, requests_per_minute, tokens_per_minute) \
-				 VALUES ($1, $2, $3, $4) RETURNING id::text",
-				&[&new.name.trim(), &key, &new.requests_per_minute, &new.tokens_per_minute],
+				"INSERT INTO psyche.limits (name, key_id, every_user, user_id, group_id, \
+				 requests_per_minute, tokens_per_minute) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id::text",
+				&[&new.name.trim(), &key, &every_user, &user, &group, &new.requests_per_minute, &new.tokens_per_minute],
 			)
 			.await
 			.map_err(|e| write_error(&e))?;
 		reload_limits(&proxy, &client).await;
-		Ok::<_, ApiError>(json!({"id": row.get::<_, String>(0), "name": new.name.trim(), "key_id": new.key_id,
-			"requests_per_minute": new.requests_per_minute, "tokens_per_minute": new.tokens_per_minute}))
+		Ok::<_, ApiError>(merge(
+			json!({"id": row.get::<_, String>(0), "name": new.name.trim(),
+				"requests_per_minute": new.requests_per_minute, "tokens_per_minute": new.tokens_per_minute}),
+			new.whom.json(),
+		))
 	}
 	.await;
 	match result {
@@ -731,7 +1024,8 @@ async fn list_budgets(State(proxy): State<Arc<Proxy>>, headers: HeaderMap) -> Re
 		let (_, client) = admin(&proxy, &headers).await?;
 		let rows = client
 			.query(
-				"SELECT id::text, name, key_id::text, amount::text, period, days, hard, created_at \
+				"SELECT id::text, name, amount::text, period, days, hard, created_at, \
+				 key_id::text, every_user, user_id::text, group_id::text \
 				 FROM psyche.budgets ORDER BY created_at, id",
 				&[],
 			)
@@ -740,16 +1034,18 @@ async fn list_budgets(State(proxy): State<Arc<Proxy>>, headers: HeaderMap) -> Re
 		Ok::<_, ApiError>(
 			rows.iter()
 				.map(|row| {
-					json!({
-						"id": row.get::<_, String>(0),
-						"name": row.get::<_, String>(1),
-						"key_id": row.get::<_, Option<String>>(2),
-						"amount": row.get::<_, String>(3),
-						"period": row.get::<_, String>(4),
-						"days": row.get::<_, Option<i32>>(5),
-						"hard": row.get::<_, bool>(6),
-						"created_at": row.get::<_, SystemTime>(7).duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs()),
-					})
+					merge(
+						json!({
+							"id": row.get::<_, String>(0),
+							"name": row.get::<_, String>(1),
+							"amount": row.get::<_, String>(2),
+							"period": row.get::<_, String>(3),
+							"days": row.get::<_, Option<i32>>(4),
+							"hard": row.get::<_, bool>(5),
+							"created_at": row.get::<_, SystemTime>(6).duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs()),
+						}),
+						whom_json(row, 7),
+					)
 				})
 				.collect::<Vec<_>>(),
 		)
@@ -769,39 +1065,31 @@ async fn create_budget(
 	let result = async {
 		let (_, client) = admin(&proxy, &headers).await?;
 		let body = body.map_err(|r| ApiError::new(Class::BadRequest, r.body_text()))?;
-		let new: NewBudget = serde_json::from_slice(&body).map_err(|e| {
-			ApiError::new(
-				Class::BadRequest,
-				format!("A budget is made from {{\"name\", \"amount\", \"period\", \"days\", \"key_id\", \"hard\"}}: {e}"),
-			)
-		})?;
+		let new: NewBudget = admin_body(&body, BUDGET_FIELDS, "A budget")?;
 		if !new.amount.is_finite() || !(0.0..1_000_000.0).contains(&new.amount) {
 			return Err(ApiError::new(
 				Class::BadRequest,
 				"amount is US dollars, from 0 to under 1,000,000.",
 			));
 		}
-		let key = match &new.key_id {
-			None => None,
-			Some(id) => Some(
-				KeyId::parse(id)
-					.ok_or_else(|| ApiError::new(Class::BadRequest, "key_id is a key's id, a uuid."))?,
-			),
-		};
+		let (key, every_user, user, group) = new.whom.columns()?;
 		// Six decimals is a millionth of a dollar, finer than any budget needs; numeric takes it
 		// exactly from text.
 		let amount = format!("{:.6}", new.amount);
 		let row = client
 			.query_one(
-				"INSERT INTO psyche.budgets (name, amount, period, days, key_id, hard) \
-				 VALUES ($1, $2::text::numeric, $3, $4, $5, $6) RETURNING id::text",
-				&[&new.name.trim(), &amount, &new.period, &new.days, &key, &new.hard],
+				"INSERT INTO psyche.budgets (name, amount, period, days, hard, key_id, every_user, \
+				 user_id, group_id) VALUES ($1, $2::text::numeric, $3, $4, $5, $6, $7, $8, $9) RETURNING id::text",
+				&[&new.name.trim(), &amount, &new.period, &new.days, &new.hard, &key, &every_user, &user, &group],
 			)
 			.await
 			.map_err(|e| write_error(&e))?;
 		reload_budgets(&proxy, &client).await;
-		Ok::<_, ApiError>(json!({"id": row.get::<_, String>(0), "name": new.name.trim(), "amount": amount,
-			"period": new.period, "days": new.days, "key_id": new.key_id, "hard": new.hard}))
+		Ok::<_, ApiError>(merge(
+			json!({"id": row.get::<_, String>(0), "name": new.name.trim(), "amount": amount,
+				"period": new.period, "days": new.days, "hard": new.hard}),
+			new.whom.json(),
+		))
 	}
 	.await;
 	match result {
@@ -843,14 +1131,14 @@ impl Proxy {
 	/// try again. `prompt_bound` is `None` when no limit applies.
 	fn take(
 		&self,
-		key: Option<KeyId>,
+		who: &Who,
 		prompt_bound: Option<u64>,
 		output: u64,
 	) -> Result<(Option<Taken>, limits::Headers), ApiError> {
 		let (Some(limits), Some(prompt)) = (&self.limits, prompt_bound) else {
 			return Ok((None, limits::Headers::default()));
 		};
-		match limits.take(key, prompt.saturating_add(output), Instant::now()) {
+		match limits.take(who, prompt.saturating_add(output), Instant::now()) {
 			Ok((taken, headers)) => Ok((Some(taken), headers)),
 			Err(refused) => {
 				let mut error = ApiError::new(Class::Limited, refused.message);
@@ -866,7 +1154,7 @@ impl Proxy {
 	/// `None` when no budget applies.
 	fn reserve(
 		&self,
-		key: Option<KeyId>,
+		who: &Who,
 		model: &Model,
 		prompt_bound: Option<u64>,
 		output: u64,
@@ -885,7 +1173,7 @@ impl Proxy {
 		};
 		let amount = worst(&price, prompt, output);
 		budgets
-			.reserve(key, amount, SystemTime::now())
+			.reserve(who, amount, SystemTime::now())
 			.map(Some)
 			.map_err(|over| ApiError::new(Class::Budget, over.message))
 	}
@@ -895,7 +1183,7 @@ impl Proxy {
 	/// [`budgets::MIN_SENT_OUTPUT`] is not shrunk to, so a call with less room is refused instead.
 	fn sent_cap(
 		&self,
-		key: Option<KeyId>,
+		who: &Who,
 		inbound: &Inbound,
 		model: &Model,
 		prompt_bound: Option<u64>,
@@ -906,7 +1194,7 @@ impl Proxy {
 		if named || model.max_output_tokens.is_some() {
 			return None;
 		}
-		let room = self.budgets.as_ref()?.room(key, SystemTime::now())?;
+		let room = self.budgets.as_ref()?.room(who, SystemTime::now())?;
 		let (price, prompt) = (model.price?, prompt_bound?);
 		let base = worst(&price, prompt, 0);
 		let per_token = worst(&price, prompt, 1).saturating_sub(base);
@@ -918,7 +1206,9 @@ impl Proxy {
 	}
 
 	/// The caller, from `Authorization: Bearer` or the `apikey` header (the front door sends both):
-	/// a Psyche key, or the project's service key. A signed-in user's token comes with budgets.
+	/// a Psyche key, the project's service key, or a signed-in user's token, which is taken only
+	/// once the project has budgets that hold every user (PS10b). The anon key alone is not a
+	/// caller.
 	fn authorize(&self, headers: &HeaderMap) -> Result<Caller, ApiError> {
 		let bearer = headers
 			.get(header::AUTHORIZATION)
@@ -934,7 +1224,7 @@ impl Proxy {
 			.ok_or_else(|| {
 				ApiError::new(
 					Class::Unauthorized,
-					"Send a Psyche key (psy_…) or the project's service key as a Bearer token.",
+					"Send a Psyche key (psy_…), a signed-in user's token or the project's service key as a Bearer token.",
 				)
 			})?;
 		if token.starts_with(keys::PREFIX) {
@@ -957,13 +1247,36 @@ impl Proxy {
 		}
 		let caller = jwt::verify(token, &self.jwt_secret, now())
 			.map_err(|e| ApiError::new(Class::Unauthorized, e.0))?;
-		if caller.role != Role::Service {
-			return Err(ApiError::new(
+		match caller.role {
+			Role::Service => Ok(Caller::Service),
+			Role::Anon => Err(ApiError::new(
 				Class::Forbidden,
-				"Only the project's service key or a Psyche key may call a model until budgets are set up.",
-			));
+				"The anon key alone cannot call a model: sign the user in and send their token as the Bearer token.",
+			)),
+			Role::Authenticated => {
+				let user = caller
+					.claims
+					.get("sub")
+					.and_then(Value::as_str)
+					.and_then(KeyId::parse)
+					.ok_or_else(|| {
+						ApiError::new(
+							Class::Unauthorized,
+							"The token names no user: its sub is not a user's id.",
+						)
+					})?;
+				let budgets = self.budgets.as_ref().ok_or_else(|| {
+					ApiError::new(
+						Class::Forbidden,
+						"This Psyche has no database, so it cannot budget signed-in users. Use a Psyche key or the service key.",
+					)
+				})?;
+				budgets
+					.admits(user)
+					.map_err(|why| ApiError::new(Class::Forbidden, why))?;
+				Ok(Caller::User(user))
+			}
 		}
-		Ok(Caller::Service)
 	}
 
 	async fn forward(
@@ -973,7 +1286,7 @@ impl Proxy {
 		operation: Operation,
 	) -> Result<Response, ApiError> {
 		let caller = self.authorize(headers)?;
-		let key = caller.key();
+		let who = caller.who(self.keys.as_ref().map(|k| &k.members));
 		let body = body.map_err(|rejection| {
 			let mut error = ApiError::new(
 				Class::BadRequest,
@@ -1004,8 +1317,8 @@ impl Proxy {
 		}
 		// The prompt's upper bound, from what the caller sent, for a call a budget or a limit applies
 		// to.
-		let budgeted = self.budgets.as_ref().is_some_and(|b| b.applies(key));
-		let limited = self.limits.as_ref().is_some_and(|l| l.applies(key));
+		let budgeted = self.budgets.as_ref().is_some_and(|b| b.applies(&who));
+		let limited = self.limits.as_ref().is_some_and(|l| l.applies(&who));
 		let prompt_bound = (budgeted || limited).then(|| budgets::prompt_bound(&body));
 		let provider = &model.provider;
 		if operation == Operation::Embeddings {
@@ -1025,11 +1338,11 @@ impl Proxy {
 				}
 				Kind::Bedrock => {
 					let reservation =
-						self.reserve(key, &model, prompt_bound.filter(|_| budgeted), 0)?;
-					let (taken, rate) = self.take(key, prompt_bound.filter(|_| limited), 0)?;
+						self.reserve(&who, &model, prompt_bound.filter(|_| budgeted), 0)?;
+					let (taken, rate) = self.take(&who, prompt_bound.filter(|_| limited), 0)?;
 					let warned = warned(&reservation);
 					let out = self
-						.embed(&inbound, &model, key, reservation, taken)
+						.embed(&inbound, &model, who, reservation, taken)
 						.await?;
 					return Ok(headed(warn(labelled(out, &model), warned), rate));
 				}
@@ -1037,7 +1350,7 @@ impl Proxy {
 		}
 		// Under a hard budget a reply is never left uncapped: the provider is told the most it may
 		// write, which is what is reserved.
-		if budgeted && let Some(cap) = self.sent_cap(key, &inbound, &model, prompt_bound) {
+		if budgeted && let Some(cap) = self.sent_cap(&who, &inbound, &model, prompt_bound) {
 			inbound
 				.body
 				.insert(cap_field(provider, operation).into(), cap.into());
@@ -1048,8 +1361,8 @@ impl Proxy {
 			_ if prompt_bound.is_some() => output_cap(&inbound, &body, &model),
 			_ => 0,
 		};
-		let reservation = self.reserve(key, &model, prompt_bound.filter(|_| budgeted), output)?;
-		let (taken, rate) = self.take(key, prompt_bound.filter(|_| limited), output)?;
+		let reservation = self.reserve(&who, &model, prompt_bound.filter(|_| budgeted), output)?;
+		let (taken, rate) = self.take(&who, prompt_bound.filter(|_| limited), output)?;
 		let warned = warned(&reservation);
 		let (path, accept) = match provider.kind {
 			Kind::Openai => (operation.path().to_string(), "text/event-stream"),
@@ -1100,7 +1413,7 @@ impl Proxy {
 				outcome: Outcome::Cancelled,
 				usage: None,
 				price: model.price,
-				key,
+				who,
 				first_byte: Duration::ZERO,
 				total: Duration::ZERO,
 			},
@@ -1151,7 +1464,7 @@ impl Proxy {
 		&self,
 		inbound: &Inbound,
 		model: &Model,
-		key: Option<KeyId>,
+		who: Who,
 		reservation: Option<Reservation>,
 		taken: Option<Taken>,
 	) -> Result<Response, ApiError> {
@@ -1186,7 +1499,7 @@ impl Proxy {
 				outcome: Outcome::Cancelled,
 				usage: None,
 				price: model.price,
-				key,
+				who,
 				first_byte: Duration::ZERO,
 				total: Duration::ZERO,
 			},
@@ -2072,9 +2385,10 @@ mod tests {
 		let (ready, loaded) = tokio::sync::oneshot::channel();
 		tokio::spawn(keys::watch(
 			url.clone(),
-			store.clone(),
-			None,
-			None,
+			keys::Held {
+				keys: store.clone(),
+				..Default::default()
+			},
 			Some(ready),
 		));
 		loaded.await.unwrap();
@@ -2083,6 +2397,7 @@ mod tests {
 			Timeouts::default(),
 			Some(Keys {
 				store,
+				members: Members::default(),
 				database_url: url,
 			}),
 			None,
@@ -2125,7 +2440,7 @@ mod tests {
 		assert_eq!(refused.status(), 403);
 		assert!(refused.text().await.unwrap().contains("may not use claude"));
 		let call = s.call().await;
-		assert_eq!(call.key.map(|k| k.to_string()), Some(id.clone()));
+		assert_eq!(call.who.key.map(|k| k.to_string()), Some(id.clone()));
 
 		let listed: Value = s
 			.client
@@ -2211,14 +2526,18 @@ mod tests {
 	async fn with_budgets(name: &str) -> Option<(Setup, tokio_postgres::Client, String, String)> {
 		let (db, url) = crate::log::tests::fresh_database(name).await?;
 		let store = keys::Store::default();
+		let members = Members::default();
 		let budgets = Budgets::default();
 		let limits = Limits::default();
 		let (ready, loaded) = tokio::sync::oneshot::channel();
 		tokio::spawn(keys::watch(
 			url.clone(),
-			store.clone(),
-			Some(budgets.clone()),
-			Some(limits.clone()),
+			keys::Held {
+				keys: store.clone(),
+				budgets: Some(budgets.clone()),
+				limits: Some(limits.clone()),
+				members: members.clone(),
+			},
 			Some(ready),
 		));
 		loaded.await.unwrap();
@@ -2227,6 +2546,7 @@ mod tests {
 			Timeouts::default(),
 			Some(Keys {
 				store,
+				members,
 				database_url: url,
 			}),
 			Some(budgets),
@@ -2436,6 +2756,209 @@ mod tests {
 		let (status, _) = call(tight, long).await;
 		assert_eq!(status, 429);
 		assert_eq!(s.fake.count(), sent);
+	}
+
+	/// A call by a signed-in user, with their own token.
+	async fn as_user(s: &Setup, sub: &str, body: &Value) -> reqwest::Response {
+		let token = jwt::sign(
+			&json!({"role": "authenticated", "sub": sub, "exp": now() + 3600}),
+			SECRET,
+		);
+		s.client
+			.post(format!("{}/ai/v1/chat/completions", s.base))
+			.bearer_auth(token)
+			.json(body)
+			.send()
+			.await
+			.unwrap()
+	}
+
+	fn add(
+		s: &Setup,
+		path: &str,
+		row: Value,
+	) -> impl std::future::Future<Output = reqwest::Result<reqwest::Response>> + use<> {
+		s.post(path, row).send()
+	}
+
+	async fn error_of(reply: reqwest::Response) -> (u16, String, String) {
+		let status = reply.status().as_u16();
+		let body: Value = reply.json().await.unwrap();
+		(
+			status,
+			body["error"]["code"].as_str().unwrap_or("").to_string(),
+			body["error"]["message"].as_str().unwrap_or("").to_string(),
+		)
+	}
+
+	#[tokio::test]
+	async fn signed_in_users_are_held_to_their_own_budget_their_group_s_and_their_limit() {
+		let Some((mut s, _db, _key, _id)) = with_budgets("users").await else {
+			return;
+		};
+		let (alice, bob, carol) = (
+			"00000000-0000-4000-8000-00000000a11c",
+			"00000000-0000-4000-8000-000000000b0b",
+			"00000000-0000-4000-8000-0000000ca201",
+		);
+		let body = json!({"model": "ok-priced", "max_tokens": 8, "messages": [{"role": "user", "content": "hi"}]});
+
+		// Refused until the project has a hard budget of its own and one for each user (PS10b).
+		let (status, _, message) = error_of(as_user(&s, alice, &body).await).await;
+		assert_eq!(status, 403);
+		assert!(message.contains("of its own"), "{message}");
+		let made = add(
+			&s,
+			"/ai/v1/admin/budgets",
+			json!({"name": "project", "amount": 10, "period": "month"}),
+		);
+		assert_eq!(made.await.unwrap().status(), 201);
+		let (status, _, message) = error_of(as_user(&s, alice, &body).await).await;
+		assert_eq!(status, 403);
+		assert!(message.contains("every_user"), "{message}");
+		let unsigned = jwt::sign(
+			&json!({"role": "authenticated", "exp": now() + 3600}),
+			SECRET,
+		);
+		let no_sub = s
+			.client
+			.post(format!("{}/ai/v1/chat/completions", s.base))
+			.bearer_auth(unsigned)
+			.json(&body)
+			.send()
+			.await
+			.unwrap();
+		assert_eq!(no_sub.status(), 401, "a user token names its user");
+
+		// $0.0002 a day each: a call reserves about $0.00011 and costs $0.000019, so a few fit.
+		let made = add(
+			&s,
+			"/ai/v1/admin/budgets",
+			json!({"name": "each user", "amount": 0.0002, "period": "day", "every_user": true}),
+		);
+		assert_eq!(made.await.unwrap().status(), 201);
+		let mut answered = 0;
+		loop {
+			let reply = as_user(&s, alice, &body).await;
+			if reply.status() == 200 {
+				reply.text().await.unwrap();
+				answered += 1;
+				assert!(answered < 20, "the budget holds");
+				continue;
+			}
+			let (status, code, message) = error_of(reply).await;
+			assert_eq!((status, code.as_str()), (429, "budget_exceeded"));
+			assert!(message.contains("each user"), "{message}");
+			break;
+		}
+		assert!(answered >= 2, "{answered}");
+		let first = s.call().await;
+		assert_eq!(
+			first.who.user.map(|u| u.to_string()).as_deref(),
+			Some(alice)
+		);
+		assert_eq!((first.who.key, first.who.group), (None, None));
+		for _ in 1..answered {
+			s.call().await;
+		}
+		// Bob's dollar is his own.
+		let reply = as_user(&s, bob, &body).await;
+		assert_eq!(reply.status(), 200);
+		reply.text().await.unwrap();
+		s.call().await;
+
+		// A budget of Alice's own replaces the default.
+		let made = add(
+			&s,
+			"/ai/v1/admin/budgets",
+			json!({"name": "alice", "amount": 1, "period": "day", "user_id": alice}),
+		);
+		assert_eq!(made.await.unwrap().status(), 201);
+		let reply = as_user(&s, alice, &body).await;
+		assert_eq!(reply.status(), 200);
+		reply.text().await.unwrap();
+		s.call().await;
+
+		// A group spends from one budget: too little for Bob's next call.
+		let group: Value = add(&s, "/ai/v1/admin/groups", json!({"name": "team"}))
+			.await
+			.unwrap()
+			.json()
+			.await
+			.unwrap();
+		let group = group["id"].as_str().unwrap();
+		let joined = s
+			.client
+			.put(format!("{}/ai/v1/admin/members/{bob}", s.base))
+			.bearer_auth(jwt::sign(&json!({"role": "service_role"}), SECRET))
+			.json(&json!({"group_id": group}))
+			.send()
+			.await
+			.unwrap();
+		assert_eq!(joined.status(), 200);
+		let made = add(
+			&s,
+			"/ai/v1/admin/budgets",
+			json!({"name": "team", "amount": 0.00005, "period": "day", "group_id": group}),
+		);
+		assert_eq!(made.await.unwrap().status(), 201);
+		let (status, _, message) = error_of(as_user(&s, bob, &body).await).await;
+		assert_eq!(status, 429);
+		assert!(message.contains("team"), "{message}");
+		let both = add(
+			&s,
+			"/ai/v1/admin/budgets",
+			json!({"name": "both", "amount": 1, "period": "day", "user_id": bob, "group_id": group}),
+		);
+		assert_eq!(both.await.unwrap().status(), 400, "one subject a row");
+		let unknown = add(
+			&s,
+			"/ai/v1/admin/budgets",
+			json!({"name": "typo", "amount": 1, "period": "day", "evry_user": true}),
+		);
+		let (status, _, message) = error_of(unknown.await.unwrap()).await;
+		assert_eq!(status, 400);
+		assert!(message.contains("not evry_user"), "{message}");
+
+		// A limit for every user: one call a minute each.
+		let made = add(
+			&s,
+			"/ai/v1/admin/limits",
+			json!({"name": "each user a minute", "every_user": true, "requests_per_minute": 1}),
+		);
+		assert_eq!(made.await.unwrap().status(), 201);
+		let reply = as_user(&s, carol, &body).await;
+		assert_eq!(reply.status(), 200);
+		assert_eq!(reply.headers()["x-ratelimit-remaining-requests"], "0");
+		reply.text().await.unwrap();
+		let (status, code, _) = error_of(as_user(&s, carol, &body).await).await;
+		assert_eq!((status, code.as_str()), (429, "rate_limit_exceeded"));
+		let reply = as_user(&s, alice, &body).await;
+		assert_eq!(reply.status(), 200, "Alice's minute is her own");
+		reply.text().await.unwrap();
+
+		// A key Carol owns counts against Carol's limit too.
+		let made: Value = add(
+			&s,
+			"/ai/v1/admin/keys",
+			json!({"name": "carol's", "owner": carol}),
+		)
+		.await
+		.unwrap()
+		.json()
+		.await
+		.unwrap();
+		let carols = s
+			.client
+			.post(format!("{}/ai/v1/chat/completions", s.base))
+			.bearer_auth(made["key"].as_str().unwrap())
+			.json(&body)
+			.send()
+			.await
+			.unwrap();
+		let (status, _, message) = error_of(carols).await;
+		assert_eq!(status, 429);
+		assert!(message.contains("each user a minute"), "{message}");
 	}
 
 	#[test]

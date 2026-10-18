@@ -73,14 +73,18 @@ async fn main() {
 			// at once and no call slips past a budget that exists.
 			let keys = Keys {
 				store: Default::default(),
+				members: Default::default(),
 				database_url: settings.database_url.clone(),
 			};
 			let (ready, loaded) = tokio::sync::oneshot::channel();
 			tokio::spawn(snout_psyche::keys::watch(
 				settings.database_url.clone(),
-				keys.store.clone(),
-				Some(budgets.clone()),
-				Some(limits.clone()),
+				snout_psyche::keys::Held {
+					keys: keys.store.clone(),
+					budgets: Some(budgets.clone()),
+					limits: Some(limits.clone()),
+					members: keys.members.clone(),
+				},
 				Some(ready),
 			));
 			if loaded.await.is_err() {

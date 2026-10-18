@@ -84,6 +84,8 @@ pub struct Key {
 	/// The model names it may use; `None` for every model.
 	pub models: Option<Vec<String>>,
 	pub expires_at: Option<SystemTime>,
+	/// The user it belongs to, whose budgets and limits it counts against too.
+	pub owner: Option<KeyId>,
 }
 
 impl Key {
@@ -184,7 +186,8 @@ fn key_id(text: &str) -> KeyId {
 pub async fn load(client: &Client) -> Result<HashMap<Hash, Arc<Key>>, tokio_postgres::Error> {
 	let rows = client
 		.query(
-			"SELECT id::text, name, hash, models, expires_at FROM psyche.keys WHERE revoked_at IS NULL",
+			"SELECT id::text, name, hash, models, expires_at, owner::text FROM psyche.keys \
+			 WHERE revoked_at IS NULL",
 			&[],
 		)
 		.await?;
@@ -201,27 +204,70 @@ pub async fn load(client: &Client) -> Result<HashMap<Hash, Arc<Key>>, tokio_post
 				name: row.get(1),
 				models: row.get(3),
 				expires_at: row.get(4),
+				owner: row.get::<_, Option<&str>>(5).and_then(KeyId::parse),
 			}),
 		);
 	}
 	Ok(keys)
 }
 
-/// Keeps `store` in step with `psyche.keys` for as long as the process runs: loads it, then
-/// reloads on every `psyche_changed` and every [`RELOAD_EVERY`], reconnecting when the connection
-/// is lost. `ready` is told after the first load.
-pub async fn watch(
-	url: String,
-	store: Store,
-	budgets: Option<crate::budgets::Budgets>,
-	limits: Option<crate::limits::Limits>,
-	ready: Option<tokio::sync::oneshot::Sender<()>>,
-) {
+/// What Psyche holds in memory from its configuration tables.
+#[derive(Clone, Default)]
+pub struct Held {
+	pub keys: Store,
+	pub budgets: Option<crate::budgets::Budgets>,
+	pub limits: Option<crate::limits::Limits>,
+	pub members: crate::who::Members,
+}
+
+/// Which tables to read again.
+#[derive(Clone, Copy, Default)]
+struct Stale {
+	keys: bool,
+	budgets: bool,
+	limits: bool,
+	members: bool,
+}
+
+impl Stale {
+	const ALL: Stale = Stale {
+		keys: true,
+		budgets: true,
+		limits: true,
+		members: true,
+	};
+
+	/// From a notification's payload, the table that changed. A group deleted takes its budgets,
+	/// limits and members with it.
+	fn table(&mut self, name: &str) {
+		match name {
+			"keys" => {
+				// A key deleted takes its budgets and limits with it.
+				self.keys = true;
+				self.budgets = true;
+				self.limits = true;
+			}
+			"budgets" => self.budgets = true,
+			"limits" => self.limits = true,
+			"members" => self.members = true,
+			"groups" => {
+				self.budgets = true;
+				self.limits = true;
+				self.members = true;
+			}
+			_ => *self = Stale::ALL,
+		}
+	}
+}
+
+/// Keeps `held` in step with `psyche.keys`, `budgets`, `limits` and `members` for as long as the
+/// process runs: loads them, then reloads the table each `psyche_changed` names and all of them
+/// every [`RELOAD_EVERY`], reconnecting when the connection is lost. `ready` is told after the first
+/// load.
+pub async fn watch(url: String, held: Held, ready: Option<tokio::sync::oneshot::Sender<()>>) {
 	let mut ready = ready;
 	loop {
-		if let Err(error) =
-			listen(&url, &store, budgets.as_ref(), limits.as_ref(), &mut ready).await
-		{
+		if let Err(error) = listen(&url, &held, &mut ready).await {
 			tracing::warn!(error = %crate::db_message(&error), "the keys' connection failed; the keys held are kept until it is back");
 		}
 		tokio::time::sleep(RECONNECT_AFTER).await;
@@ -230,19 +276,22 @@ pub async fn watch(
 
 async fn listen(
 	url: &str,
-	store: &Store,
-	budgets: Option<&crate::budgets::Budgets>,
-	limits: Option<&crate::limits::Limits>,
+	held: &Held,
 	ready: &mut Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<(), tokio_postgres::Error> {
-	// Keys, budgets and limits are reloaded together: there are few of each, and one notification name
-	// serves every table.
-	let reload = async |client: &Client| -> Result<(), tokio_postgres::Error> {
-		store.replace(load(client).await?);
-		if let Some(budgets) = budgets {
+	// One notification name serves every table; its payload names the table, so only that one is
+	// read again (members can be many).
+	let reload = async |client: &Client, stale: Stale| -> Result<(), tokio_postgres::Error> {
+		if stale.keys {
+			held.keys.replace(load(client).await?);
+		}
+		if stale.members {
+			held.members.replace(crate::who::load(client).await?);
+		}
+		if let Some(budgets) = held.budgets.as_ref().filter(|_| stale.budgets) {
 			budgets.replace(crate::budgets::load(client).await?);
 		}
-		if let Some(limits) = limits {
+		if let Some(limits) = held.limits.as_ref().filter(|_| stale.limits) {
 			limits.replace(crate::limits::load(client).await?);
 		}
 		Ok(())
@@ -255,8 +304,8 @@ async fn listen(
 		let mut messages = futures_util::stream::poll_fn(move |cx| connection.poll_message(cx));
 		while let Some(message) = messages.next().await {
 			match message {
-				Ok(AsyncMessage::Notification(_)) => {
-					if changed.send(()).is_err() {
+				Ok(AsyncMessage::Notification(note)) => {
+					if changed.send(note.payload().to_string()).is_err() {
 						return;
 					}
 				}
@@ -270,24 +319,28 @@ async fn listen(
 	});
 	let result = async {
 		client.batch_execute("LISTEN psyche_changed").await?;
-		reload(&client).await?;
+		reload(&client, Stale::ALL).await?;
 		if let Some(ready) = ready.take() {
 			let _ = ready.send(());
 		}
 		let mut tick = tokio::time::interval(RELOAD_EVERY);
 		tick.tick().await;
 		loop {
+			let mut stale = Stale::default();
 			tokio::select! {
 				change = changes.recv() => {
-					if change.is_none() {
+					let Some(table) = change else {
 						return Ok(());
-					}
+					};
+					stale.table(&table);
 					// A burst of changes is one reload.
-					while changes.try_recv().is_ok() {}
+					while let Ok(table) = changes.try_recv() {
+						stale.table(&table);
+					}
 				}
-				_ = tick.tick() => {}
+				_ = tick.tick() => stale = Stale::ALL,
 			}
-			reload(&client).await?;
+			reload(&client, stale).await?;
 		}
 	}
 	.await;
@@ -373,6 +426,7 @@ pub async fn create(
 			name: name.clone(),
 			models: new.models.clone(),
 			expires_at,
+			owner,
 		},
 	);
 	Ok(serde_json::json!({
@@ -487,6 +541,7 @@ mod tests {
 				name: "ci".into(),
 				models: Some(vec!["luna".into()]),
 				expires_at: Some(now + Duration::from_secs(60)),
+				owner: None,
 			},
 		);
 		let found = store.find(&key, now).unwrap();

@@ -31,6 +31,7 @@ pub mod sigv4;
 pub mod sse;
 pub mod translate;
 pub mod usage;
+pub mod who;
 
 #[cfg(any(test, feature = "fake"))]
 pub mod fake;

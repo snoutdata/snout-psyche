@@ -150,13 +150,8 @@ struct Totals {
 	unpriced: i64,
 }
 
-type Key = (
-	Day,
-	&'static str,
-	String,
-	String,
-	Option<crate::keys::KeyId>,
-);
+type Id = Option<crate::keys::KeyId>;
+type Key = (Day, &'static str, String, String, Id, Id, Id);
 
 fn totals(batch: &[Call]) -> BTreeMap<Key, Totals> {
 	let mut out: BTreeMap<Key, Totals> = BTreeMap::new();
@@ -166,7 +161,9 @@ fn totals(batch: &[Call]) -> BTreeMap<Key, Totals> {
 			call.operation.name(),
 			call.model.clone(),
 			call.provider.clone(),
-			call.key,
+			call.who.key,
+			call.who.user,
+			call.who.group,
 		);
 		let t = out.entry(key).or_default();
 		t.requests += 1;
@@ -218,7 +215,7 @@ async fn write(client: &mut Client, batch: &[Call]) -> Result<(), tokio_postgres
 		.copy_in(
 			"COPY psyche.requests (at, operation, model, provider, streamed, outcome, \
 			 prompt_tokens, completion_tokens, cached_tokens, cache_write_tokens, reasoning_tokens, \
-			 first_byte_ms, total_ms, cost, key_id) FROM STDIN BINARY",
+			 first_byte_ms, total_ms, cost, key_id, user_id, group_id) FROM STDIN BINARY",
 		)
 		.await?;
 	let writer = BinaryCopyInWriter::new(
@@ -238,6 +235,8 @@ async fn write(client: &mut Client, batch: &[Call]) -> Result<(), tokio_postgres
 			Type::INT4,
 			Type::INT4,
 			Type::NUMERIC,
+			Type::UUID,
+			Type::UUID,
 			Type::UUID,
 		],
 	);
@@ -261,7 +260,9 @@ async fn write(client: &mut Client, batch: &[Call]) -> Result<(), tokio_postgres
 				&millis(call.first_byte),
 				&millis(call.total),
 				&call.cost(),
-				&call.key,
+				&call.who.key,
+				&call.who.user,
+				&call.who.group,
 			])
 			.await?;
 	}
@@ -271,9 +272,11 @@ async fn write(client: &mut Client, batch: &[Call]) -> Result<(), tokio_postgres
 	let mut columns: (Vec<String>, Vec<&str>, Vec<&str>, Vec<&str>) = Default::default();
 	let mut counts: [Vec<i64>; 10] = Default::default();
 	let mut costs: Vec<Dollars> = Vec::new();
-	let mut keys: Vec<Option<crate::keys::KeyId>> = Vec::new();
-	for ((day, operation, model, provider, key), t) in &totals {
-		keys.push(*key);
+	let mut ids: [Vec<Id>; 3] = Default::default();
+	for ((day, operation, model, provider, key, user, group), t) in &totals {
+		ids[0].push(*key);
+		ids[1].push(*user);
+		ids[2].push(*group);
 		columns.0.push(day.iso());
 		columns.1.push(operation);
 		columns.2.push(model);
@@ -298,13 +301,17 @@ async fn write(client: &mut Client, batch: &[Call]) -> Result<(), tokio_postgres
 	tx.execute(
 		"INSERT INTO psyche.usage_daily AS u (day, operation, model, provider, requests, failed, \
 		 cancelled, uncounted, prompt_tokens, completion_tokens, cached_tokens, cache_write_tokens, \
-		 reasoning_tokens, unpriced, cost, key_id) \
-		 SELECT d::date, o, m, p, r, f, c, un, pt, ct, cr, cw, rt, up, co, k FROM unnest($1::text[], $2::text[], \
+		 reasoning_tokens, unpriced, cost, key_id, user_id, group_id) \
+		 SELECT d::date, o, m, p, r, f, c, un, pt, ct, cr, cw, rt, up, co, k, us, g \
+		 FROM unnest($1::text[], $2::text[], \
 		 $3::text[], $4::text[], $5::int8[], $6::int8[], $7::int8[], $8::int8[], $9::int8[], \
-		 $10::int8[], $11::int8[], $12::int8[], $13::int8[], $14::int8[], $15::numeric[], $16::uuid[]) \
-		 AS t(d, o, m, p, r, f, c, un, pt, ct, cr, cw, rt, up, co, k) \
+		 $10::int8[], $11::int8[], $12::int8[], $13::int8[], $14::int8[], $15::numeric[], $16::uuid[], \
+		 $17::uuid[], $18::uuid[]) \
+		 AS t(d, o, m, p, r, f, c, un, pt, ct, cr, cw, rt, up, co, k, us, g) \
 		 ON CONFLICT (day, operation, model, provider, \
-		 (coalesce(key_id, '00000000-0000-0000-0000-000000000000'::uuid))) DO UPDATE SET \
+		 (coalesce(key_id, '00000000-0000-0000-0000-000000000000'::uuid)), \
+		 (coalesce(user_id, '00000000-0000-0000-0000-000000000000'::uuid)), \
+		 (coalesce(group_id, '00000000-0000-0000-0000-000000000000'::uuid))) DO UPDATE SET \
 		 requests = u.requests + excluded.requests, failed = u.failed + excluded.failed, \
 		 cancelled = u.cancelled + excluded.cancelled, uncounted = u.uncounted + excluded.uncounted, \
 		 prompt_tokens = u.prompt_tokens + excluded.prompt_tokens, \
@@ -315,8 +322,7 @@ async fn write(client: &mut Client, batch: &[Call]) -> Result<(), tokio_postgres
 		 unpriced = u.unpriced + excluded.unpriced, cost = u.cost + excluded.cost",
 		&[
 			&columns.0, &columns.1, &columns.2, &columns.3, r, f, c, un, pt, ct, cr, cw, rt, up,
-			&costs,
-			&keys,
+			&costs, &ids[0], &ids[1], &ids[2],
 		],
 	)
 	.await?;
@@ -557,7 +563,7 @@ pub(crate) mod tests {
 			outcome,
 			usage,
 			price: None,
-			key: None,
+			who: Default::default(),
 			first_byte: Duration::from_millis(120),
 			total: Duration::from_millis(900),
 		}
@@ -597,7 +603,15 @@ pub(crate) mod tests {
 		];
 		let totals = totals(&batch);
 		assert_eq!(totals.len(), 3);
-		let a = totals[&(Day::of(today), "chat", "a".into(), "bedrock".into(), None)];
+		let a = totals[&(
+			Day::of(today),
+			"chat",
+			"a".into(),
+			"bedrock".into(),
+			None,
+			None,
+			None,
+		)];
 		assert_eq!(
 			a,
 			Totals {
@@ -655,6 +669,15 @@ pub(crate) mod tests {
 		] {
 			admin.batch_execute(&statement).await.unwrap();
 		}
+		// The signed-in role a SnoutData project has, so the owners' grants are made. Roles belong
+		// to the cluster, and tests make databases at once.
+		admin
+			.batch_execute(
+				"DO $$ BEGIN CREATE ROLE authenticated NOLOGIN; \
+				 EXCEPTION WHEN duplicate_object OR unique_violation THEN NULL; END $$",
+			)
+			.await
+			.unwrap();
 		let url = format!("{}/{database}", admin_url.rsplit_once('/').unwrap().0);
 		let mut client = connect(&url).await.unwrap();
 		let migrations = crate::migrations::MIGRATIONS;
@@ -888,7 +911,15 @@ pub(crate) mod tests {
 			)
 			.await
 			.unwrap();
-		for table in ["psyche.requests", "psyche.usage_daily", "psyche.keys"] {
+		for table in [
+			"psyche.requests",
+			"psyche.usage_daily",
+			"psyche.keys",
+			"psyche.budgets",
+			"psyche.limits",
+			"psyche.groups",
+			"psyche.members",
+		] {
 			let error = client
 				.batch_execute(&format!(
 					"BEGIN; SET LOCAL ROLE psyche_test_reader; SELECT * FROM {table}; COMMIT"
@@ -905,5 +936,99 @@ pub(crate) mod tests {
 				"{table}: {error}"
 			);
 		}
+	}
+
+	#[tokio::test]
+	async fn owners_see_their_own_keys_calls_totals_and_budgets_and_nothing_else() {
+		let Some((mut client, _)) = fresh_database("owners").await else {
+			return;
+		};
+		let alice = "00000000-0000-4000-8000-00000000a11c";
+		let bob = "00000000-0000-4000-8000-000000000b0b";
+		let id = |text: &str| crate::keys::KeyId::parse(text).unwrap();
+		let team: String = client
+			.query_one(
+				"INSERT INTO psyche.groups (name) VALUES ('team') RETURNING id::text",
+				&[],
+			)
+			.await
+			.unwrap()
+			.get(0);
+		client
+			.batch_execute(&format!(
+				"INSERT INTO psyche.members (user_id, group_id) VALUES ('{alice}', '{team}');
+				 INSERT INTO psyche.keys (name, hash, hint, owner) VALUES
+				   ('alice', decode(repeat('a1', 32), 'hex'), 'psy_a', '{alice}'),
+				   ('bob', decode(repeat('b0', 32), 'hex'), 'psy_b', '{bob}'),
+				   ('app', decode(repeat('00', 32), 'hex'), 'psy_0', null);
+				 INSERT INTO psyche.budgets (name, amount, period, every_user) VALUES ('each', 1, 'day', true);
+				 INSERT INTO psyche.budgets (name, amount, period, user_id) VALUES ('alice', 5, 'day', '{alice}');
+				 INSERT INTO psyche.budgets (name, amount, period, user_id) VALUES ('bob', 5, 'day', '{bob}');
+				 INSERT INTO psyche.budgets (name, amount, period, group_id) VALUES ('team', 9, 'day', '{team}');
+				 INSERT INTO psyche.budgets (name, amount, period) VALUES ('project', 99, 'month');"
+			))
+			.await
+			.unwrap();
+		let now = SystemTime::now();
+		partitions(&client, &[Day::of(now)]).await.unwrap();
+		let by = |user: &str, group: Option<&str>| {
+			let mut call = call(now, "a", Outcome::Completed, Some(Usage::default()));
+			call.who.user = Some(id(user));
+			call.who.group = group.map(id);
+			call
+		};
+		let batch = [
+			by(alice, Some(&team)),
+			by(alice, Some(&team)),
+			by(bob, None),
+		];
+		write(&mut client, &batch).await.unwrap();
+
+		let seen = |claims: Option<String>| {
+			let client = &client;
+			async move {
+				let set = claims.map_or(String::new(), |c| {
+					format!("SET LOCAL request.jwt.claims = '{c}';")
+				});
+				client
+					.batch_execute(&format!("BEGIN; SET LOCAL ROLE authenticated; {set}"))
+					.await
+					.unwrap();
+				let mut counts = Vec::new();
+				for sql in [
+					"SELECT count(*) FROM psyche.keys",
+					"SELECT count(*) FROM psyche.requests",
+					"SELECT coalesce(sum(requests), 0)::bigint FROM psyche.usage_daily",
+					"SELECT count(*) FROM psyche.budgets",
+					"SELECT count(*) FROM psyche.groups",
+					"SELECT count(*) FROM psyche.members",
+				] {
+					counts.push(count(client, sql).await);
+				}
+				let hash = client.batch_execute("SELECT hash FROM psyche.keys").await;
+				client.batch_execute("ROLLBACK").await.unwrap();
+				(counts, hash.is_ok())
+			}
+		};
+		let claims = |sub: &str| Some(format!(r#"{{"sub": "{sub}", "role": "authenticated"}}"#));
+		// Alice: her key, her two calls, their total, every user's budget, hers and her group's,
+		// her group and her membership. Never a hash.
+		let (alice_sees, hash) = seen(claims(alice)).await;
+		assert_eq!(alice_sees, vec![1, 2, 2, 3, 1, 1]);
+		assert!(!hash, "the hash is not readable");
+		let (bob_sees, _) = seen(claims(bob)).await;
+		assert_eq!(bob_sees, vec![1, 1, 1, 2, 0, 0]);
+		// No user, no rows, but every user's budget, which says nothing about anyone.
+		let (nobody_sees, _) = seen(None).await;
+		assert_eq!(nobody_sees, vec![0, 0, 0, 1, 0, 0]);
+		// The daily totals keep who and which group.
+		let rows = count(
+			&client,
+			&format!(
+				"SELECT count(*) FROM psyche.usage_daily WHERE user_id = '{alice}' AND group_id = '{team}'"
+			),
+		)
+		.await;
+		assert_eq!(rows, 1);
 	}
 }

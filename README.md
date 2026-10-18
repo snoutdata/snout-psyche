@@ -70,8 +70,8 @@ Keys and budgets, more providers and automatic routing are being built.
   servers.
 
 Callers authenticate as a Bearer token or an `apikey` header, with the project's service key (an
-HS256 JWT with `role: service_role`) or, when there is a database, a Psyche key (below). Budgets
-come next.
+HS256 JWT with `role: service_role`) or, when there is a database, a Psyche key or a signed-in
+user's own token (below). The anon key alone calls nothing.
 
 ### Keys
 
@@ -161,15 +161,16 @@ Each finished call is logged under the `psyche::call` target: operation, model, 
 
 ### Budgets
 
-A budget caps what the project, or one key, spends in a calendar day or month (UTC) or the last N
-days. A hard budget refuses a call that would not fit, before anything is sent; a soft one lets it
+A budget caps what the project, one key, each signed-in user, one user or a group of users spends
+in a calendar day or month (UTC) or the last N days. A hard budget refuses a call that would not fit, before anything is sent; a soft one lets it
 through and names itself in the `x-psyche-budget-warning` header.
 
 ```sh
 curl -X POST $PSYCHE/ai/v1/admin/budgets -H "Authorization: Bearer $SERVICE_KEY" \
   -d '{"name": "ci daily", "amount": 5, "period": "day", "key_id": "<key id>"}'
-# period: day, month, or rolling with "days": 1-366; "hard": false for a soft budget;
-# no key_id for the project's own. GET lists them, DELETE /ai/v1/admin/budgets/<id> removes one.
+# period: day, month, or rolling with "days": 1-366; "hard": false for a soft budget.
+# Whom it is for, one of: key_id, "every_user": true, user_id, group_id; none for the project.
+# GET lists them, DELETE /ai/v1/admin/budgets/<id> removes one.
 ```
 
 A budget is kept by **reserving, then settling**. Before a call goes to its provider, its worst
@@ -183,7 +184,7 @@ what it has left and what the call could cost. A model with no price cannot be b
 to one that a budget covers is refused.
 
 Spend is held in memory, per day, and read at start from `psyche.usage_daily` (which keeps each
-key's totals for good), so a restart resumes where it was. What it can miss, stated rather than
+key's, user's and group's totals for good), so a restart resumes where it was. What it can miss, stated rather than
 hidden: the rows a crash did not write (see the request log). A reply is never left uncapped under
 a hard budget: when the caller names no `max_tokens` and the model's entry no `max_output_tokens`,
 Psyche sends a cap of 4,096 tokens (the one Anthropic always gets), or less when that is all the
@@ -195,7 +196,8 @@ generous where prompts are short, so near its end a budget refuses some calls th
 
 ### Rate limits
 
-Requests and tokens a minute, for the project (every call counts) or one key:
+Requests and tokens a minute, for the project (every call counts), one key, each signed-in user, one
+user or a group, named the way a budget is:
 
 ```sh
 curl -X POST $PSYCHE/ai/v1/admin/limits -H "Authorization: Bearer $SERVICE_KEY" \
@@ -209,7 +211,43 @@ not use when it ends. Over a limit, it is refused with 429, the code `rate_limit
 minute is refused without a `retry-after`, since waiting would not help. Every response to a call
 a limit applies to carries OpenAI's `x-ratelimit-limit-*`, `-remaining-*` and `-reset-*` headers
 for requests and tokens, from the tightest limit. A limit that is not changed keeps its bucket
-when the table is reloaded; a restart starts every bucket full.
+when the table is reloaded; a restart starts every bucket full. A limit for every user keeps a
+bucket per user, dropped once it has filled again, so idle users cost nothing.
+
+### Signed-in users
+
+An app's users can call models straight from the browser: the anon key in `apikey` and the user's
+own token (the project's JWT, `role: authenticated`, the user's id in `sub`) as the Bearer token,
+exactly as the data API takes them, with no backend in between. Because that door is open to the
+world, **Psyche takes no such call until the project has a hard budget of its own and a hard budget
+for every user** (`"every_user": true`), and refuses with a sentence saying which is missing:
+
+```sh
+curl -X POST $PSYCHE/ai/v1/admin/budgets -H "Authorization: Bearer $SERVICE_KEY" \
+  -d '{"name": "project", "amount": 200, "period": "month"}'
+curl -X POST $PSYCHE/ai/v1/admin/budgets -H "Authorization: Bearer $SERVICE_KEY" \
+  -d '{"name": "each user", "amount": 0.50, "period": "day", "every_user": true}'
+```
+
+An every-user budget or limit gives each user one of their own. One that names a `user_id` replaces
+the every-user ones for that user, to give someone more or less. A **group** is a team inside the
+app, whose members spend from one budget together; a user is in one group at most:
+
+```sh
+curl -X POST $PSYCHE/ai/v1/admin/groups -H "Authorization: Bearer $SERVICE_KEY" -d '{"name": "acme"}'
+curl -X PUT $PSYCHE/ai/v1/admin/members/<user id> -H "Authorization: Bearer $SERVICE_KEY" \
+  -d '{"group_id": "<group id>"}'           # DELETE the same path takes them out
+```
+
+A key with an `owner` counts against its owner's budgets, limits and group too, so a user's
+allowance follows them from the browser to a script. The request log and the daily totals name the
+user and the group (`user_id`, `group_id`).
+
+**Owners read their own rows.** Through RLS, a signed-in user reads their own keys (never the hash),
+calls, daily totals, membership and group, and the budgets and limits that apply to them, so an app
+can show "your AI usage" with the data API and no code of its own. The policies read the caller from
+`request.jwt.claims`, so they need nothing but Postgres; the grants go to the signed-in role
+(`authenticated`, or `snout_member`) if it exists when the schema is made.
 
 ### Prices
 
