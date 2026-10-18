@@ -44,6 +44,7 @@ use crate::config::Timeouts;
 use crate::error::{ApiError, Class, scrub};
 use crate::jwt::{self, Role};
 use crate::net;
+use crate::price::{Dollars, Price};
 use crate::providers::{Catalogue, Kind, Model};
 use crate::sse::{Event, Parser};
 use crate::translate::{Out, Translator};
@@ -80,9 +81,18 @@ pub struct Call {
 	pub streamed: bool,
 	pub outcome: Outcome,
 	pub usage: Option<Usage>,
+	/// The model's price, so the log can cost the call; `None` when nothing prices it.
+	pub price: Option<Price>,
 	/// From sending the request to the provider's response headers.
 	pub first_byte: Duration,
 	pub total: Duration,
+}
+
+impl Call {
+	/// What the call cost in dollars, when it was counted and its model is priced.
+	pub fn cost(&self) -> Option<Dollars> {
+		Some(Dollars(self.price?.cost(&self.usage?)))
+	}
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -434,6 +444,7 @@ impl Proxy {
 				streamed: inbound.stream,
 				outcome: Outcome::Cancelled,
 				usage: None,
+				price: model.price,
 				first_byte: Duration::ZERO,
 				total: Duration::ZERO,
 			},
@@ -505,6 +516,7 @@ impl Proxy {
 				streamed: false,
 				outcome: Outcome::Cancelled,
 				usage: None,
+				price: model.price,
 				first_byte: Duration::ZERO,
 				total: Duration::ZERO,
 			},
@@ -934,6 +946,7 @@ impl Drop for Record {
 		self.call.total = self.started.elapsed();
 		let call = &self.call;
 		let usage = call.usage.unwrap_or_default();
+		let cost = call.cost().map(|c| c.to_string());
 		tracing::info!(
 			target: "psyche::call",
 			operation = call.operation.name(),
@@ -944,6 +957,7 @@ impl Drop for Record {
 			prompt_tokens = usage.prompt_tokens,
 			completion_tokens = usage.completion_tokens,
 			counted = call.usage.is_some(),
+			cost = cost.as_deref(),
 			first_byte_ms = call.first_byte.as_millis() as u64,
 			total_ms = call.total.as_millis() as u64,
 		);
@@ -1146,6 +1160,7 @@ mod tests {
 					],
 					"models": [
 						{{"name": "ok", "provider": "fake", "upstream": "fake-ok"}},
+						{{"name": "ok-priced", "provider": "fake", "upstream": "fake-ok", "price": {{"input": 1, "output": 2.5}}}},
 						{{"name": "cached", "provider": "fake", "upstream": "fake-ok", "prompt_caching": true}},
 						{{"name": "claude", "provider": "anthropic", "upstream": "fake-ok", "prompt_caching": true}},
 						{{"name": "claude-tool", "provider": "anthropic", "upstream": "fake-tool"}},
@@ -1302,6 +1317,35 @@ mod tests {
 		let call = s.call().await;
 		assert_eq!(call.outcome, Outcome::Completed);
 		assert_eq!(call.usage.unwrap().completion_tokens, 4);
+	}
+
+	#[tokio::test]
+	async fn a_call_is_costed_at_the_providers_file_price_and_an_unpriced_one_is_not() {
+		let mut s = Setup::new().await;
+		let response = s
+			.post("/ai/v1/chat/completions", chat("ok-priced", true))
+			.send()
+			.await
+			.unwrap();
+		response.text().await.unwrap();
+		let call = s.call().await;
+		let usage = call.usage.unwrap();
+		assert!(usage.prompt_tokens > 0 && usage.completion_tokens > 0);
+		assert_eq!(
+			call.cost().unwrap().0,
+			usage.prompt_tokens * 1_000_000 + usage.completion_tokens * 2_500_000
+		);
+
+		s.post("/ai/v1/chat/completions", chat("ok", false))
+			.send()
+			.await
+			.unwrap()
+			.text()
+			.await
+			.unwrap();
+		let call = s.call().await;
+		assert!(call.usage.is_some());
+		assert_eq!(call.cost(), None, "nothing prices fake-ok");
 	}
 
 	#[tokio::test]
@@ -2011,6 +2055,8 @@ mod tests {
 		let call = s.call().await;
 		assert_eq!(call.outcome, Outcome::Completed);
 		assert_eq!(call.usage.unwrap().prompt_tokens, 210);
+		// Priced from the shipped catalogue: Titan v2 in us-west-2, $0.02 per million tokens.
+		assert_eq!(call.cost().unwrap().to_string(), "0.000004200000");
 
 		// base64 is the vector's numbers as little-endian f32s, OpenAI's form.
 		let body: Value = s

@@ -1,0 +1,126 @@
+{
+	"checked": "2026-10-18",
+	"source": "The AWS Price List API (service codes AmazonBedrockFoundationModels and AmazonBedrock, regionCode us-west-2), on-demand standard tier. A regional inference profile (us.) and an in-region model id are charged the standard rate, a global profile (global.) the global rate. cache_write is the five-minute write, the only cache point Psyche asks Bedrock for. Cohere Embed v4 has one rate in the list, applied to its in-region id and its us. profile; its global profile is left out until its rate is known.",
+	"models": [
+		{
+			"provider": "bedrock",
+			"region": "us-west-2",
+			"upstream": "global.anthropic.claude-sonnet-5-5",
+			"price": {
+				"input": 2,
+				"output": 10,
+				"cache_read": 0.1,
+				"cache_write": 2.5
+			}
+		},
+		{
+			"provider": "bedrock",
+			"region": "us-west-2",
+			"upstream": "us.anthropic.claude-sonnet-5-5",
+			"price": {
+				"input": 2.2,
+				"output": 11,
+				"cache_read": 0.11,
+				"cache_write": 2.75
+			}
+		},
+		{
+			"provider": "bedrock",
+			"region": "us-west-2",
+			"upstream": "anthropic.claude-sonnet-5-5",
+			"price": {
+				"input": 2.2,
+				"output": 11,
+				"cache_read": 0.11,
+				"cache_write": 2.75
+			}
+		},
+		{
+			"provider": "bedrock",
+			"region": "us-west-2",
+			"upstream": "global.anthropic.claude-sonnet-5",
+			"price": {
+				"input": 2,
+				"output": 10,
+				"cache_read": 0.2,
+				"cache_write": 2.5
+			}
+		},
+		{
+			"provider": "bedrock",
+			"region": "us-west-2",
+			"upstream": "us.anthropic.claude-sonnet-5",
+			"price": {
+				"input": 2.2,
+				"output": 11,
+				"cache_read": 0.22,
+				"cache_write": 2.75
+			}
+		},
+		{
+			"provider": "bedrock",
+			"region": "us-west-2",
+			"upstream": "anthropic.claude-sonnet-5",
+			"price": {
+				"input": 2.2,
+				"output": 11,
+				"cache_read": 0.22,
+				"cache_write": 2.75
+			}
+		},
+		{
+			"provider": "bedrock",
+			"region": "us-west-2",
+			"upstream": "qwen.qwen3-coder-30b-a3b-v1:0",
+			"price": {
+				"input": 0.15,
+				"output": 0.6
+			}
+		},
+		{
+			"provider": "bedrock",
+			"region": "us-west-2",
+			"upstream": "amazon.titan-embed-text-v2:0",
+			"price": {
+				"input": 0.02,
+				"output": 0
+			}
+		},
+		{
+			"provider": "bedrock",
+			"region": "us-west-2",
+			"upstream": "cohere.embed-english-v3",
+			"price": {
+				"input": 0.1,
+				"output": 0
+			}
+		},
+		{
+			"provider": "bedrock",
+			"region": "us-west-2",
+			"upstream": "cohere.embed-multilingual-v3",
+			"price": {
+				"input": 0.1,
+				"output": 0
+			}
+		},
+		{
+			"provider": "bedrock",
+			"region": "us-west-2",
+			"upstream": "cohere.embed-v4:0",
+			"price": {
+				"input": 0.12,
+				"output": 0
+			}
+		},
+		{
+			"provider": "bedrock",
+			"region": "us-west-2",
+			"upstream": "us.cohere.embed-v4:0",
+			"price": {
+				"input": 0.12,
+				"output": 0
+			}
+		}
+	]
+}

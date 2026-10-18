@@ -132,14 +132,37 @@ either Psyche asks for 4096. A provider with no `api_key_env` is sent no key. A 
 that is not set, an http URL under `public` egress) stops the server at start with its name.
 
 Each finished call is logged under the `psyche::call` target: operation, model, provider, outcome
-(completed, cancelled, or failed with a class), tokens, time to first byte and total time.
+(completed, cancelled, or failed with a class), tokens, cost, time to first byte and total time.
+
+### Prices
+
+A call's cost is the tokens the provider reported at the model's price. The price comes from the
+model's `price` in the providers file, in US dollars per million tokens as providers publish them:
+
+```json
+{"name": "sonnet", "provider": "bedrock", "upstream": "us.anthropic.claude-sonnet-5-5",
+ "price": {"input": 2.2, "output": 11, "cache_read": 0.11, "cache_write": 2.75}}
+```
+
+`cache_read` and `cache_write` default to the input price; `request` adds a fee per call in dollars;
+`long_context: {"above": 272000, "input": …, "output": …}` is the second tier some models have,
+charged for the whole call once the prompt is longer than `above`. Without a `price`, Psyche looks the
+model up in the catalogue it ships ([`catalogue/models.json`](catalogue/models.json)), matched on the
+provider's kind, its region (Bedrock) or host (the others), and the upstream id, since all three
+change the price: a `us.` inference profile costs 10% more than a `global.` one. Today the catalogue
+holds the Bedrock models Psyche has been run against, in `us-west-2`, from the AWS Price List API,
+with the date they were checked. A model priced by neither still works: its calls are logged with
+no cost, and Psyche names it in a warning at start. Costs are kept exact to the picodollar, so a
+sum of a million small calls does not drift.
 
 ### The request log
 
 With `DATABASE_URL` set, Psyche makes a `psyche` schema in that database at start (migrations in
 `migrations/`, each recorded with its hash, so a changed file is refused rather than run again) and
-keeps one row per call in `psyche.requests`: the same fields as above, never a prompt or a reply.
-`psyche.usage_daily` holds each day's totals per operation, model and provider. Neither is granted
+keeps one row per call in `psyche.requests`: the same fields as above, the cost as a `numeric` in
+dollars (null when the call was not counted or its model has no price), never a prompt or a reply.
+`psyche.usage_daily` holds each day's totals per operation, model and provider, cost included, and
+`unpriced`, the calls missing from that cost. Neither is granted
 to any other role, and row-level security is on for both.
 
 No call waits for the database. A finished call is handed to a task of its own, which writes what

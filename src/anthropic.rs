@@ -788,12 +788,14 @@ mod tests {
 				base_url: url::Url::parse("https://api.anthropic.com/v1").unwrap(),
 				api_key: None,
 				aws: None,
+				region: None,
 			}),
 			upstream: "claude-sonnet-4-5".into(),
 			prompt_caching: caching,
 			max_output_tokens: None,
 			reasoning: Some(Reasoning::Budget),
 			embeddings: None,
+			price: None,
 		}
 	}
 

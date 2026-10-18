@@ -36,6 +36,8 @@
 //! `reasoning_effort`; without it a request that asks for reasoning is refused, not guessed at.
 //! And, for a Bedrock embedding model, `embeddings` (`titan` or `cohere`), the body its InvokeModel
 //! takes (`embeddings.rs`); a Bedrock model without it is not called for embeddings.
+//! And `price` (`price.rs`), which overrides the price catalogue shipped in the binary; a model
+//! that has neither is served and logged with no cost.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -44,6 +46,7 @@ use serde::Deserialize;
 
 use crate::config::ConfigError;
 use crate::net::{Egress, check_base_url};
+use crate::price::{self, Place, Price, PriceEntry};
 use crate::sigv4::{self, Credentials};
 
 /// How Psyche speaks to a provider. Phase 2 adds Bedrock, Gemini, Ollama and the rest.
@@ -112,6 +115,8 @@ pub struct Provider {
 	pub api_key: Option<Secret>,
 	/// Bedrock signed with AWS credentials rather than a Bedrock API key.
 	pub aws: Option<Aws>,
+	/// A Bedrock provider's region.
+	pub region: Option<String>,
 }
 
 /// What a Bedrock provider signs with, and where.
@@ -188,6 +193,8 @@ pub struct Model {
 	pub reasoning: Option<Reasoning>,
 	/// For a Bedrock embedding model, the body it takes.
 	pub embeddings: Option<Embeddings>,
+	/// What it costs; `None` when neither the file nor the shipped catalogue prices it.
+	pub price: Option<Price>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -244,6 +251,8 @@ struct ModelEntry {
 	reasoning: Option<Reasoning>,
 	#[serde(default)]
 	embeddings: Option<Embeddings>,
+	#[serde(default)]
+	price: Option<PriceEntry>,
 }
 
 impl Catalogue {
@@ -334,9 +343,11 @@ impl Catalogue {
 					base_url,
 					api_key,
 					aws,
+					region,
 				}),
 			);
 		}
+		let prices = price::Catalogue::shipped()?;
 		let mut catalogue = Catalogue::default();
 		let mut seen = HashSet::new();
 		for entry in file.models {
@@ -358,14 +369,29 @@ impl Catalogue {
 					entry.name
 				)));
 			}
+			let upstream = entry.upstream.unwrap_or_else(|| entry.name.clone());
+			let price = match &entry.price {
+				Some(price) => Some(
+					price
+						.price()
+						.map_err(|e| ConfigError(format!("model {}: {e}", entry.name)))?,
+				),
+				None => prices.find(&Place {
+					kind: provider.kind,
+					region: provider.region.as_deref(),
+					host: provider.base_url.host_str(),
+					upstream: &upstream,
+				}),
+			};
 			let model = Arc::new(Model {
-				upstream: entry.upstream.unwrap_or_else(|| entry.name.clone()),
+				upstream,
 				name: entry.name,
 				provider,
 				prompt_caching: entry.prompt_caching,
 				max_output_tokens: entry.max_output_tokens.filter(|n| *n > 0),
 				reasoning: entry.reasoning,
 				embeddings: entry.embeddings,
+				price,
 			});
 			catalogue.by_name.insert(model.name.clone(), model.clone());
 			catalogue.models.push(model);
@@ -380,6 +406,15 @@ impl Catalogue {
 	/// Every model, in the order the catalogue lists them.
 	pub fn models(&self) -> &[Arc<Model>] {
 		&self.models
+	}
+
+	/// The models nothing prices, whose calls are logged with no cost.
+	pub fn unpriced(&self) -> Vec<&str> {
+		self.models
+			.iter()
+			.filter(|m| m.price.is_none())
+			.map(|m| m.name.as_str())
+			.collect()
 	}
 
 	/// Every credential the catalogue holds, for scrubbing provider errors (`error::scrub`).

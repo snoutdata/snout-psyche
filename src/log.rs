@@ -22,6 +22,7 @@ use tokio_postgres::binary_copy::BinaryCopyInWriter;
 use tokio_postgres::types::Type;
 use tokio_postgres::{Client, NoTls};
 
+use crate::price::Dollars;
 use crate::proxy::{Call, Outcome};
 
 /// How often what is held is written.
@@ -143,6 +144,10 @@ struct Totals {
 	cached_tokens: i64,
 	cache_write_tokens: i64,
 	reasoning_tokens: i64,
+	/// Picodollars.
+	cost: u64,
+	/// Calls counted whose model has no price, so they are missing from `cost`.
+	unpriced: i64,
 }
 
 type Key = (Day, &'static str, String, String);
@@ -174,6 +179,11 @@ fn totals(batch: &[Call]) -> BTreeMap<Key, Totals> {
 				t.reasoning_tokens += n(u.reasoning_tokens.unwrap_or(0));
 			}
 		}
+		match (call.usage.is_some(), call.cost()) {
+			(_, Some(cost)) => t.cost = t.cost.saturating_add(cost.0),
+			(true, None) => t.unpriced += 1,
+			(false, None) => {}
+		}
 	}
 	out
 }
@@ -201,7 +211,7 @@ async fn write(client: &mut Client, batch: &[Call]) -> Result<(), tokio_postgres
 		.copy_in(
 			"COPY psyche.requests (at, operation, model, provider, streamed, outcome, \
 			 prompt_tokens, completion_tokens, cached_tokens, cache_write_tokens, reasoning_tokens, \
-			 first_byte_ms, total_ms) FROM STDIN BINARY",
+			 first_byte_ms, total_ms, cost) FROM STDIN BINARY",
 		)
 		.await?;
 	let writer = BinaryCopyInWriter::new(
@@ -220,6 +230,7 @@ async fn write(client: &mut Client, batch: &[Call]) -> Result<(), tokio_postgres
 			Type::INT4,
 			Type::INT4,
 			Type::INT4,
+			Type::NUMERIC,
 		],
 	);
 	let mut writer = std::pin::pin!(writer);
@@ -241,6 +252,7 @@ async fn write(client: &mut Client, batch: &[Call]) -> Result<(), tokio_postgres
 				&usage.and_then(|u| u.reasoning_tokens).map(int),
 				&millis(call.first_byte),
 				&millis(call.total),
+				&call.cost(),
 			])
 			.await?;
 	}
@@ -248,7 +260,8 @@ async fn write(client: &mut Client, batch: &[Call]) -> Result<(), tokio_postgres
 
 	let totals = totals(batch);
 	let mut columns: (Vec<String>, Vec<&str>, Vec<&str>, Vec<&str>) = Default::default();
-	let mut counts: [Vec<i64>; 9] = Default::default();
+	let mut counts: [Vec<i64>; 10] = Default::default();
+	let mut costs: Vec<Dollars> = Vec::new();
 	for ((day, operation, model, provider), t) in &totals {
 		columns.0.push(day.iso());
 		columns.1.push(operation);
@@ -264,18 +277,21 @@ async fn write(client: &mut Client, batch: &[Call]) -> Result<(), tokio_postgres
 			t.cached_tokens,
 			t.cache_write_tokens,
 			t.reasoning_tokens,
+			t.unpriced,
 		]) {
 			list.push(n);
 		}
+		costs.push(Dollars(t.cost));
 	}
-	let [r, f, c, un, pt, ct, cr, cw, rt] = &counts;
+	let [r, f, c, un, pt, ct, cr, cw, rt, up] = &counts;
 	tx.execute(
 		"INSERT INTO psyche.usage_daily AS u (day, operation, model, provider, requests, failed, \
 		 cancelled, uncounted, prompt_tokens, completion_tokens, cached_tokens, cache_write_tokens, \
-		 reasoning_tokens) \
-		 SELECT d::date, o, m, p, r, f, c, un, pt, ct, cr, cw, rt FROM unnest($1::text[], $2::text[], \
+		 reasoning_tokens, unpriced, cost) \
+		 SELECT d::date, o, m, p, r, f, c, un, pt, ct, cr, cw, rt, up, co FROM unnest($1::text[], $2::text[], \
 		 $3::text[], $4::text[], $5::int8[], $6::int8[], $7::int8[], $8::int8[], $9::int8[], \
-		 $10::int8[], $11::int8[], $12::int8[], $13::int8[]) AS t(d, o, m, p, r, f, c, un, pt, ct, cr, cw, rt) \
+		 $10::int8[], $11::int8[], $12::int8[], $13::int8[], $14::int8[], $15::numeric[]) \
+		 AS t(d, o, m, p, r, f, c, un, pt, ct, cr, cw, rt, up, co) \
 		 ON CONFLICT (day, operation, model, provider) DO UPDATE SET \
 		 requests = u.requests + excluded.requests, failed = u.failed + excluded.failed, \
 		 cancelled = u.cancelled + excluded.cancelled, uncounted = u.uncounted + excluded.uncounted, \
@@ -283,9 +299,11 @@ async fn write(client: &mut Client, batch: &[Call]) -> Result<(), tokio_postgres
 		 completion_tokens = u.completion_tokens + excluded.completion_tokens, \
 		 cached_tokens = u.cached_tokens + excluded.cached_tokens, \
 		 cache_write_tokens = u.cache_write_tokens + excluded.cache_write_tokens, \
-		 reasoning_tokens = u.reasoning_tokens + excluded.reasoning_tokens",
+		 reasoning_tokens = u.reasoning_tokens + excluded.reasoning_tokens, \
+		 unpriced = u.unpriced + excluded.unpriced, cost = u.cost + excluded.cost",
 		&[
-			&columns.0, &columns.1, &columns.2, &columns.3, r, f, c, un, pt, ct, cr, cw, rt,
+			&columns.0, &columns.1, &columns.2, &columns.3, r, f, c, un, pt, ct, cr, cw, rt, up,
+			&costs,
 		],
 	)
 	.await?;
@@ -525,6 +543,7 @@ mod tests {
 			streamed: true,
 			outcome,
 			usage,
+			price: None,
 			first_byte: Duration::from_millis(120),
 			total: Duration::from_millis(900),
 		}
@@ -577,6 +596,8 @@ mod tests {
 				cached_tokens: 160,
 				cache_write_tokens: 0,
 				reasoning_tokens: 10,
+				cost: 0,
+				unpriced: 2,
 			}
 		);
 	}
@@ -683,9 +704,16 @@ mod tests {
 			},
 			rx,
 		));
+		let price = serde_json::from_str::<crate::price::PriceEntry>(
+			r#"{"input": 2.2, "output": 11, "cache_read": 0.11}"#,
+		)
+		.unwrap()
+		.price()
+		.unwrap();
 		for _ in 0..2500 {
-			tx.send(call(now, "sonnet", Outcome::Completed, Some(used)))
-				.unwrap();
+			let mut priced = call(now, "sonnet", Outcome::Completed, Some(used));
+			priced.price = Some(price);
+			tx.send(priced).unwrap();
 		}
 		tx.send(call(
 			now,
@@ -730,6 +758,38 @@ mod tests {
 			.unwrap();
 		let got: Vec<i64> = (0..7).map(|i| row.get(i)).collect();
 		assert_eq!(got, vec![2501, 1, 0, 1, 25_000, 7_500, 10_000]);
+		// Each call: 6 plain tokens at $2.20, 4 cached at $0.11 and 3 out at $11 per million, so
+		// $0.00004664, exactly, 2,500 times; the failed call reported nothing and costs nothing.
+		let cost = |sql: &'static str| {
+			let client = &client;
+			async move {
+				client
+					.query_one(sql, &[])
+					.await
+					.unwrap()
+					.get::<_, String>(0)
+			}
+		};
+		assert_eq!(
+			cost("SELECT sum(cost)::text FROM psyche.requests WHERE model = 'sonnet'").await,
+			"0.116600000000"
+		);
+		assert_eq!(
+			cost("SELECT min(cost)::text FROM psyche.requests WHERE model = 'sonnet'").await,
+			"0.000046640000"
+		);
+		assert_eq!(
+			cost(
+				"SELECT cost::text || ' ' || unpriced FROM psyche.usage_daily WHERE model = 'sonnet'"
+			)
+			.await,
+			"0.116600000000 0"
+		);
+		assert_eq!(
+			cost("SELECT coalesce(max(cost)::text, 'null') || ' ' || (SELECT unpriced FROM psyche.usage_daily WHERE model = 'luna') FROM psyche.requests WHERE model = 'luna'").await,
+			"null 1",
+			"a model with no price: the row has no cost and the day counts it"
+		);
 		let failed = client
 			.query_one(
 				"SELECT outcome, prompt_tokens, first_byte_ms, total_ms FROM psyche.requests WHERE outcome <> 'completed' AND model = 'sonnet'",

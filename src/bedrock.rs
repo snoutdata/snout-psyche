@@ -466,12 +466,14 @@ mod tests {
 					.unwrap(),
 				api_key: None,
 				aws: None,
+				region: None,
 			}),
 			upstream: "us.anthropic.claude-sonnet-5".into(),
 			prompt_caching: caching,
 			max_output_tokens: None,
 			reasoning: Some(crate::providers::Reasoning::Budget),
 			embeddings: None,
+			price: None,
 		}
 	}
 

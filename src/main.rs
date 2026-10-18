@@ -35,6 +35,13 @@ async fn main() {
 		.unwrap_or_else(|error| fail(2, &error.to_string()));
 	let http = snout_psyche::net::client(config.egress).unwrap_or_else(|error| fail(1, &error));
 	let models = catalogue.models().len();
+	for model in catalogue.unpriced() {
+		// PS14: served, and logged with no cost. A price in the providers file silences it.
+		tracing::warn!(
+			model,
+			"no price for this model: its calls are logged with no cost; give it a price in the providers file"
+		);
+	}
 	// The request log: the schema migrated before the first call, then a task of its own that the
 	// calls are handed to. A database that cannot be migrated stops the start, since a log that
 	// silently is not kept is worse than none.

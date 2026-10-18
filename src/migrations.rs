@@ -21,11 +21,18 @@ impl Migration {
 }
 
 /// A migration's statements are never edited once released: a change is a new file with the next id.
-pub const MIGRATIONS: &[Migration] = &[Migration {
-	id: 1,
-	name: "request-log",
-	sql: include_str!("../migrations/0001-request-log.sql"),
-}];
+pub const MIGRATIONS: &[Migration] = &[
+	Migration {
+		id: 1,
+		name: "request-log",
+		sql: include_str!("../migrations/0001-request-log.sql"),
+	},
+	Migration {
+		id: 2,
+		name: "cost",
+		sql: include_str!("../migrations/0002-cost.sql"),
+	},
+];
 
 /// "snout-ps", so it collides with no other advisory lock by accident.
 const LOCK_KEY: i64 = 0x736e_6f75_742d_7073;

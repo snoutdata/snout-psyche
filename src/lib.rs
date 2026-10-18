@@ -21,6 +21,7 @@ pub mod layout;
 pub mod log;
 pub mod migrations;
 pub mod net;
+pub mod price;
 pub mod providers;
 pub mod proxy;
 pub mod sigv4;
@@ -68,12 +69,14 @@ pub mod fuzz {
 				base_url: url::Url::parse("https://api.anthropic.com/v1").expect("a URL"),
 				api_key: None,
 				aws: None,
+				region: None,
 			}),
 			upstream: "u".into(),
 			prompt_caching: true,
 			max_output_tokens: None,
 			reasoning: Some(crate::providers::Reasoning::Adaptive),
 			embeddings: None,
+			price: None,
 		};
 		let _ = crate::anthropic::request(&inbound.body, &model, inbound.stream);
 		let _ = crate::bedrock::request(&inbound.body, &model);
