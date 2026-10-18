@@ -301,6 +301,9 @@ on Postgres 17.
 against the request as it arrived) and never spend a token. The signer is pinned against
 signatures botocore made for the same requests. `bash tests/db.sh` runs the same suite with a
 throwaway Postgres 17 beside it, which the request log's tests need (they skip without it).
+`bash tests/crash.sh` stops a release Psyche under load, once with SIGTERM and twice with `kill -9`,
+and checks what the request log kept: every answered call on a clean stop, and after a kill no
+more lost than two batches (2,000 rows) and the calls in flight.
 
 ## License
 
