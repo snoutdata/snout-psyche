@@ -17,7 +17,8 @@ cleanup() {
 }
 trap cleanup EXIT
 "$engine" run -d --rm --name "$pg" --network "$net" -e POSTGRES_PASSWORD=test postgres:17-alpine >/dev/null
-until "$engine" exec "$pg" psql -U postgres -tAc 'select 1' >/dev/null 2>&1; do sleep 0.5; done
+# Over TCP: while it initialises, the image runs a temporary server on its socket alone.
+until "$engine" exec "$pg" psql -h 127.0.0.1 -U postgres -tAc 'select 1' >/dev/null 2>&1; do sleep 0.5; done
 
 # The stack's dev container: two levels up in the monorepo, one in the published repository.
 dev="$here/../../scripts/dev.sh"
