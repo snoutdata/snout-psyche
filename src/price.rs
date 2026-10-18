@@ -374,6 +374,12 @@ mod tests {
 		let regional = find("us-west-2", "us.anthropic.claude-sonnet-5-5").unwrap();
 		assert_eq!(global.rates.input, 2_000_000);
 		assert_eq!(regional.rates.input, 2_200_000);
+		let luna = find("us-west-2", "us.openai.gpt-5.6-luna").unwrap();
+		assert_eq!((luna.rates.input, luna.rates.cache_read), (220_000, 22_000));
+		assert_eq!(
+			luna.long_context.map(|(above, l)| (above, l.output)),
+			Some((272_000, 1_980_000))
+		);
 		assert_eq!(
 			find("us-west-2", "amazon.titan-embed-text-v2:0")
 				.unwrap()

@@ -1,6 +1,6 @@
 {
 	"checked": "2026-10-18",
-	"source": "The AWS Price List API (service codes AmazonBedrockFoundationModels and AmazonBedrock, regionCode us-west-2), on-demand standard tier. A regional inference profile (us.) and an in-region model id are charged the standard rate, a global profile (global.) the global rate. cache_write is the five-minute write, the only cache point Psyche asks Bedrock for. Cohere Embed v4 has one rate in the list, applied to its in-region id and its us. profile; its global profile is left out until its rate is known.",
+	"source": "The AWS Price List API (service codes AmazonBedrockFoundationModels and AmazonBedrock, regionCode us-west-2), on-demand standard tier. A regional inference profile (us.) and an in-region model id are charged the standard rate, a global profile (global.) the global rate. cache_write is the five-minute write, the only cache point Psyche asks Bedrock for. Cohere Embed v4 has one rate in the list, applied to its in-region id and its us. profile; its global profile is left out until its rate is known. GPT-5.6 Luna (us.openai.gpt-5.6-luna) is not in the Price List API; its rates are the ones SnoutData's production gateway bills it at, checked the same day, and its long-context cache rates, which are not published, default to the long-context input price.",
 	"models": [
 		{
 			"provider": "bedrock",
@@ -120,6 +120,22 @@
 			"price": {
 				"input": 0.12,
 				"output": 0
+			}
+		},
+		{
+			"provider": "bedrock",
+			"region": "us-west-2",
+			"upstream": "us.openai.gpt-5.6-luna",
+			"price": {
+				"input": 0.22,
+				"output": 1.32,
+				"cache_read": 0.022,
+				"cache_write": 0.275,
+				"long_context": {
+					"above": 272000,
+					"input": 0.44,
+					"output": 1.98
+				}
 			}
 		}
 	]

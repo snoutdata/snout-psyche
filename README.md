@@ -224,8 +224,9 @@ charged for the whole call once the prompt is longer than `above`. Without a `pr
 model up in the catalogue it ships ([`catalogue/models.json`](catalogue/models.json)), matched on the
 provider's kind, its region (Bedrock) or host (the others), and the upstream id, since all three
 change the price: a `us.` inference profile costs 10% more than a `global.` one. Today the catalogue
-holds the Bedrock models Psyche has been run against, in `us-west-2`, from the AWS Price List API,
-with the date they were checked. A model priced by neither still works: its calls are logged with
+holds the Bedrock models Psyche has been run against, in `us-west-2`, from the AWS Price List API
+(GPT-5.6 Luna, which that list does not carry, at the rate it is billed at in production), with the
+date they were checked. A model priced by neither still works: its calls are logged with
 no cost, and Psyche names it in a warning at start. Costs are kept exact to the picodollar, so a
 sum of a million small calls does not drift.
 
