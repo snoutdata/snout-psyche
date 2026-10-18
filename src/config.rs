@@ -25,6 +25,10 @@ pub struct Config {
 	pub timeouts: Timeouts,
 	/// `PSYCHE_MAX_REQUEST_MB`, default 32: the largest request body accepted (images travel inline).
 	pub max_request_bytes: usize,
+	/// `DATABASE_URL` (secret, optional): the Postgres the request log is written to, in the
+	/// `psyche` schema, which Psyche makes and migrates at start. Without it no call is stored; each
+	/// is still logged to stderr.
+	pub log: Option<crate::log::Settings>,
 }
 
 /// How long Psyche waits on a provider. A reasoning model can think for minutes before its first
@@ -140,6 +144,22 @@ impl Config {
 				}
 			},
 		};
+		// `PSYCHE_LOG_RETENTION_DAYS`, default 30: days of request rows kept (the daily totals stay).
+		let retention_days = match get("PSYCHE_LOG_RETENTION_DAYS") {
+			None => 30,
+			Some(text) => match text.parse::<u32>() {
+				Ok(days) if (1..=3650).contains(&days) => days,
+				_ => {
+					return Err(ConfigError(format!(
+						"PSYCHE_LOG_RETENTION_DAYS is a number of days from 1 to 3650, not {text}"
+					)));
+				}
+			},
+		};
+		let log = get("DATABASE_URL").map(|database_url| crate::log::Settings {
+			database_url,
+			retention_days,
+		});
 		Ok(Self {
 			addr,
 			jwt_secret,
@@ -147,6 +167,7 @@ impl Config {
 			egress,
 			timeouts,
 			max_request_bytes,
+			log,
 		})
 	}
 }
@@ -172,6 +193,14 @@ mod tests {
 		assert_eq!(config.egress, Egress::Public);
 		assert_eq!(config.timeouts, Timeouts::default());
 		assert_eq!(config.max_request_bytes, 32 * 1024 * 1024);
+		assert!(config.log.is_none());
+		let mut env = base();
+		env.insert(
+			"DATABASE_URL".into(),
+			"postgres://psyche:a-db-password@db/postgres".into(),
+		);
+		let config = Config::from_map(&env).unwrap();
+		assert_eq!(config.log.unwrap().retention_days, 30);
 	}
 
 	#[test]
@@ -195,6 +224,7 @@ mod tests {
 			("PSYCHE_FIRST_BYTE_TIMEOUT_S", "soon"),
 			("PSYCHE_MAX_REQUEST_MB", "1000"),
 			("PSYCHE_ADDR", "5300"),
+			("PSYCHE_LOG_RETENTION_DAYS", "0"),
 		] {
 			let mut env = base();
 			env.insert(name.into(), bad.into());
@@ -208,7 +238,13 @@ mod tests {
 
 	#[test]
 	fn debug_never_prints_a_secret() {
-		let printed = format!("{:?}", Config::from_map(&base()).unwrap());
+		let mut env = base();
+		env.insert(
+			"DATABASE_URL".into(),
+			"postgres://psyche:a-db-password@db/postgres".into(),
+		);
+		let printed = format!("{:?}", Config::from_map(&env).unwrap());
 		assert!(!printed.contains("a-project-secret"), "{printed}");
+		assert!(!printed.contains("a-db-password"), "{printed}");
 	}
 }

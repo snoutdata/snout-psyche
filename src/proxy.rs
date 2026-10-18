@@ -64,14 +64,16 @@ pub struct Proxy {
 	pub jwt_secret: String,
 	pub timeouts: Timeouts,
 	pub max_request_bytes: usize,
-	/// Where each finished call is sent. Phase 3 puts the request log here; until then the call is
-	/// logged (`psyche::call`) and, in tests, handed to whoever listens.
+	/// Where each finished call is sent: the request log (`log.rs`) when there is a database, and in
+	/// tests whoever listens. Every call is also logged (`psyche::call`).
 	pub calls: Option<tokio::sync::mpsc::UnboundedSender<Call>>,
 }
 
 /// One call, as the request log will hold it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Call {
+	/// When the call reached Psyche.
+	pub at: SystemTime,
 	pub operation: Operation,
 	pub model: String,
 	pub provider: String,
@@ -107,7 +109,7 @@ impl Operation {
 		}
 	}
 
-	fn name(self) -> &'static str {
+	pub fn name(self) -> &'static str {
 		match self {
 			Operation::Chat => "chat",
 			Operation::Completions => "completions",
@@ -425,6 +427,7 @@ impl Proxy {
 		let record = Record {
 			sink: self.calls.clone(),
 			call: Call {
+				at: SystemTime::now(),
 				operation,
 				model: model.name.clone(),
 				provider: provider.name.clone(),
@@ -495,6 +498,7 @@ impl Proxy {
 		let mut record = Record {
 			sink: self.calls.clone(),
 			call: Call {
+				at: SystemTime::now(),
 				operation: Operation::Embeddings,
 				model: model.name.clone(),
 				provider: provider.name.clone(),

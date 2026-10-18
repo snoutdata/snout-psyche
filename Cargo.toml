@@ -43,6 +43,10 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 tracing = "0.1"
 
+# The request log (log.rs): its own connection to Postgres, written to by COPY in batches, never on
+# a request's path. std's SystemTime is a timestamptz to it, so no date crate comes with it.
+tokio-postgres = "0.7"
+
 # The server: /ai/v1 (and /v1, for clients that take a base URL ending in /v1).
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json"] }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "json", "ansi"] }

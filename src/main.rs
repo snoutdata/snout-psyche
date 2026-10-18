@@ -35,13 +35,37 @@ async fn main() {
 		.unwrap_or_else(|error| fail(2, &error.to_string()));
 	let http = snout_psyche::net::client(config.egress).unwrap_or_else(|error| fail(1, &error));
 	let models = catalogue.models().len();
+	// The request log: the schema migrated before the first call, then a task of its own that the
+	// calls are handed to. A database that cannot be migrated stops the start, since a log that
+	// silently is not kept is worse than none.
+	let (calls, log) = match &config.log {
+		None => (None, None),
+		Some(settings) => {
+			let mut client = snout_psyche::log::connect(&settings.database_url)
+				.await
+				.unwrap_or_else(|error| fail(1, &format!("cannot reach DATABASE_URL: {error}")));
+			let ran = snout_psyche::migrations::migrate(
+				&mut client,
+				snout_psyche::migrations::MIGRATIONS,
+			)
+			.await
+			.unwrap_or_else(|error| fail(1, &format!("cannot migrate the psyche schema: {error}")));
+			if !ran.is_empty() {
+				tracing::info!(?ran, "migrated the psyche schema");
+			}
+			drop(client);
+			let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+			let task = tokio::spawn(snout_psyche::log::run(settings.clone(), rx));
+			(Some(tx), Some(task))
+		}
+	};
 	let proxy = Arc::new(Proxy {
 		catalogue,
 		http,
 		jwt_secret: config.jwt_secret.clone(),
 		timeouts: config.timeouts,
 		max_request_bytes: config.max_request_bytes,
-		calls: None,
+		calls,
 	});
 	let listener = tokio::net::TcpListener::bind(config.addr)
 		.await
@@ -57,6 +81,15 @@ async fn main() {
 		.await
 	{
 		fail(1, &error.to_string());
+	}
+	// Every connection has ended and the router with it, so the log's channel is closed: it writes
+	// what it holds and stops.
+	if let Some(log) = log
+		&& tokio::time::timeout(std::time::Duration::from_secs(10), log)
+			.await
+			.is_err()
+	{
+		tracing::error!("the request log did not finish writing within 10 seconds");
 	}
 }
 

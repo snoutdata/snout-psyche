@@ -1,0 +1,835 @@
+//! The request log: every finished call, written to Postgres by a task of its own.
+//!
+//! A call ends by handing its [`Call`] to a channel, which costs it nothing that waits. This task
+//! holds what arrives and writes it as one `COPY` every [`FLUSH_EVERY`] or every [`FLUSH_ROWS`]
+//! rows, whichever comes first, together with the day's totals in `psyche.usage_daily`, in one
+//! transaction. So the database is never on a request's path, and what a crash loses is the batch
+//! not yet written, which those two numbers bound.
+//!
+//! When the database cannot be reached the rows are held and written once it can, up to
+//! [`MAX_HELD`]; past that the oldest are dropped, counted and reported, so a long outage costs a
+//! bounded amount of memory rather than the process.
+//!
+//! The log is partitioned by day (UTC). The task makes the partitions from yesterday to two days
+//! ahead whenever the date changes, and drops those past the retention, so an expired day is one
+//! `DROP TABLE` rather than a delete of every row.
+
+use std::collections::{BTreeMap, VecDeque};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use tokio::sync::mpsc::UnboundedReceiver;
+use tokio_postgres::binary_copy::BinaryCopyInWriter;
+use tokio_postgres::types::Type;
+use tokio_postgres::{Client, NoTls};
+
+use crate::proxy::{Call, Outcome};
+
+/// How often what is held is written.
+pub const FLUSH_EVERY: Duration = Duration::from_millis(500);
+/// How many held rows make a write happen at once.
+pub const FLUSH_ROWS: usize = 1000;
+/// The most rows held while the database cannot be reached.
+pub const MAX_HELD: usize = 100_000;
+/// How long a failed connection waits before the next attempt.
+const RECONNECT_AFTER: Duration = Duration::from_secs(5);
+
+const SECONDS_PER_DAY: u64 = 86_400;
+
+#[derive(Clone)]
+pub struct Settings {
+	pub database_url: String,
+	/// Days of rows kept; the totals in `usage_daily` are kept for good.
+	pub retention_days: u32,
+}
+
+impl std::fmt::Debug for Settings {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_struct("Settings")
+			.field("retention_days", &self.retention_days)
+			.finish_non_exhaustive()
+	}
+}
+
+/// A day in UTC, by its first second since the epoch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct Day(u64);
+
+impl Day {
+	fn of(at: SystemTime) -> Self {
+		let unix = at.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
+		Day(unix - unix % SECONDS_PER_DAY)
+	}
+
+	fn plus(self, days: i64) -> Self {
+		Day(self.0.saturating_add_signed(days * SECONDS_PER_DAY as i64))
+	}
+
+	/// `20261018`, the partition's suffix.
+	fn compact(self) -> String {
+		crate::sigv4::amz_date(self.0)[..8].to_string()
+	}
+
+	/// `2026-10-18`, as Postgres reads a date.
+	fn iso(self) -> String {
+		let d = self.compact();
+		format!("{}-{}-{}", &d[..4], &d[4..6], &d[6..])
+	}
+}
+
+/// Connects as Psyche, for the migrations at start and for the log.
+pub async fn connect(url: &str) -> Result<Client, tokio_postgres::Error> {
+	let mut config: tokio_postgres::Config = url.parse()?;
+	config.application_name("snout-psyche");
+	let (client, connection) = config.connect(NoTls).await?;
+	tokio::spawn(async move {
+		if let Err(error) = connection.await {
+			tracing::debug!(%error, "the request log's connection closed");
+		}
+	});
+	Ok(client)
+}
+
+/// Writes the calls that arrive on `calls` until the channel closes, then writes what is left and
+/// returns.
+pub async fn run(settings: Settings, mut calls: UnboundedReceiver<Call>) {
+	let mut writer = Writer::new(settings);
+	let mut tick = tokio::time::interval(FLUSH_EVERY);
+	tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+	loop {
+		tokio::select! {
+			call = calls.recv() => match call {
+				Some(call) => {
+					writer.hold(call);
+					if writer.held.len() >= FLUSH_ROWS {
+						writer.flush().await;
+					}
+				}
+				None => {
+					writer.flush().await;
+					if !writer.held.is_empty() {
+						tracing::error!(rows = writer.held.len(), "the request log could not write its last rows before stopping");
+					}
+					return;
+				}
+			},
+			_ = tick.tick() => writer.flush().await,
+		}
+	}
+}
+
+struct Writer {
+	settings: Settings,
+	client: Option<Client>,
+	/// When the last connection attempt failed.
+	failed_at: Option<tokio::time::Instant>,
+	held: VecDeque<Call>,
+	/// Rows dropped because too many were held, not yet reported.
+	dropped: u64,
+	/// The day whose partitions were last made.
+	maintained: Option<Day>,
+	/// Whether the last write failed, so a run of failures is reported once.
+	failing: bool,
+}
+
+/// A batch's totals for one day, operation, model and provider.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct Totals {
+	requests: i64,
+	failed: i64,
+	cancelled: i64,
+	uncounted: i64,
+	prompt_tokens: i64,
+	completion_tokens: i64,
+	cached_tokens: i64,
+	cache_write_tokens: i64,
+	reasoning_tokens: i64,
+}
+
+type Key = (Day, &'static str, String, String);
+
+fn totals(batch: &[Call]) -> BTreeMap<Key, Totals> {
+	let mut out: BTreeMap<Key, Totals> = BTreeMap::new();
+	for call in batch {
+		let key = (
+			Day::of(call.at),
+			call.operation.name(),
+			call.model.clone(),
+			call.provider.clone(),
+		);
+		let t = out.entry(key).or_default();
+		t.requests += 1;
+		match call.outcome {
+			Outcome::Completed => {}
+			Outcome::Cancelled => t.cancelled += 1,
+			Outcome::Failed(_) => t.failed += 1,
+		}
+		match call.usage {
+			None => t.uncounted += 1,
+			Some(u) => {
+				let n = |v: u64| i64::try_from(v).unwrap_or(i64::MAX);
+				t.prompt_tokens += n(u.prompt_tokens);
+				t.completion_tokens += n(u.completion_tokens);
+				t.cached_tokens += n(u.cached_tokens.unwrap_or(0));
+				t.cache_write_tokens += n(u.cache_write_tokens.unwrap_or(0));
+				t.reasoning_tokens += n(u.reasoning_tokens.unwrap_or(0));
+			}
+		}
+	}
+	out
+}
+
+fn outcome(outcome: Outcome) -> &'static str {
+	match outcome {
+		Outcome::Completed => "completed",
+		Outcome::Cancelled => "cancelled",
+		Outcome::Failed(class) => class.code(),
+	}
+}
+
+fn int(n: u64) -> i32 {
+	i32::try_from(n).unwrap_or(i32::MAX)
+}
+
+fn millis(d: Duration) -> i32 {
+	i32::try_from(d.as_millis()).unwrap_or(i32::MAX)
+}
+
+/// The batch's rows, by COPY, and its totals, in one transaction.
+async fn write(client: &mut Client, batch: &[Call]) -> Result<(), tokio_postgres::Error> {
+	let tx = client.transaction().await?;
+	let sink = tx
+		.copy_in(
+			"COPY psyche.requests (at, operation, model, provider, streamed, outcome, \
+			 prompt_tokens, completion_tokens, cached_tokens, cache_write_tokens, reasoning_tokens, \
+			 first_byte_ms, total_ms) FROM STDIN BINARY",
+		)
+		.await?;
+	let writer = BinaryCopyInWriter::new(
+		sink,
+		&[
+			Type::TIMESTAMPTZ,
+			Type::TEXT,
+			Type::TEXT,
+			Type::TEXT,
+			Type::BOOL,
+			Type::TEXT,
+			Type::INT4,
+			Type::INT4,
+			Type::INT4,
+			Type::INT4,
+			Type::INT4,
+			Type::INT4,
+			Type::INT4,
+		],
+	);
+	let mut writer = std::pin::pin!(writer);
+	for call in batch {
+		let usage = call.usage;
+		writer
+			.as_mut()
+			.write(&[
+				&call.at,
+				&call.operation.name(),
+				&call.model,
+				&call.provider,
+				&call.streamed,
+				&outcome(call.outcome),
+				&usage.map(|u| int(u.prompt_tokens)),
+				&usage.map(|u| int(u.completion_tokens)),
+				&usage.and_then(|u| u.cached_tokens).map(int),
+				&usage.and_then(|u| u.cache_write_tokens).map(int),
+				&usage.and_then(|u| u.reasoning_tokens).map(int),
+				&millis(call.first_byte),
+				&millis(call.total),
+			])
+			.await?;
+	}
+	writer.finish().await?;
+
+	let totals = totals(batch);
+	let mut columns: (Vec<String>, Vec<&str>, Vec<&str>, Vec<&str>) = Default::default();
+	let mut counts: [Vec<i64>; 9] = Default::default();
+	for ((day, operation, model, provider), t) in &totals {
+		columns.0.push(day.iso());
+		columns.1.push(operation);
+		columns.2.push(model);
+		columns.3.push(provider);
+		for (list, n) in counts.iter_mut().zip([
+			t.requests,
+			t.failed,
+			t.cancelled,
+			t.uncounted,
+			t.prompt_tokens,
+			t.completion_tokens,
+			t.cached_tokens,
+			t.cache_write_tokens,
+			t.reasoning_tokens,
+		]) {
+			list.push(n);
+		}
+	}
+	let [r, f, c, un, pt, ct, cr, cw, rt] = &counts;
+	tx.execute(
+		"INSERT INTO psyche.usage_daily AS u (day, operation, model, provider, requests, failed, \
+		 cancelled, uncounted, prompt_tokens, completion_tokens, cached_tokens, cache_write_tokens, \
+		 reasoning_tokens) \
+		 SELECT d::date, o, m, p, r, f, c, un, pt, ct, cr, cw, rt FROM unnest($1::text[], $2::text[], \
+		 $3::text[], $4::text[], $5::int8[], $6::int8[], $7::int8[], $8::int8[], $9::int8[], \
+		 $10::int8[], $11::int8[], $12::int8[], $13::int8[]) AS t(d, o, m, p, r, f, c, un, pt, ct, cr, cw, rt) \
+		 ON CONFLICT (day, operation, model, provider) DO UPDATE SET \
+		 requests = u.requests + excluded.requests, failed = u.failed + excluded.failed, \
+		 cancelled = u.cancelled + excluded.cancelled, uncounted = u.uncounted + excluded.uncounted, \
+		 prompt_tokens = u.prompt_tokens + excluded.prompt_tokens, \
+		 completion_tokens = u.completion_tokens + excluded.completion_tokens, \
+		 cached_tokens = u.cached_tokens + excluded.cached_tokens, \
+		 cache_write_tokens = u.cache_write_tokens + excluded.cache_write_tokens, \
+		 reasoning_tokens = u.reasoning_tokens + excluded.reasoning_tokens",
+		&[
+			&columns.0, &columns.1, &columns.2, &columns.3, r, f, c, un, pt, ct, cr, cw, rt,
+		],
+	)
+	.await?;
+	tx.commit().await
+}
+
+/// Makes each day's partition, if it is not there. Two Psyches making the same one at once is
+/// harmless: the one that loses is told it exists.
+async fn partitions(client: &Client, days: &[Day]) -> Result<(), tokio_postgres::Error> {
+	for day in days {
+		let made = client
+			.batch_execute(&format!(
+				"CREATE TABLE IF NOT EXISTS psyche.requests_{} PARTITION OF psyche.requests \
+				 FOR VALUES FROM ('{} 00:00:00+00') TO ('{} 00:00:00+00')",
+				day.compact(),
+				day.iso(),
+				day.plus(1).iso()
+			))
+			.await;
+		if let Err(error) = made {
+			let raced = error.code().is_some_and(|code| {
+				*code == tokio_postgres::error::SqlState::DUPLICATE_TABLE
+					|| *code == tokio_postgres::error::SqlState::UNIQUE_VIOLATION
+			});
+			if !raced {
+				return Err(error);
+			}
+		}
+	}
+	Ok(())
+}
+
+/// Drops the partitions whose day is older than `keep` days before `today`. Returns their names.
+async fn expire(
+	client: &Client,
+	today: Day,
+	keep: u32,
+) -> Result<Vec<String>, tokio_postgres::Error> {
+	let oldest = format!("requests_{}", today.plus(-i64::from(keep)).compact());
+	let rows = client
+		.query(
+			"SELECT c.relname FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid \
+			 WHERE i.inhparent = 'psyche.requests'::regclass ORDER BY 1",
+			&[],
+		)
+		.await?;
+	let mut dropped = Vec::new();
+	for row in rows {
+		let name: String = row.get(0);
+		let dated = name.len() == "requests_".len() + 8
+			&& name.starts_with("requests_")
+			&& name["requests_".len()..]
+				.bytes()
+				.all(|b| b.is_ascii_digit());
+		if dated && name < oldest {
+			client
+				.batch_execute(&format!("DROP TABLE IF EXISTS psyche.{name}"))
+				.await?;
+			dropped.push(name);
+		}
+	}
+	Ok(dropped)
+}
+
+fn no_partition(error: &tokio_postgres::Error) -> bool {
+	error
+		.as_db_error()
+		.is_some_and(|e| e.message().starts_with("no partition of relation"))
+}
+
+impl Writer {
+	fn new(settings: Settings) -> Self {
+		Self {
+			settings,
+			client: None,
+			failed_at: None,
+			held: VecDeque::new(),
+			dropped: 0,
+			maintained: None,
+			failing: false,
+		}
+	}
+
+	fn hold(&mut self, call: Call) {
+		self.held.push_back(call);
+		if self.held.len() > MAX_HELD {
+			self.held.pop_front();
+			self.dropped += 1;
+		}
+	}
+
+	/// The connection, made again if it closed, but not more often than every [`RECONNECT_AFTER`].
+	async fn client(&mut self) -> Option<&mut Client> {
+		if self.client.as_ref().is_some_and(Client::is_closed) {
+			self.client = None;
+			self.maintained = None;
+		}
+		if self.client.is_none() {
+			if self
+				.failed_at
+				.is_some_and(|at| at.elapsed() < RECONNECT_AFTER)
+			{
+				return None;
+			}
+			match connect(&self.settings.database_url).await {
+				Ok(client) => {
+					self.client = Some(client);
+					self.failed_at = None;
+				}
+				Err(error) => {
+					self.failed_at = Some(tokio::time::Instant::now());
+					self.report(&format!("cannot connect: {error}"));
+					return None;
+				}
+			}
+		}
+		self.client.as_mut()
+	}
+
+	fn report(&mut self, why: &str) {
+		if !self.failing {
+			tracing::warn!(
+				held = self.held.len(),
+				"the request log cannot write: {why}; rows are held until it can"
+			);
+		}
+		self.failing = true;
+	}
+
+	/// Makes the partitions around today and drops the expired ones, once per day.
+	async fn maintain(&mut self) {
+		let today = Day::of(SystemTime::now());
+		if self.maintained == Some(today) {
+			return;
+		}
+		let keep = self.settings.retention_days;
+		let Some(client) = self.client().await else {
+			return;
+		};
+		let days: Vec<Day> = (-1..=2).map(|n| today.plus(n)).collect();
+		let result = match partitions(client, &days).await {
+			Ok(()) => expire(client, today, keep).await,
+			Err(error) => Err(error),
+		};
+		match result {
+			Ok(dropped) => {
+				if !dropped.is_empty() {
+					tracing::info!(
+						?dropped,
+						"the request log dropped the days past its retention"
+					);
+				}
+				self.maintained = Some(today);
+			}
+			Err(error) => {
+				tracing::warn!(%error, "the request log could not make or expire its partitions")
+			}
+		}
+	}
+
+	async fn flush(&mut self) {
+		self.maintain().await;
+		if self.dropped > 0 {
+			tracing::error!(
+				rows = self.dropped,
+				"the request log dropped its oldest rows: it held {MAX_HELD} it could not write"
+			);
+			self.dropped = 0;
+		}
+		while !self.held.is_empty() {
+			let n = self.held.len().min(10 * FLUSH_ROWS);
+			let batch: Vec<Call> = self.held.drain(..n).collect();
+			let Some(client) = self.client().await else {
+				self.put_back(batch);
+				return;
+			};
+			let mut result = write(client, &batch).await;
+			if result.as_ref().is_err_and(no_partition) {
+				// A day the batch holds has no partition (rows held across midnight while the database
+				// was away, or a clock that jumped): made, and the batch written again.
+				let mut days: Vec<Day> = batch.iter().map(|c| Day::of(c.at)).collect();
+				days.sort();
+				days.dedup();
+				result = match partitions(client, &days).await {
+					Ok(()) => write(client, &batch).await,
+					Err(error) => Err(error),
+				};
+			}
+			match result {
+				Ok(()) => {
+					if self.failing {
+						tracing::info!("the request log is writing again");
+					}
+					self.failing = false;
+				}
+				Err(error) => {
+					let why = error
+						.as_db_error()
+						.map_or_else(|| error.to_string(), |e| e.message().to_string());
+					self.put_back(batch);
+					self.report(&why);
+					return;
+				}
+			}
+		}
+	}
+
+	fn put_back(&mut self, batch: Vec<Call>) {
+		for call in batch.into_iter().rev() {
+			self.held.push_front(call);
+		}
+		while self.held.len() > MAX_HELD {
+			self.held.pop_front();
+			self.dropped += 1;
+		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::error::Class;
+	use crate::proxy::Operation;
+	use crate::usage::Usage;
+
+	pub(crate) fn call(
+		at: SystemTime,
+		model: &str,
+		outcome: Outcome,
+		usage: Option<Usage>,
+	) -> Call {
+		Call {
+			at,
+			operation: Operation::Chat,
+			model: model.into(),
+			provider: "bedrock".into(),
+			streamed: true,
+			outcome,
+			usage,
+			first_byte: Duration::from_millis(120),
+			total: Duration::from_millis(900),
+		}
+	}
+
+	#[test]
+	fn days_are_utc_and_named_for_their_partition() {
+		let at = UNIX_EPOCH + Duration::from_secs(1_792_324_800 + 3_600 * 11 + 59);
+		let day = Day::of(at);
+		assert_eq!(day.compact(), "20261018");
+		assert_eq!(day.iso(), "2026-10-18");
+		assert_eq!(day.plus(1).iso(), "2026-10-19");
+		assert_eq!(day.plus(-18).iso(), "2026-09-30");
+		assert_eq!(
+			Day::of(UNIX_EPOCH + Duration::from_secs(1_792_367_999)),
+			day
+		);
+	}
+
+	#[test]
+	fn a_batch_is_totalled_per_day_model_and_provider() {
+		let today = UNIX_EPOCH + Duration::from_secs(1_792_324_800);
+		let tomorrow = today + Duration::from_secs(SECONDS_PER_DAY);
+		let used = Usage {
+			prompt_tokens: 100,
+			completion_tokens: 20,
+			cached_tokens: Some(80),
+			cache_write_tokens: None,
+			reasoning_tokens: Some(5),
+		};
+		let batch = vec![
+			call(today, "a", Outcome::Completed, Some(used)),
+			call(today, "a", Outcome::Failed(Class::RateLimited), None),
+			call(today, "a", Outcome::Cancelled, Some(used)),
+			call(tomorrow, "a", Outcome::Completed, Some(used)),
+			call(today, "b", Outcome::Completed, Some(used)),
+		];
+		let totals = totals(&batch);
+		assert_eq!(totals.len(), 3);
+		let a = totals[&(Day::of(today), "chat", "a".into(), "bedrock".into())];
+		assert_eq!(
+			a,
+			Totals {
+				requests: 3,
+				failed: 1,
+				cancelled: 1,
+				uncounted: 1,
+				prompt_tokens: 200,
+				completion_tokens: 40,
+				cached_tokens: 160,
+				cache_write_tokens: 0,
+				reasoning_tokens: 10,
+			}
+		);
+	}
+
+	#[test]
+	fn held_rows_are_bounded_and_the_oldest_go_first() {
+		let mut writer = Writer::new(Settings {
+			database_url: "postgres://nowhere".into(),
+			retention_days: 30,
+		});
+		for i in 0..MAX_HELD + 3 {
+			let at = UNIX_EPOCH + Duration::from_secs(i as u64);
+			writer.hold(call(at, "a", Outcome::Completed, None));
+		}
+		assert_eq!(writer.held.len(), MAX_HELD);
+		assert_eq!(writer.dropped, 3);
+		assert_eq!(
+			writer.held.front().unwrap().at,
+			UNIX_EPOCH + Duration::from_secs(3)
+		);
+	}
+
+	#[test]
+	fn the_settings_never_print_the_url() {
+		let settings = Settings {
+			database_url: "postgres://psyche:hunter2@db/postgres".into(),
+			retention_days: 30,
+		};
+		assert!(!format!("{settings:?}").contains("hunter2"));
+	}
+
+	/// A fresh, migrated database of its own for one test, or `None` when `PSYCHE_TEST_DATABASE_URL`
+	/// is not set (tests/db.sh sets it). Returns the client and the database's URL.
+	async fn fresh_database(name: &str) -> Option<(Client, String)> {
+		let admin_url = std::env::var("PSYCHE_TEST_DATABASE_URL").ok()?;
+		let admin = connect(&admin_url).await.unwrap();
+		let database = format!("psyche_{name}_{}", std::process::id());
+		for statement in [
+			format!("DROP DATABASE IF EXISTS {database} WITH (FORCE)"),
+			format!("CREATE DATABASE {database}"),
+		] {
+			admin.batch_execute(&statement).await.unwrap();
+		}
+		let url = format!("{}/{database}", admin_url.rsplit_once('/').unwrap().0);
+		let mut client = connect(&url).await.unwrap();
+		let migrations = crate::migrations::MIGRATIONS;
+		assert_eq!(
+			crate::migrations::migrate(&mut client, migrations)
+				.await
+				.unwrap(),
+			migrations.iter().map(|m| m.id).collect::<Vec<_>>()
+		);
+		assert!(
+			crate::migrations::migrate(&mut client, migrations)
+				.await
+				.unwrap()
+				.is_empty(),
+			"a second run runs nothing"
+		);
+		Some((client, url))
+	}
+
+	async fn count(client: &Client, sql: &str) -> i64 {
+		client.query_one(sql, &[]).await.unwrap().get(0)
+	}
+
+	#[tokio::test]
+	async fn a_changed_migration_is_refused() {
+		let Some((mut client, _)) = fresh_database("ledger").await else {
+			return;
+		};
+		client
+			.batch_execute("UPDATE psyche.migrations SET hash = repeat('0', 64) WHERE id = 1")
+			.await
+			.unwrap();
+		let error = crate::migrations::migrate(&mut client, crate::migrations::MIGRATIONS)
+			.await
+			.unwrap_err();
+		assert!(
+			error.to_string().contains("changed after it ran"),
+			"{error}"
+		);
+	}
+
+	#[tokio::test]
+	async fn calls_are_written_in_batches_with_their_totals() {
+		let Some((client, url)) = fresh_database("write").await else {
+			return;
+		};
+		let now = SystemTime::now();
+		let tomorrow = now + Duration::from_secs(SECONDS_PER_DAY);
+		let used = Usage {
+			prompt_tokens: 10,
+			completion_tokens: 3,
+			cached_tokens: Some(4),
+			cache_write_tokens: None,
+			reasoning_tokens: None,
+		};
+		let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+		let task = tokio::spawn(run(
+			Settings {
+				database_url: url,
+				retention_days: 30,
+			},
+			rx,
+		));
+		for _ in 0..2500 {
+			tx.send(call(now, "sonnet", Outcome::Completed, Some(used)))
+				.unwrap();
+		}
+		tx.send(call(
+			now,
+			"sonnet",
+			Outcome::Failed(Class::RateLimited),
+			None,
+		))
+		.unwrap();
+		tx.send(call(tomorrow, "luna", Outcome::Cancelled, Some(used)))
+			.unwrap();
+		// Written as they arrive, a thousand at a time, without waiting for the channel to close.
+		let mut written = 0;
+		for _ in 0..50 {
+			written = count(&client, "SELECT count(*) FROM psyche.requests").await;
+			if written >= 2000 {
+				break;
+			}
+			tokio::time::sleep(Duration::from_millis(100)).await;
+		}
+		assert!(written >= 2000, "{written}");
+		drop(tx);
+		task.await.unwrap();
+
+		assert_eq!(
+			count(&client, "SELECT count(*) FROM psyche.requests").await,
+			2502
+		);
+		let today = Day::of(now);
+		let partitions = count(
+			&client,
+			"SELECT count(*) FROM pg_inherits WHERE inhparent = 'psyche.requests'::regclass",
+		)
+		.await;
+		assert_eq!(partitions, 4, "yesterday to two days ahead");
+		let row = client
+			.query_one(
+				"SELECT requests, failed, cancelled, uncounted, prompt_tokens, completion_tokens, cached_tokens \
+				 FROM psyche.usage_daily WHERE day = $1::text::date AND model = 'sonnet'",
+				&[&today.iso()],
+			)
+			.await
+			.unwrap();
+		let got: Vec<i64> = (0..7).map(|i| row.get(i)).collect();
+		assert_eq!(got, vec![2501, 1, 0, 1, 25_000, 7_500, 10_000]);
+		let failed = client
+			.query_one(
+				"SELECT outcome, prompt_tokens, first_byte_ms, total_ms FROM psyche.requests WHERE outcome <> 'completed' AND model = 'sonnet'",
+				&[],
+			)
+			.await
+			.unwrap();
+		assert_eq!(failed.get::<_, String>(0), "rate_limited");
+		assert_eq!(failed.get::<_, Option<i32>>(1), None);
+		assert_eq!(
+			(failed.get::<_, i32>(2), failed.get::<_, i32>(3)),
+			(120, 900)
+		);
+		assert_eq!(
+			count(
+				&client,
+				"SELECT cancelled FROM psyche.usage_daily WHERE model = 'luna'"
+			)
+			.await,
+			1
+		);
+	}
+
+	#[tokio::test]
+	async fn rows_wait_out_an_outage_and_old_days_are_dropped() {
+		let Some((client, url)) = fresh_database("outage").await else {
+			return;
+		};
+		let mut writer = Writer::new(Settings {
+			database_url: format!("{url}_not_there"),
+			retention_days: 7,
+		});
+		let now = SystemTime::now();
+		for _ in 0..5 {
+			writer.hold(call(now, "a", Outcome::Completed, None));
+		}
+		writer.flush().await;
+		assert_eq!(writer.held.len(), 5, "held while the database is away");
+		assert!(writer.failing);
+
+		// An old day, as if left from before the retention was shortened.
+		let old = Day::of(now).plus(-8);
+		partitions(&client, &[old, Day::of(now).plus(-7)])
+			.await
+			.unwrap();
+		writer.settings.database_url = url;
+		writer.failed_at = None;
+		writer.flush().await;
+		assert!(writer.held.is_empty());
+		assert!(!writer.failing);
+		assert_eq!(
+			count(&client, "SELECT count(*) FROM psyche.requests").await,
+			5
+		);
+		let names: Vec<String> = client
+			.query(
+				"SELECT c.relname::text FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid \
+				 WHERE i.inhparent = 'psyche.requests'::regclass ORDER BY 1",
+				&[],
+			)
+			.await
+			.unwrap()
+			.iter()
+			.map(|r| r.get(0))
+			.collect();
+		assert!(
+			!names.contains(&format!("requests_{}", old.compact())),
+			"{names:?}"
+		);
+		assert!(names.contains(&format!("requests_{}", Day::of(now).plus(-7).compact())));
+	}
+
+	#[tokio::test]
+	async fn nobody_but_psyche_reads_the_log() {
+		let Some((client, _)) = fresh_database("grants").await else {
+			return;
+		};
+		client
+			.batch_execute(
+				"DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'psyche_test_reader') \
+				 THEN CREATE ROLE psyche_test_reader; END IF; END $$",
+			)
+			.await
+			.unwrap();
+		for table in ["psyche.requests", "psyche.usage_daily"] {
+			let error = client
+				.batch_execute(&format!(
+					"BEGIN; SET LOCAL ROLE psyche_test_reader; SELECT * FROM {table}; COMMIT"
+				))
+				.await
+				.unwrap_err();
+			let _ = client.batch_execute("ROLLBACK").await;
+			assert!(
+				error
+					.as_db_error()
+					.unwrap()
+					.message()
+					.contains("permission denied"),
+				"{table}: {error}"
+			);
+		}
+	}
+}

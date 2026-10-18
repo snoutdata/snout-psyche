@@ -7,8 +7,8 @@ written in Rust. On SnoutData Cloud one runs beside each project's database, in 
 pod, and keeps its keys, budgets and request log in the project's own Postgres.
 
 **Status: early, not production-ready.** What works today is the OpenAI-compatible API over
-OpenAI-style providers, Anthropic and Amazon Bedrock (below). Keys and budgets, the request log in Postgres, more
-providers and automatic routing are being built.
+OpenAI-style providers, Anthropic and Amazon Bedrock, and the request log in Postgres (below).
+Keys and budgets, more providers and automatic routing are being built.
 
 ## What works today
 
@@ -89,6 +89,8 @@ its providers file the server refuses to start, and says which one is missing.
 | `PSYCHE_MAX_REQUEST_MB` | `32` | no | The largest request accepted (1 to 256). |
 | `PSYCHE_LOG` | `info` | no | Log filter, `tracing` syntax. |
 | `PSYCHE_LOG_FORMAT` | text | no | `json` for one JSON object per line. |
+| `DATABASE_URL` | (none) | yes | The Postgres the request log is kept in (below). Without it no call is stored. |
+| `PSYCHE_LOG_RETENTION_DAYS` | `30` | no | Days of request rows kept (1 to 3650). The daily totals are kept for good. |
 | each provider's `api_key_env` | (as named) | yes | The provider's key, in the variable the providers file names. |
 
 ### The providers file
@@ -132,13 +134,34 @@ that is not set, an http URL under `public` egress) stops the server at start wi
 Each finished call is logged under the `psyche::call` target: operation, model, provider, outcome
 (completed, cancelled, or failed with a class), tokens, time to first byte and total time.
 
+### The request log
+
+With `DATABASE_URL` set, Psyche makes a `psyche` schema in that database at start (migrations in
+`migrations/`, each recorded with its hash, so a changed file is refused rather than run again) and
+keeps one row per call in `psyche.requests`: the same fields as above, never a prompt or a reply.
+`psyche.usage_daily` holds each day's totals per operation, model and provider. Neither is granted
+to any other role, and row-level security is on for both.
+
+No call waits for the database. A finished call is handed to a task of its own, which writes what
+it holds as one `COPY` every 500 ms or every 1,000 rows, whichever comes first, with the day's
+totals in the same transaction. **What a crash can lose is what that task held**: under load about
+a thousand rows (killed with `kill -9` at 70,000 calls a second, 1,268 of 159,550 were lost), at low
+traffic half a second of calls. A clean stop (SIGTERM) writes everything. If the database cannot be
+reached the rows are held and written once it can, up to 100,000; past that the oldest are dropped
+and the number is logged.
+
+The rows are partitioned by day (UTC). Psyche makes the partitions from yesterday to two days ahead
+and drops those older than `PSYCHE_LOG_RETENTION_DAYS`, so an expired day is one `DROP TABLE`. Tested
+on Postgres 17.
+
 ## Building and testing
 
 `bash scripts/dev.sh cargo test -p snout-psyche` (in the stack's container) or
 `cargo test -p snout-psyche`. The tests run against a fake provider on 127.0.0.1
 (`src/fake.rs`, OpenAI's API, Anthropic's and Bedrock's, which checks each SigV4 signature
 against the request as it arrived) and never spend a token. The signer is pinned against
-signatures botocore made for the same requests.
+signatures botocore made for the same requests. `bash tests/db.sh` runs the same suite with a
+throwaway Postgres 17 beside it, which the request log's tests need (they skip without it).
 
 ## License
 

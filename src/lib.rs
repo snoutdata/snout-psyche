@@ -18,6 +18,8 @@ pub mod error;
 pub mod eventstream;
 pub mod jwt;
 pub mod layout;
+pub mod log;
+pub mod migrations;
 pub mod net;
 pub mod providers;
 pub mod proxy;
