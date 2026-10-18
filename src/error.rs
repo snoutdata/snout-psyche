@@ -36,6 +36,9 @@ pub enum Class {
 	EgressRefused,
 	/// A hard budget has no room for the call (`budgets.rs`); nothing was sent.
 	Budget,
+	/// One of Psyche's own rate limits is used up (`limits.rs`), unlike `RateLimited`, which is the
+	/// provider's; another target would not help.
+	Limited,
 }
 
 impl Class {
@@ -53,6 +56,7 @@ impl Class {
 			Class::Transport => "transport",
 			Class::EgressRefused => "egress_refused",
 			Class::Budget => "budget_exceeded",
+			Class::Limited => "rate_limit_exceeded",
 		}
 	}
 
@@ -62,7 +66,7 @@ impl Class {
 			Class::BadRequest | Class::ModelNotFound | Class::Rejected => "invalid_request_error",
 			Class::Unauthorized => "authentication_error",
 			Class::Forbidden => "permission_error",
-			Class::RateLimited => "rate_limit_error",
+			Class::RateLimited | Class::Limited => "rate_limit_error",
 			// OpenAI's name for a spending limit reached, which clients already handle.
 			Class::Budget => "insufficient_quota",
 			_ => "api_error",
@@ -75,7 +79,7 @@ impl Class {
 			Class::Unauthorized => StatusCode::UNAUTHORIZED,
 			Class::Forbidden => StatusCode::FORBIDDEN,
 			Class::ModelNotFound => StatusCode::NOT_FOUND,
-			Class::RateLimited | Class::Budget => StatusCode::TOO_MANY_REQUESTS,
+			Class::RateLimited | Class::Budget | Class::Limited => StatusCode::TOO_MANY_REQUESTS,
 			Class::Timeout => StatusCode::GATEWAY_TIMEOUT,
 			Class::ProviderAuth | Class::Upstream | Class::Transport | Class::EgressRefused => {
 				StatusCode::BAD_GATEWAY

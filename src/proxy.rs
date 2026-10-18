@@ -45,6 +45,7 @@ use crate::config::Timeouts;
 use crate::error::{ApiError, Class, scrub};
 use crate::jwt::{self, Role};
 use crate::keys::{self, Key, KeyId, Refusal};
+use crate::limits::{self, Limits, Taken};
 use crate::net;
 use crate::price::{Dollars, Price};
 use crate::providers::{Catalogue, Kind, Model};
@@ -74,6 +75,8 @@ pub struct Proxy {
 	pub keys: Option<Keys>,
 	/// Budgets (`budgets.rs`), likewise.
 	pub budgets: Option<Budgets>,
+	/// Rate limits (`limits.rs`), likewise.
+	pub limits: Option<Limits>,
 }
 
 /// The keys in memory, and the database they are kept in, which the admin API writes to.
@@ -297,6 +300,16 @@ fn warned(reservation: &Option<Reservation>) -> Option<HeaderValue> {
 	HeaderValue::from_str(&names.join(", ")).ok()
 }
 
+/// The rate-limit headers, on a call a limit applies to.
+fn headed(mut response: Response, rate: limits::Headers) -> Response {
+	for (name, value) in rate.0 {
+		if let Ok(value) = HeaderValue::from_str(&value) {
+			response.headers_mut().insert(name, value);
+		}
+	}
+	response
+}
+
 fn warn(mut response: Response, warned: Option<HeaderValue>) -> Response {
 	if let Some(names) = warned {
 		response
@@ -334,7 +347,9 @@ pub fn router(proxy: Arc<Proxy>) -> Router {
 		.route("/admin/keys", get(list_keys).post(create_key))
 		.route("/admin/keys/{id}", delete(revoke_key))
 		.route("/admin/budgets", get(list_budgets).post(create_budget))
-		.route("/admin/budgets/{id}", delete(delete_budget));
+		.route("/admin/budgets/{id}", delete(delete_budget))
+		.route("/admin/limits", get(list_limits).post(create_limit))
+		.route("/admin/limits/{id}", delete(delete_limit));
 	let limit = proxy.max_request_bytes;
 	Router::new()
 		.nest("/ai/v1", api.clone())
@@ -536,6 +551,141 @@ fn yes() -> bool {
 	true
 }
 
+/// What the admin API makes a rate limit from.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NewLimit {
+	name: String,
+	#[serde(default)]
+	key_id: Option<String>,
+	#[serde(default)]
+	requests_per_minute: Option<i32>,
+	#[serde(default)]
+	tokens_per_minute: Option<i32>,
+}
+
+async fn reload_limits(proxy: &Proxy, client: &tokio_postgres::Client) {
+	if let Some(limits) = &proxy.limits {
+		match limits::load(client).await {
+			Ok(list) => limits.replace(list),
+			Err(error) => {
+				tracing::warn!(error = %crate::db_message(&error), "could not reload the limits")
+			}
+		}
+	}
+}
+
+/// A broken rule of a table (a value it does not take, a key that does not exist, a name used
+/// twice) is the caller's to fix, in Postgres's words; anything else is ours.
+fn write_error(e: &tokio_postgres::Error) -> ApiError {
+	match e.as_db_error() {
+		Some(db) if db.code().code().starts_with("23") => {
+			ApiError::new(Class::BadRequest, db.message().to_string())
+		}
+		_ => database_error(e),
+	}
+}
+
+async fn list_limits(State(proxy): State<Arc<Proxy>>, headers: HeaderMap) -> Response {
+	let result = async {
+		let (_, client) = admin(&proxy, &headers).await?;
+		let rows = client
+			.query(
+				"SELECT id::text, name, key_id::text, requests_per_minute, tokens_per_minute \
+				 FROM psyche.limits ORDER BY created_at, id",
+				&[],
+			)
+			.await
+			.map_err(|e| database_error(&e))?;
+		Ok::<_, ApiError>(
+			rows.iter()
+				.map(|row| {
+					json!({
+						"id": row.get::<_, String>(0),
+						"name": row.get::<_, String>(1),
+						"key_id": row.get::<_, Option<String>>(2),
+						"requests_per_minute": row.get::<_, Option<i32>>(3),
+						"tokens_per_minute": row.get::<_, Option<i32>>(4),
+					})
+				})
+				.collect::<Vec<_>>(),
+		)
+	}
+	.await;
+	match result {
+		Ok(data) => axum::Json(json!({"object": "list", "data": data})).into_response(),
+		Err(error) => error.into_response(),
+	}
+}
+
+async fn create_limit(
+	State(proxy): State<Arc<Proxy>>,
+	headers: HeaderMap,
+	body: Result<Bytes, BytesRejection>,
+) -> Response {
+	let result = async {
+		let (_, client) = admin(&proxy, &headers).await?;
+		let body = body.map_err(|r| ApiError::new(Class::BadRequest, r.body_text()))?;
+		let new: NewLimit = serde_json::from_slice(&body).map_err(|e| {
+			ApiError::new(
+				Class::BadRequest,
+				format!("A limit is made from {{\"name\", \"key_id\", \"requests_per_minute\", \"tokens_per_minute\"}}: {e}"),
+			)
+		})?;
+		let key = match &new.key_id {
+			None => None,
+			Some(id) => Some(
+				KeyId::parse(id)
+					.ok_or_else(|| ApiError::new(Class::BadRequest, "key_id is a key's id, a uuid."))?,
+			),
+		};
+		let row = client
+			.query_one(
+				"INSERT INTO psyche.limits (name, key_id, requests_per_minute, tokens_per_minute) \
+				 VALUES ($1, $2, $3, $4) RETURNING id::text",
+				&[&new.name.trim(), &key, &new.requests_per_minute, &new.tokens_per_minute],
+			)
+			.await
+			.map_err(|e| write_error(&e))?;
+		reload_limits(&proxy, &client).await;
+		Ok::<_, ApiError>(json!({"id": row.get::<_, String>(0), "name": new.name.trim(), "key_id": new.key_id,
+			"requests_per_minute": new.requests_per_minute, "tokens_per_minute": new.tokens_per_minute}))
+	}
+	.await;
+	match result {
+		Ok(made) => (StatusCode::CREATED, axum::Json(made)).into_response(),
+		Err(error) => error.into_response(),
+	}
+}
+
+async fn delete_limit(
+	State(proxy): State<Arc<Proxy>>,
+	headers: HeaderMap,
+	Path(id): Path<String>,
+) -> Response {
+	let result = async {
+		let (_, client) = admin(&proxy, &headers).await?;
+		let id = KeyId::parse(&id)
+			.ok_or_else(|| ApiError::new(Class::BadRequest, "A limit's id is a uuid."))?;
+		let deleted = client
+			.execute("DELETE FROM psyche.limits WHERE id = $1", &[&id])
+			.await
+			.map_err(|e| database_error(&e))?;
+		reload_limits(&proxy, &client).await;
+		if deleted == 0 {
+			let mut error = ApiError::new(Class::BadRequest, "There is no limit with that id.");
+			error.status = Some(StatusCode::NOT_FOUND);
+			return Err(error);
+		}
+		Ok(())
+	}
+	.await;
+	match result {
+		Ok(()) => StatusCode::NO_CONTENT.into_response(),
+		Err(error) => error.into_response(),
+	}
+}
+
 /// Reads the budgets again after the admin API changed them, so the change holds from the next
 /// call rather than from the notification.
 async fn reload_budgets(proxy: &Proxy, client: &tokio_postgres::Client) {
@@ -621,16 +771,9 @@ async fn create_budget(
 				&[&new.name.trim(), &amount, &new.period, &new.days, &key, &new.hard],
 			)
 			.await
-			.map_err(|e| match e.as_db_error() {
-				// A broken rule of the table (a period it does not know, a key that does not exist,
-				// a name used twice) is the caller's to fix, in Postgres's words.
-				Some(db) if db.code().code().starts_with("23") => {
-					ApiError::new(Class::BadRequest, db.message().to_string())
-				}
-				_ => database_error(&e),
-			})?;
+			.map_err(|e| write_error(&e))?;
 		reload_budgets(&proxy, &client).await;
-		Ok(json!({"id": row.get::<_, String>(0), "name": new.name.trim(), "amount": amount,
+		Ok::<_, ApiError>(json!({"id": row.get::<_, String>(0), "name": new.name.trim(), "amount": amount,
 			"period": new.period, "days": new.days, "key_id": new.key_id, "hard": new.hard}))
 	}
 	.await;
@@ -669,6 +812,29 @@ async fn delete_budget(
 }
 
 impl Proxy {
+	/// Takes a call's request and tokens from every rate limit on it, or refuses it with when to
+	/// try again. `prompt_bound` is `None` when no limit applies.
+	fn take(
+		&self,
+		key: Option<KeyId>,
+		prompt_bound: Option<u64>,
+		output: u64,
+	) -> Result<(Option<Taken>, limits::Headers), ApiError> {
+		let (Some(limits), Some(prompt)) = (&self.limits, prompt_bound) else {
+			return Ok((None, limits::Headers::default()));
+		};
+		match limits.take(key, prompt.saturating_add(output), Instant::now()) {
+			Ok((taken, headers)) => Ok((Some(taken), headers)),
+			Err(refused) => {
+				let mut error = ApiError::new(Class::Limited, refused.message);
+				error.retry_after = refused
+					.retry_after
+					.map(|d| d.as_secs_f64().ceil().max(1.0).to_string());
+				Err(error)
+			}
+		}
+	}
+
 	/// Holds room for a call in every budget that applies to it, or refuses it. `prompt_bound` is
 	/// `None` when no budget applies.
 	fn reserve(
@@ -791,12 +957,11 @@ impl Proxy {
 				format!("This key may not use {}.", model.name),
 			));
 		}
-		// The prompt's upper bound, from what the caller sent, for a call a budget applies to.
-		let prompt_bound = self
-			.budgets
-			.as_ref()
-			.filter(|b| b.applies(key))
-			.map(|_| budgets::prompt_bound(&body));
+		// The prompt's upper bound, from what the caller sent, for a call a budget or a limit applies
+		// to.
+		let budgeted = self.budgets.as_ref().is_some_and(|b| b.applies(key));
+		let limited = self.limits.as_ref().is_some_and(|l| l.applies(key));
+		let prompt_bound = (budgeted || limited).then(|| budgets::prompt_bound(&body));
 		let provider = &model.provider;
 		if operation == Operation::Embeddings {
 			if inbound.stream {
@@ -814,24 +979,25 @@ impl Proxy {
 					));
 				}
 				Kind::Bedrock => {
-					let reservation = self.reserve(key, &model, prompt_bound, 0)?;
+					let reservation =
+						self.reserve(key, &model, prompt_bound.filter(|_| budgeted), 0)?;
+					let (taken, rate) = self.take(key, prompt_bound.filter(|_| limited), 0)?;
 					let warned = warned(&reservation);
-					let out = self.embed(&inbound, &model, key, reservation).await?;
-					return Ok(warn(labelled(out, &model), warned));
+					let out = self
+						.embed(&inbound, &model, key, reservation, taken)
+						.await?;
+					return Ok(headed(warn(labelled(out, &model), warned), rate));
 				}
 			}
 		}
 		let body = inbound.upstream(&model, operation)?;
-		let reservation = match prompt_bound {
-			None => None,
-			Some(_) if operation == Operation::Embeddings => {
-				self.reserve(key, &model, prompt_bound, 0)?
-			}
-			Some(_) => {
-				let output = output_cap(&inbound, &body, &model);
-				self.reserve(key, &model, prompt_bound, output)?
-			}
+		let output = match operation {
+			Operation::Embeddings => 0,
+			_ if prompt_bound.is_some() => output_cap(&inbound, &body, &model),
+			_ => 0,
 		};
+		let reservation = self.reserve(key, &model, prompt_bound.filter(|_| budgeted), output)?;
+		let (taken, rate) = self.take(key, prompt_bound.filter(|_| limited), output)?;
 		let warned = warned(&reservation);
 		let (path, accept) = match provider.kind {
 			Kind::Openai => (operation.path().to_string(), "text/event-stream"),
@@ -888,6 +1054,7 @@ impl Proxy {
 			},
 			started,
 			reservation,
+			taken,
 			billable: false,
 		};
 		let response = match tokio::time::timeout(self.timeouts.first_byte, request.send()).await {
@@ -921,7 +1088,7 @@ impl Proxy {
 		} else {
 			self.whole(response, &model, record).await?
 		};
-		Ok(warn(labelled(out, &model), warned))
+		Ok(headed(warn(labelled(out, &model), warned), rate))
 	}
 
 	/// Embeddings from a Bedrock model, in the InvokeModel body the catalogue names for it: every
@@ -934,6 +1101,7 @@ impl Proxy {
 		model: &Model,
 		key: Option<KeyId>,
 		reservation: Option<Reservation>,
+		taken: Option<Taken>,
 	) -> Result<Response, ApiError> {
 		let provider = &model.provider;
 		let family = model.embeddings.ok_or_else(|| {
@@ -972,6 +1140,7 @@ impl Proxy {
 			},
 			started: Instant::now(),
 			reservation,
+			taken,
 			// Each text is its own call, and some may be billed before another fails.
 			billable: true,
 		};
@@ -1383,6 +1552,8 @@ struct Record {
 	started: Instant,
 	/// The room held in the call's budgets, settled when this is dropped.
 	reservation: Option<Reservation>,
+	/// What the call took from its rate limits; the tokens it did not use go back when it ends.
+	taken: Option<Taken>,
 	/// Whether the provider may have produced anything it bills for: false until a successful
 	/// response starts, so a refused or failed request releases its reservation and is charged
 	/// nothing.
@@ -1420,6 +1591,9 @@ impl Drop for Record {
 			first_byte_ms = call.first_byte.as_millis() as u64,
 			total_ms = call.total.as_millis() as u64,
 		);
+		if let Some(taken) = self.taken.take() {
+			taken.settle(self.call.usage.map(|u| u.total()));
+		}
 		if let Some(reservation) = self.reservation.take() {
 			let charge = match (self.billable, self.call.cost()) {
 				(false, _) => Some(0),
@@ -1617,9 +1791,20 @@ mod tests {
 
 		async fn build(
 			key: &str,
+			timeouts: Timeouts,
+			keys: Option<Keys>,
+			budgets: Option<Budgets>,
+		) -> Self {
+			let limits = budgets.as_ref().map(|_| Limits::default());
+			Self::build_with(key, timeouts, keys, budgets, limits).await
+		}
+
+		async fn build_with(
+			key: &str,
 			mut timeouts: Timeouts,
 			keys: Option<Keys>,
 			budgets: Option<Budgets>,
+			limits: Option<Limits>,
 		) -> Self {
 			let fake = Fake::start().await;
 			let catalogue = Catalogue::from_json(
@@ -1686,6 +1871,7 @@ mod tests {
 				calls: Some(tx),
 				keys,
 				budgets,
+				limits,
 			});
 			let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
 			let base = format!("http://{}", listener.local_addr().unwrap());
@@ -1832,7 +2018,13 @@ mod tests {
 		};
 		let store = keys::Store::default();
 		let (ready, loaded) = tokio::sync::oneshot::channel();
-		tokio::spawn(keys::watch(url.clone(), store.clone(), None, Some(ready)));
+		tokio::spawn(keys::watch(
+			url.clone(),
+			store.clone(),
+			None,
+			None,
+			Some(ready),
+		));
 		loaded.await.unwrap();
 		let mut s = Setup::build(
 			Fake::KEY,
@@ -1968,15 +2160,17 @@ mod tests {
 		let (db, url) = crate::log::tests::fresh_database(name).await?;
 		let store = keys::Store::default();
 		let budgets = Budgets::default();
+		let limits = Limits::default();
 		let (ready, loaded) = tokio::sync::oneshot::channel();
 		tokio::spawn(keys::watch(
 			url.clone(),
 			store.clone(),
 			Some(budgets.clone()),
+			Some(limits.clone()),
 			Some(ready),
 		));
 		loaded.await.unwrap();
-		let s = Setup::build(
+		let s = Setup::build_with(
 			Fake::KEY,
 			Timeouts::default(),
 			Some(Keys {
@@ -1984,6 +2178,7 @@ mod tests {
 				database_url: url,
 			}),
 			Some(budgets),
+			Some(limits),
 		)
 		.await;
 		let made: Value = s
@@ -2096,6 +2291,93 @@ mod tests {
 			.unwrap();
 		assert_eq!(unpriced.status(), 429);
 		assert!(unpriced.text().await.unwrap().contains("has no price"));
+	}
+
+	#[tokio::test]
+	async fn rate_limits_refuse_with_when_to_try_again_and_say_what_is_left() {
+		let Some((s, _db, key, id)) = with_budgets("limits").await else {
+			return;
+		};
+		let made = s
+			.post(
+				"/ai/v1/admin/limits",
+				json!({"name": "app", "key_id": id, "requests_per_minute": 3}),
+			)
+			.send()
+			.await
+			.unwrap();
+		assert_eq!(made.status(), 201, "{}", made.text().await.unwrap());
+		let call = || {
+			s.client
+				.post(format!("{}/ai/v1/chat/completions", s.base))
+				.bearer_auth(&key)
+				.json(&chat("ok", false))
+				.send()
+		};
+		let first = call().await.unwrap();
+		assert_eq!(first.status(), 200);
+		assert_eq!(first.headers()["x-ratelimit-limit-requests"], "3");
+		assert_eq!(first.headers()["x-ratelimit-remaining-requests"], "2");
+		call().await.unwrap();
+		call().await.unwrap();
+		let refused = call().await.unwrap();
+		assert_eq!(refused.status(), 429);
+		let wait: u64 = refused.headers()["retry-after"]
+			.to_str()
+			.unwrap()
+			.parse()
+			.unwrap();
+		assert!((1..=20).contains(&wait), "{wait}");
+		let body: Value = refused.json().await.unwrap();
+		assert_eq!(body["error"]["code"], "rate_limit_exceeded");
+		assert!(
+			body["error"]["message"]
+				.as_str()
+				.unwrap()
+				.contains("3 requests a minute")
+		);
+		// The service key is not held by the key's limit, and gets no rate-limit headers.
+		let service = s
+			.post("/ai/v1/chat/completions", chat("ok", false))
+			.send()
+			.await
+			.unwrap();
+		assert_eq!(service.status(), 200);
+		assert!(
+			service
+				.headers()
+				.get("x-ratelimit-limit-requests")
+				.is_none()
+		);
+
+		let tokens = s
+			.post(
+				"/ai/v1/admin/limits",
+				json!({"name": "tokens", "tokens_per_minute": 50}),
+			)
+			.send()
+			.await
+			.unwrap();
+		assert_eq!(tokens.status(), 201);
+		let big = s
+			.post(
+				"/ai/v1/chat/completions",
+				json!({"model": "ok", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}]}),
+			)
+			.send()
+			.await
+			.unwrap();
+		assert_eq!(big.status(), 429);
+		assert!(
+			big.headers().get("retry-after").is_none(),
+			"waiting would not help"
+		);
+		let none = s
+			.post("/ai/v1/admin/limits", json!({"name": "empty"}))
+			.send()
+			.await
+			.unwrap();
+		assert_eq!(none.status(), 400, "a limit limits something");
 	}
 
 	#[tokio::test]

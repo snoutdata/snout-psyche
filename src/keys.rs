@@ -214,11 +214,14 @@ pub async fn watch(
 	url: String,
 	store: Store,
 	budgets: Option<crate::budgets::Budgets>,
+	limits: Option<crate::limits::Limits>,
 	ready: Option<tokio::sync::oneshot::Sender<()>>,
 ) {
 	let mut ready = ready;
 	loop {
-		if let Err(error) = listen(&url, &store, budgets.as_ref(), &mut ready).await {
+		if let Err(error) =
+			listen(&url, &store, budgets.as_ref(), limits.as_ref(), &mut ready).await
+		{
 			tracing::warn!(error = %crate::db_message(&error), "the keys' connection failed; the keys held are kept until it is back");
 		}
 		tokio::time::sleep(RECONNECT_AFTER).await;
@@ -229,14 +232,18 @@ async fn listen(
 	url: &str,
 	store: &Store,
 	budgets: Option<&crate::budgets::Budgets>,
+	limits: Option<&crate::limits::Limits>,
 	ready: &mut Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<(), tokio_postgres::Error> {
-	// Keys and budgets are reloaded together: there are few of each, and one notification name
+	// Keys, budgets and limits are reloaded together: there are few of each, and one notification name
 	// serves every table.
 	let reload = async |client: &Client| -> Result<(), tokio_postgres::Error> {
 		store.replace(load(client).await?);
 		if let Some(budgets) = budgets {
 			budgets.replace(crate::budgets::load(client).await?);
+		}
+		if let Some(limits) = limits {
+			limits.replace(crate::limits::load(client).await?);
 		}
 		Ok(())
 	};

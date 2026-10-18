@@ -20,6 +20,7 @@ pub mod eventstream;
 pub mod jwt;
 pub mod keys;
 pub mod layout;
+pub mod limits;
 pub mod log;
 pub mod migrations;
 pub mod net;

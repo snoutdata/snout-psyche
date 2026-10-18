@@ -190,6 +190,24 @@ is reserved at 4,096 tokens and can run past that once. Measured against the fak
 calls at once on a key with a $0.001 day: 18 answered, 282 refused, $0.000342 spent. The bound is
 generous where prompts are short, so near its end a budget refuses some calls that would have fit.
 
+### Rate limits
+
+Requests and tokens a minute, for the project (every call counts) or one key:
+
+```sh
+curl -X POST $PSYCHE/ai/v1/admin/limits -H "Authorization: Bearer $SERVICE_KEY" \
+  -d '{"name": "ci", "key_id": "<key id>", "requests_per_minute": 60, "tokens_per_minute": 100000}'
+```
+
+They are token buckets in memory, refilled continuously. A call takes one request and its token
+bound (the same worst case a budget reserves) from every limit on it, and gives back what it did
+not use when it ends. Over a limit, it is refused with 429, the code `rate_limit_exceeded`, a
+`retry-after` and a sentence saying which limit; a call whose bound is more than a limit's whole
+minute is refused without a `retry-after`, since waiting would not help. Every response to a call
+a limit applies to carries OpenAI's `x-ratelimit-limit-*`, `-remaining-*` and `-reset-*` headers
+for requests and tokens, from the tightest limit. A limit that is not changed keeps its bucket
+when the table is reloaded; a restart starts every bucket full.
+
 ### Prices
 
 A call's cost is the tokens the provider reported at the model's price. The price comes from the

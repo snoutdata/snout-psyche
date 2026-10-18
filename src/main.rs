@@ -45,8 +45,8 @@ async fn main() {
 	// The request log: the schema migrated before the first call, then a task of its own that the
 	// calls are handed to. A database that cannot be migrated stops the start, since a log that
 	// silently is not kept is worse than none.
-	let (calls, log, keys, budgets) = match &config.log {
-		None => (None, None, None, None),
+	let (calls, log, keys, budgets, limits) = match &config.log {
+		None => (None, None, None, None, None),
 		Some(settings) => {
 			let mut client = snout_psyche::log::connect(&settings.database_url)
 				.await
@@ -62,6 +62,7 @@ async fn main() {
 			}
 			// What was spent before this start, which every budget counts from.
 			let budgets = snout_psyche::budgets::Budgets::default();
+			let limits = snout_psyche::limits::Limits::default();
 			snout_psyche::budgets::load_spent(&client, &budgets, std::time::SystemTime::now())
 				.await
 				.unwrap_or_else(|error| fail(1, &format!("cannot read what was spent: {error}")));
@@ -79,13 +80,20 @@ async fn main() {
 				settings.database_url.clone(),
 				keys.store.clone(),
 				Some(budgets.clone()),
+				Some(limits.clone()),
 				Some(ready),
 			));
 			if loaded.await.is_err() {
 				fail(1, "the keys could not be loaded");
 			}
 			tracing::info!(keys = keys.store.len(), "loaded the keys");
-			(Some(tx), Some(task), Some(keys), Some(budgets))
+			(
+				Some(tx),
+				Some(task),
+				Some(keys),
+				Some(budgets),
+				Some(limits),
+			)
 		}
 	};
 	let proxy = Arc::new(Proxy {
@@ -97,6 +105,7 @@ async fn main() {
 		calls,
 		keys,
 		budgets,
+		limits,
 	});
 	let listener = tokio::net::TcpListener::bind(config.addr)
 		.await
