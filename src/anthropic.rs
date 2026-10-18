@@ -789,6 +789,7 @@ mod tests {
 				api_key: None,
 				aws: None,
 				region: None,
+				credential: None,
 			}),
 			upstream: "claude-sonnet-4-5".into(),
 			prompt_caching: caching,

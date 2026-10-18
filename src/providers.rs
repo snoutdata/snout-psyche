@@ -18,6 +18,12 @@
 //! }
 //! ```
 //!
+//! With a database, a provider may instead name a **stored credential** (`"credential": "openai"`),
+//! a row of `psyche.credentials` set through the admin API and never read back (`credentials.rs`).
+//! The catalogue as the file describes it is then the base, and the one calls use is the base with
+//! the stored credentials filled in ([`Catalogue::with_credentials`], held by [`Live`]), rebuilt
+//! whenever a credential changes, so a new key restarts nothing.
+//!
 //! A Bedrock provider names its region instead of a base URL, and takes either a Bedrock API key
 //! (`api_key_env`, sent as a bearer token) or AWS credentials (`aws`, each part named by the
 //! variable that holds it), which sign every request with SigV4 (`sigv4.rs`):
@@ -40,7 +46,7 @@
 //! that has neither is served and logged with no cost.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use serde::Deserialize;
 
@@ -117,6 +123,51 @@ pub struct Provider {
 	pub aws: Option<Aws>,
 	/// A Bedrock provider's region.
 	pub region: Option<String>,
+	/// The stored credential it takes (`psyche.credentials`), by name. Its key or AWS credentials
+	/// are filled in from there, and are `None` until one is stored.
+	pub credential: Option<String>,
+}
+
+/// A stored credential, as `psyche.credentials` holds it.
+#[derive(Clone)]
+pub enum Stored {
+	ApiKey(Secret),
+	Aws(Credentials),
+}
+
+/// The catalogue calls are made with: the base the file describes, with the stored credentials
+/// filled in, swapped whole when one changes. A call holds its own copy of its model, so a swap
+/// never changes a call already sent.
+#[derive(Clone)]
+pub struct Live(Arc<RwLock<Arc<Catalogue>>>);
+
+impl Live {
+	pub fn new(catalogue: Catalogue) -> Self {
+		Self(Arc::new(RwLock::new(Arc::new(catalogue))))
+	}
+
+	pub fn get(&self) -> Arc<Catalogue> {
+		self.0.read().unwrap_or_else(|e| e.into_inner()).clone()
+	}
+
+	pub fn set(&self, catalogue: Catalogue) {
+		*self.0.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(catalogue);
+	}
+}
+
+impl std::fmt::Debug for Live {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.write_str("Live(..)")
+	}
+}
+
+/// A stored credential's name: what a URL path and a log line can carry.
+pub fn credential_name_ok(name: &str) -> bool {
+	!name.is_empty()
+		&& name.len() <= 63
+		&& name
+			.bytes()
+			.all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
 }
 
 /// What a Bedrock provider signs with, and where.
@@ -225,6 +276,9 @@ struct ProviderEntry {
 	region: Option<String>,
 	#[serde(default)]
 	aws: Option<AwsEntry>,
+	/// A stored credential, by name, instead of `api_key_env` or `aws`.
+	#[serde(default)]
+	credential: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -329,9 +383,25 @@ impl Catalogue {
 					})
 				}
 			};
-			if entry.kind == Kind::Bedrock && api_key.is_none() && aws.is_none() {
+			if let Some(credential) = &entry.credential {
+				if api_key.is_some() || aws.is_some() {
+					return Err(fail(
+						"takes a stored credential or api_key_env or aws, only one".into(),
+					));
+				}
+				if !credential_name_ok(credential) {
+					return Err(fail(format!(
+						"{credential} is not a credential's name: lowercase letters, digits, - and _, up to 63"
+					)));
+				}
+			}
+			if entry.kind == Kind::Bedrock
+				&& api_key.is_none()
+				&& aws.is_none()
+				&& entry.credential.is_none()
+			{
 				return Err(fail(
-					"a Bedrock provider takes api_key_env (a Bedrock API key) or aws credentials"
+					"a Bedrock provider takes api_key_env (a Bedrock API key), aws credentials or a stored credential"
 						.into(),
 				));
 			}
@@ -344,6 +414,7 @@ impl Catalogue {
 					api_key,
 					aws,
 					region,
+					credential: entry.credential,
 				}),
 			);
 		}
@@ -417,6 +488,63 @@ impl Catalogue {
 			.collect()
 	}
 
+	/// This catalogue with each named credential filled in from `stored`; a provider whose
+	/// credential is not there has none. AWS credentials go only to a Bedrock provider.
+	pub fn with_credentials(&self, stored: &HashMap<String, Stored>) -> Catalogue {
+		let mut providers: HashMap<String, Arc<Provider>> = HashMap::new();
+		let mut out = Catalogue::default();
+		for model in &self.models {
+			let provider = providers
+				.entry(model.provider.name.clone())
+				.or_insert_with(|| {
+					let mut provider = (*model.provider).clone();
+					if let Some(name) = &provider.credential {
+						provider.api_key = None;
+						provider.aws = None;
+						match (stored.get(name), &provider.region) {
+							(Some(Stored::ApiKey(key)), _) => provider.api_key = Some(key.clone()),
+							(Some(Stored::Aws(credentials)), Some(region))
+								if provider.kind == Kind::Bedrock =>
+							{
+								provider.aws = Some(Aws {
+									region: region.clone(),
+									credentials: credentials.clone(),
+								});
+							}
+							_ => {}
+						}
+					}
+					Arc::new(provider)
+				})
+				.clone();
+			let model = Arc::new(Model {
+				provider,
+				..(**model).clone()
+			});
+			out.by_name.insert(model.name.clone(), model.clone());
+			out.models.push(model);
+		}
+		out
+	}
+
+	/// The providers that take a stored credential, with its name.
+	pub fn credentialed(&self) -> Vec<&Provider> {
+		let mut out: Vec<&Provider> = Vec::new();
+		for model in &self.models {
+			if model.provider.credential.is_some()
+				&& !out.iter().any(|p| p.name == model.provider.name)
+			{
+				out.push(&model.provider);
+			}
+		}
+		out
+	}
+
+	/// The first model a provider serves, by provider name, for a request that proves a credential.
+	pub fn first_model_of(&self, provider: &str) -> Option<&Arc<Model>> {
+		self.models.iter().find(|m| m.provider.name == provider)
+	}
+
 	/// Every credential the catalogue holds, for scrubbing provider errors (`error::scrub`).
 	pub fn secrets(&self) -> Vec<&str> {
 		let mut secrets: Vec<&str> = Vec::new();
@@ -473,6 +601,59 @@ mod tests {
 		assert_eq!(catalogue.models().len(), 2);
 		assert_eq!(catalogue.secrets(), vec!["sk-test-0123456789"]);
 		assert!(!format!("{fast:?}").contains("sk-test"));
+	}
+
+	#[test]
+	fn a_stored_credential_is_filled_in_and_scrubbed_like_any_other() {
+		let file = r#"{"providers": [
+			{"name": "openai", "kind": "openai", "base_url": "https://api.openai.com/v1", "credential": "openai"},
+			{"name": "bedrock", "kind": "bedrock", "region": "us-west-2", "credential": "aws-prod"}
+		], "models": [
+			{"name": "fast", "provider": "openai", "upstream": "gpt-4o-mini"},
+			{"name": "sonnet", "provider": "bedrock", "upstream": "us.anthropic.claude-sonnet-5"}
+		]}"#;
+		let base = Catalogue::from_json(file, &HashMap::new(), Egress::Public).unwrap();
+		assert!(base.secrets().is_empty());
+		assert_eq!(base.credentialed().len(), 2);
+		let stored = HashMap::from([
+			(
+				"openai".to_string(),
+				Stored::ApiKey(Secret::new("sk-stored-0123")),
+			),
+			(
+				"aws-prod".to_string(),
+				Stored::Aws(Credentials {
+					access_key_id: "AKID".into(),
+					secret_access_key: Secret::new("aws-secret-0123"),
+					session_token: None,
+				}),
+			),
+		]);
+		let live = base.with_credentials(&stored);
+		assert_eq!(
+			live.model("fast")
+				.unwrap()
+				.provider
+				.api_key
+				.as_ref()
+				.map(Secret::expose),
+			Some("sk-stored-0123")
+		);
+		let bedrock = &live.model("sonnet").unwrap().provider;
+		assert_eq!(bedrock.aws.as_ref().unwrap().region, "us-west-2");
+		assert_eq!(live.secrets(), vec!["aws-secret-0123", "sk-stored-0123"]);
+		// Taken away, it is gone again.
+		assert!(base.with_credentials(&HashMap::new()).secrets().is_empty());
+
+		let both = file.replace(
+			r#""credential": "openai""#,
+			r#""credential": "openai", "api_key_env": "OPENAI_API_KEY""#,
+		);
+		let error = Catalogue::from_json(&both, &env(), Egress::Public).unwrap_err();
+		assert!(error.0.contains("only one"), "{error}");
+		let badly_named = file.replace(r#""credential": "openai""#, r#""credential": "Open AI""#);
+		let error = Catalogue::from_json(&badly_named, &env(), Egress::Public).unwrap_err();
+		assert!(error.0.contains("not a credential's name"), "{error}");
 	}
 
 	#[test]

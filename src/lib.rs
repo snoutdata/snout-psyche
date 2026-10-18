@@ -14,6 +14,7 @@ pub mod anthropic;
 pub mod bedrock;
 pub mod budgets;
 pub mod config;
+pub mod credentials;
 pub mod embeddings;
 pub mod error;
 pub mod eventstream;
@@ -74,6 +75,7 @@ pub mod fuzz {
 				api_key: None,
 				aws: None,
 				region: None,
+				credential: None,
 			}),
 			upstream: "u".into(),
 			prompt_caching: true,

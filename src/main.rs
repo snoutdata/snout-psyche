@@ -42,6 +42,13 @@ async fn main() {
 			"no price for this model: its calls are logged with no cost; give it a price in the providers file"
 		);
 	}
+	// What calls use: the file's catalogue, with stored credentials filled in once they are loaded.
+	let live = snout_psyche::providers::Live::new(catalogue.clone());
+	let credentials = snout_psyche::credentials::Held {
+		base: catalogue,
+		live: live.clone(),
+	};
+	let held_credentials = config.log.is_some().then(|| credentials.clone());
 	// The request log: the schema migrated before the first call, then a task of its own that the
 	// calls are handed to. A database that cannot be migrated stops the start, since a log that
 	// silently is not kept is worse than none.
@@ -84,6 +91,7 @@ async fn main() {
 					budgets: Some(budgets.clone()),
 					limits: Some(limits.clone()),
 					members: keys.members.clone(),
+					credentials: Some(credentials.clone()),
 				},
 				Some(ready),
 			));
@@ -91,6 +99,15 @@ async fn main() {
 				fail(1, "the keys could not be loaded");
 			}
 			tracing::info!(keys = keys.store.len(), "loaded the keys");
+			for provider in live.get().credentialed() {
+				if provider.api_key.is_none() && provider.aws.is_none() {
+					tracing::warn!(
+						provider = provider.name,
+						credential = provider.credential,
+						"this provider's stored credential is not set, so its calls are refused until it is"
+					);
+				}
+			}
 			(
 				Some(tx),
 				Some(task),
@@ -101,7 +118,8 @@ async fn main() {
 		}
 	};
 	let proxy = Arc::new(Proxy {
-		catalogue,
+		catalogue: live,
+		credentials: held_credentials,
 		http,
 		jwt_secret: config.jwt_secret.clone(),
 		timeouts: config.timeouts,

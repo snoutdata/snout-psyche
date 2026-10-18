@@ -42,13 +42,14 @@ use serde_json::{Map, Value, json};
 
 use crate::budgets::{self, Budgets, Reservation};
 use crate::config::Timeouts;
+use crate::credentials;
 use crate::error::{ApiError, Class, scrub};
 use crate::jwt::{self, Role};
 use crate::keys::{self, Key, KeyId, Refusal};
 use crate::limits::{self, Limits, Taken};
 use crate::net;
 use crate::price::{Dollars, Price};
-use crate::providers::{Catalogue, Kind, Model, Provider};
+use crate::providers::{Kind, Live, Model, Provider};
 use crate::sse::{Event, Parser};
 use crate::translate::{Out, Translator};
 use crate::usage::Usage;
@@ -64,7 +65,10 @@ const EMBED_CONCURRENCY: usize = 8;
 
 /// The server: the catalogue, the one outbound client, and the rules for callers.
 pub struct Proxy {
-	pub catalogue: Catalogue,
+	/// The catalogue calls use: the providers file's, with any stored credentials filled in.
+	pub catalogue: Live,
+	/// The providers file's catalogue and the stored credentials, when there is a database.
+	pub credentials: Option<credentials::Held>,
 	pub http: reqwest::Client,
 	pub jwt_secret: String,
 	pub timeouts: Timeouts,
@@ -398,6 +402,11 @@ pub fn router(proxy: Arc<Proxy>) -> Router {
 		.route(
 			"/admin/members/{user_id}",
 			put(set_member).delete(remove_member),
+		)
+		.route("/admin/credentials", get(list_credentials))
+		.route(
+			"/admin/credentials/{name}",
+			put(set_credential).delete(delete_credential),
 		);
 	let limit = proxy.max_request_bytes;
 	Router::new()
@@ -448,6 +457,7 @@ async fn models(State(proxy): State<Arc<Proxy>>, headers: HeaderMap) -> Response
 	};
 	let data: Vec<Value> = proxy
 		.catalogue
+		.get()
 		.models()
 		.iter()
 		.filter(|m| caller.may_use(&m.name))
@@ -530,7 +540,7 @@ async fn create_key(
 			.models
 			.iter()
 			.flatten()
-			.find(|m| proxy.catalogue.model(m).is_none())
+			.find(|m| proxy.catalogue.get().model(m).is_none())
 		{
 			return Err(ApiError::new(
 				Class::BadRequest,
@@ -720,6 +730,123 @@ fn admin_body<T: serde::de::DeserializeOwned>(
 	}
 	serde_json::from_value(value)
 		.map_err(|e| ApiError::new(Class::BadRequest, format!("{}: {e}", known())))
+}
+
+/// The stored credentials, for the admin API: who has them, never what they are.
+fn held_credentials(proxy: &Proxy) -> Result<&credentials::Held, ApiError> {
+	proxy.credentials.as_ref().ok_or_else(|| {
+		ApiError::new(
+			Class::BadRequest,
+			"This Psyche has no database (DATABASE_URL), so it stores no credentials.",
+		)
+	})
+}
+
+/// Reads the credentials again after the admin API changed them, so the next call uses them.
+async fn reload_credentials(held: &credentials::Held, client: &tokio_postgres::Client) {
+	match credentials::load(client).await {
+		Ok(stored) => held.replace(&stored),
+		Err(error) => {
+			tracing::warn!(error = %crate::db_message(&error), "could not reload the credentials")
+		}
+	}
+}
+
+async fn list_credentials(State(proxy): State<Arc<Proxy>>, headers: HeaderMap) -> Response {
+	let result = async {
+		let (_, client) = admin(&proxy, &headers).await?;
+		let held = held_credentials(&proxy)?;
+		credentials::list(&client, &held.base)
+			.await
+			.map_err(|e| database_error(&e))
+	}
+	.await;
+	match result {
+		Ok(data) => axum::Json(json!({"object": "list", "data": data})).into_response(),
+		Err(error) => error.into_response(),
+	}
+}
+
+/// Proves a credential against every provider that names it, then stores it. Nothing that a
+/// provider refuses, or that cannot be checked, is stored.
+async fn set_credential(
+	State(proxy): State<Arc<Proxy>>,
+	headers: HeaderMap,
+	Path(name): Path<String>,
+	body: Result<Bytes, BytesRejection>,
+) -> Response {
+	let result = async {
+		let (_, client) = admin(&proxy, &headers).await?;
+		let held = held_credentials(&proxy)?;
+		let name = credentials::name(&name).map_err(|m| ApiError::new(Class::BadRequest, m))?;
+		let body = body.map_err(|r| ApiError::new(Class::BadRequest, r.body_text()))?;
+		let new: credentials::NewCredential = serde_json::from_slice(&body)
+			.map_err(|e| ApiError::new(Class::BadRequest, format!("A credential: {e}")))?;
+		let stored = new
+			.stored()
+			.map_err(|m| ApiError::new(Class::BadRequest, m))?;
+		let providers: Vec<&Provider> = held
+			.base
+			.credentialed()
+			.into_iter()
+			.filter(|p| p.credential.as_deref() == Some(name))
+			.collect();
+		if providers.is_empty() {
+			return Err(ApiError::new(
+				Class::BadRequest,
+				format!(
+					"No provider in the providers file takes the credential {name}, so it cannot be checked. Name it with \"credential\": \"{name}\" first."
+				),
+			));
+		}
+		for provider in providers {
+			let model = held.base.first_model_of(&provider.name).ok_or_else(|| {
+				ApiError::new(
+					Class::BadRequest,
+					format!("{} serves no model, so the credential cannot be checked.", provider.name),
+				)
+			})?;
+			credentials::prove(&proxy.http, provider, model, &stored)
+				.await
+				.map_err(|m| ApiError::new(Class::BadRequest, m))?;
+		}
+		let made = credentials::save(&client, name, &stored)
+			.await
+			.map_err(|e| write_error(&e))?;
+		reload_credentials(held, &client).await;
+		Ok::<_, ApiError>(made)
+	}
+	.await;
+	match result {
+		Ok(made) => axum::Json(made).into_response(),
+		Err(error) => error.into_response(),
+	}
+}
+
+async fn delete_credential(
+	State(proxy): State<Arc<Proxy>>,
+	headers: HeaderMap,
+	Path(name): Path<String>,
+) -> Response {
+	let result = async {
+		let (_, client) = admin(&proxy, &headers).await?;
+		let held = held_credentials(&proxy)?;
+		let name = credentials::name(&name).map_err(|m| ApiError::new(Class::BadRequest, m))?;
+		let deleted = client
+			.execute("DELETE FROM psyche.credentials WHERE name = $1", &[&name])
+			.await
+			.map_err(|e| database_error(&e))?;
+		reload_credentials(held, &client).await;
+		if deleted == 0 {
+			return Err(not_found("There is no credential by that name."));
+		}
+		Ok(())
+	}
+	.await;
+	match result {
+		Ok(()) => StatusCode::NO_CONTENT.into_response(),
+		Err(error) => error.into_response(),
+	}
 }
 
 /// Reads the memberships again after the admin API changed them, so the next call sees it.
@@ -1298,6 +1425,7 @@ impl Proxy {
 		let mut inbound = Inbound::parse(&body)?;
 		let model = self
 			.catalogue
+			.get()
 			.model(&inbound.model)
 			.cloned()
 			.ok_or_else(|| {
@@ -1314,6 +1442,19 @@ impl Proxy {
 				Class::Forbidden,
 				format!("This key may not use {}.", model.name),
 			));
+		}
+		if let Some(name) = &model.provider.credential
+			&& model.provider.api_key.is_none()
+			&& model.provider.aws.is_none()
+		{
+			return Err(ApiError::new(
+				Class::ProviderAuth,
+				format!(
+					"{} takes the stored credential {name}, which is not set. Set it with PUT /ai/v1/admin/credentials/{name} and the service key.",
+					model.provider.name
+				),
+			)
+			.from_provider(&model.provider.name));
 		}
 		// The prompt's upper bound, from what the caller sent, for a call a budget or a limit applies
 		// to.
@@ -1757,6 +1898,7 @@ impl Proxy {
 			idle: self.timeouts.idle,
 			secrets: self
 				.catalogue
+				.get()
 				.secrets()
 				.into_iter()
 				.map(String::from)
@@ -1796,7 +1938,8 @@ impl Proxy {
 			.ok()
 			.and_then(Result::ok)
 			.unwrap_or_default();
-		let text = scrub(&String::from_utf8_lossy(&body), &self.catalogue.secrets());
+		let catalogue = self.catalogue.get();
+		let text = scrub(&String::from_utf8_lossy(&body), &catalogue.secrets());
 		let said = serde_json::from_str::<Value>(&text)
 			.ok()
 			.and_then(|v| {
@@ -2140,6 +2283,8 @@ mod tests {
 	struct Setup {
 		base: String,
 		fake: Fake,
+		/// The file's catalogue and the live one, for a watcher a test starts.
+		credentials: credentials::Held,
 		calls: tokio::sync::mpsc::UnboundedReceiver<Call>,
 		client: reqwest::Client,
 	}
@@ -2172,7 +2317,7 @@ mod tests {
 			limits: Option<Limits>,
 		) -> Self {
 			let fake = Fake::start().await;
-			let catalogue = Catalogue::from_json(
+			let catalogue = crate::providers::Catalogue::from_json(
 				&format!(
 					r#"{{"providers": [
 						{{"name": "fake", "kind": "openai", "base_url": "{0}/v1", "api_key_env": "FAKE_KEY"}},
@@ -2180,6 +2325,8 @@ mod tests {
 						{{"name": "bedrock", "kind": "bedrock", "region": "us-west-2", "base_url": "{0}",
 							"aws": {{"access_key_id_env": "AWS_AK", "secret_access_key_env": "AWS_SK"}}}},
 						{{"name": "bedrock-key", "kind": "bedrock", "region": "us-west-2", "base_url": "{0}", "api_key_env": "FAKE_KEY"}},
+						{{"name": "stored", "kind": "openai", "base_url": "{0}/v1", "credential": "stored"}},
+						{{"name": "stored-aws", "kind": "bedrock", "region": "us-west-2", "base_url": "{0}", "credential": "stored-aws"}},
 						{{"name": "bedrock-wrong", "kind": "bedrock", "region": "us-west-2", "base_url": "{0}",
 							"aws": {{"access_key_id_env": "AWS_AK", "secret_access_key_env": "AWS_SK_WRONG"}}}}
 					],
@@ -2201,6 +2348,8 @@ mod tests {
 						{{"name": "bedrock-stream-throttle", "provider": "bedrock", "upstream": "fake-stream-throttle"}},
 						{{"name": "bedrock-truncated", "provider": "bedrock", "upstream": "fake-truncated"}},
 						{{"name": "bedrock-wrong", "provider": "bedrock-wrong", "upstream": "fake-ok"}},
+						{{"name": "via-store", "provider": "stored", "upstream": "fake-ok"}},
+						{{"name": "via-store-aws", "provider": "stored-aws", "upstream": "fake-ok"}},
 						{{"name": "slow", "provider": "fake", "upstream": "fake-slow"}},
 						{{"name": "fails", "provider": "fake", "upstream": "fake-500"}},
 						{{"name": "limited", "provider": "fake", "upstream": "fake-429"}},
@@ -2227,8 +2376,14 @@ mod tests {
 				timeouts.idle = Duration::from_secs(5);
 			}
 			let (tx, calls) = tokio::sync::mpsc::unbounded_channel();
+			let live = Live::new(catalogue.clone());
+			let held = credentials::Held {
+				base: catalogue,
+				live: live.clone(),
+			};
 			let proxy = Arc::new(Proxy {
-				catalogue,
+				catalogue: live,
+				credentials: keys.as_ref().map(|_| held.clone()),
 				http: net::client(Egress::Private).unwrap(),
 				jwt_secret: SECRET.into(),
 				timeouts,
@@ -2244,6 +2399,7 @@ mod tests {
 			Self {
 				base,
 				fake,
+				credentials: held,
 				calls,
 				client: reqwest::Client::new(),
 			}
@@ -2387,7 +2543,10 @@ mod tests {
 			url.clone(),
 			keys::Held {
 				keys: store.clone(),
-				..Default::default()
+				members: Members::default(),
+				budgets: None,
+				limits: None,
+				credentials: None,
 			},
 			Some(ready),
 		));
@@ -2529,30 +2688,31 @@ mod tests {
 		let members = Members::default();
 		let budgets = Budgets::default();
 		let limits = Limits::default();
-		let (ready, loaded) = tokio::sync::oneshot::channel();
-		tokio::spawn(keys::watch(
-			url.clone(),
-			keys::Held {
-				keys: store.clone(),
-				budgets: Some(budgets.clone()),
-				limits: Some(limits.clone()),
-				members: members.clone(),
-			},
-			Some(ready),
-		));
-		loaded.await.unwrap();
 		let s = Setup::build_with(
 			Fake::KEY,
 			Timeouts::default(),
 			Some(Keys {
-				store,
-				members,
-				database_url: url,
+				store: store.clone(),
+				members: members.clone(),
+				database_url: url.clone(),
 			}),
-			Some(budgets),
-			Some(limits),
+			Some(budgets.clone()),
+			Some(limits.clone()),
 		)
 		.await;
+		let (ready, loaded) = tokio::sync::oneshot::channel();
+		tokio::spawn(keys::watch(
+			url,
+			keys::Held {
+				keys: store,
+				budgets: Some(budgets),
+				limits: Some(limits),
+				members,
+				credentials: Some(s.credentials.clone()),
+			},
+			Some(ready),
+		));
+		loaded.await.unwrap();
 		let made: Value = s
 			.post("/ai/v1/admin/keys", json!({"name": "app"}))
 			.send()
@@ -2961,6 +3121,139 @@ mod tests {
 		assert!(message.contains("each user a minute"), "{message}");
 	}
 
+	#[tokio::test]
+	async fn a_stored_credential_is_proven_never_shown_and_used_at_once() {
+		let Some((s, db, _key, _id)) = with_budgets("credentials").await else {
+			return;
+		};
+		let service = || jwt::sign(&json!({"role": "service_role"}), SECRET);
+		let put = |name: &str, body: Value| {
+			s.client
+				.put(format!("{}/ai/v1/admin/credentials/{name}", s.base))
+				.bearer_auth(service())
+				.json(&body)
+				.send()
+		};
+		let call = |model: &str| s.post("/ai/v1/chat/completions", chat(model, false)).send();
+		let stored = || async {
+			let n: i64 = db
+				.query_one("SELECT count(*) FROM psyche.credentials", &[])
+				.await
+				.unwrap()
+				.get(0);
+			n
+		};
+
+		// Not set yet: refused with what to do, and nothing is sent.
+		let sent = s.fake.count();
+		let (status, code, message) = error_of(call("via-store").await.unwrap()).await;
+		assert_eq!((status, code.as_str()), (502, "provider_auth"));
+		assert!(
+			message.contains("PUT /ai/v1/admin/credentials/stored"),
+			"{message}"
+		);
+		assert_eq!(s.fake.count(), sent);
+		let listed: Value = s
+			.client
+			.get(format!("{}/ai/v1/admin/credentials", s.base))
+			.bearer_auth(service())
+			.send()
+			.await
+			.unwrap()
+			.json()
+			.await
+			.unwrap();
+		assert!(
+			listed["data"]
+				.as_array()
+				.unwrap()
+				.iter()
+				.any(|c| c["name"] == "stored"
+					&& c["stored"] == false
+					&& c["used_by"] == json!(["stored"])),
+			"{listed}"
+		);
+
+		// A key the provider refuses is not stored, and its echo of the key is scrubbed.
+		let wrong = "not-the-fake-providers-own";
+		let (status, _, message) =
+			error_of(put("stored", json!({"api_key": wrong})).await.unwrap()).await;
+		assert_eq!(status, 400);
+		assert!(
+			message.contains("refused this credential (401)"),
+			"{message}"
+		);
+		assert!(!message.contains(wrong), "{message}");
+		assert_eq!(stored().await, 0);
+		let (status, _, message) =
+			error_of(put("nobody", json!({"api_key": Fake::KEY})).await.unwrap()).await;
+		assert_eq!(status, 400);
+		assert!(message.contains("No provider"), "{message}");
+
+		// The right one is stored, shown only by its print, and used by the next call.
+		let made = put("stored", json!({"api_key": Fake::KEY})).await.unwrap();
+		assert_eq!(made.status(), 200);
+		let made: Value = made.json().await.unwrap();
+		assert_eq!(made["last_four"], "6789");
+		assert!(made["fingerprint"].as_str().unwrap().starts_with("sha256:"));
+		assert!(!made.to_string().contains(Fake::KEY));
+		let reply = call("via-store").await.unwrap();
+		assert_eq!(reply.status(), 200, "no restart");
+		assert_eq!(
+			s.fake.last().authorization.as_deref(),
+			Some(format!("Bearer {}", Fake::KEY).as_str())
+		);
+
+		// AWS credentials sign a Bedrock provider's calls; a wrong secret is refused.
+		let wrong = put(
+			"stored-aws",
+			json!({"access_key_id": Fake::AWS_ACCESS_KEY_ID, "secret_access_key": "not-the-secret"}),
+		);
+		let (status, _, message) = error_of(wrong.await.unwrap()).await;
+		assert_eq!(status, 400);
+		assert!(message.contains("(403)"), "{message}");
+		let made = put(
+			"stored-aws",
+			json!({"access_key_id": Fake::AWS_ACCESS_KEY_ID, "secret_access_key": Fake::AWS_SECRET}),
+		);
+		assert_eq!(made.await.unwrap().status(), 200);
+		assert_eq!(call("via-store-aws").await.unwrap().status(), 200);
+		let listed = s
+			.client
+			.get(format!("{}/ai/v1/admin/credentials", s.base))
+			.bearer_auth(service())
+			.send()
+			.await
+			.unwrap()
+			.text()
+			.await
+			.unwrap();
+		assert!(!listed.contains(Fake::KEY) && !listed.contains(Fake::AWS_SECRET));
+
+		// Removed in plain SQL, it stops at once: the trigger tells Psyche.
+		db.batch_execute("DELETE FROM psyche.credentials WHERE name = 'stored'")
+			.await
+			.unwrap();
+		let mut stopped = false;
+		for _ in 0..250 {
+			if call("via-store").await.unwrap().status() == 502 {
+				stopped = true;
+				break;
+			}
+			tokio::time::sleep(Duration::from_millis(20)).await;
+		}
+		assert!(stopped, "the deletion reached Psyche");
+		let gone = s
+			.client
+			.delete(format!("{}/ai/v1/admin/credentials/stored-aws", s.base))
+			.bearer_auth(service())
+			.send()
+			.await
+			.unwrap();
+		assert_eq!(gone.status(), 204);
+		assert_eq!(call("via-store-aws").await.unwrap().status(), 502);
+	}
+
 	#[test]
 	fn openai_s_own_api_takes_max_completion_tokens_and_the_rest_max_tokens() {
 		let provider = |kind: Kind, base: &str| Provider {
@@ -2970,6 +3263,7 @@ mod tests {
 			api_key: None,
 			aws: None,
 			region: None,
+			credential: None,
 		};
 		let openai = provider(Kind::Openai, "https://api.openai.com/v1");
 		assert_eq!(cap_field(&openai, Operation::Chat), "max_completion_tokens");

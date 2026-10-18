@@ -218,6 +218,7 @@ pub struct Held {
 	pub budgets: Option<crate::budgets::Budgets>,
 	pub limits: Option<crate::limits::Limits>,
 	pub members: crate::who::Members,
+	pub credentials: Option<crate::credentials::Held>,
 }
 
 /// Which tables to read again.
@@ -227,6 +228,7 @@ struct Stale {
 	budgets: bool,
 	limits: bool,
 	members: bool,
+	credentials: bool,
 }
 
 impl Stale {
@@ -235,6 +237,7 @@ impl Stale {
 		budgets: true,
 		limits: true,
 		members: true,
+		credentials: true,
 	};
 
 	/// From a notification's payload, the table that changed. A group deleted takes its budgets,
@@ -250,6 +253,7 @@ impl Stale {
 			"budgets" => self.budgets = true,
 			"limits" => self.limits = true,
 			"members" => self.members = true,
+			"credentials" => self.credentials = true,
 			"groups" => {
 				self.budgets = true;
 				self.limits = true;
@@ -260,7 +264,7 @@ impl Stale {
 	}
 }
 
-/// Keeps `held` in step with `psyche.keys`, `budgets`, `limits` and `members` for as long as the
+/// Keeps `held` in step with `psyche.keys`, `budgets`, `limits`, `members` and `credentials` for as long as the
 /// process runs: loads them, then reloads the table each `psyche_changed` names and all of them
 /// every [`RELOAD_EVERY`], reconnecting when the connection is lost. `ready` is told after the first
 /// load.
@@ -293,6 +297,9 @@ async fn listen(
 		}
 		if let Some(limits) = held.limits.as_ref().filter(|_| stale.limits) {
 			limits.replace(crate::limits::load(client).await?);
+		}
+		if let Some(credentials) = held.credentials.as_ref().filter(|_| stale.credentials) {
+			credentials.replace(&crate::credentials::load(client).await?);
 		}
 		Ok(())
 	};

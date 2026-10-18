@@ -467,6 +467,7 @@ mod tests {
 				api_key: None,
 				aws: None,
 				region: None,
+				credential: None,
 			}),
 			upstream: "us.anthropic.claude-sonnet-5".into(),
 			prompt_caching: caching,

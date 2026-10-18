@@ -919,6 +919,7 @@ pub(crate) mod tests {
 			"psyche.limits",
 			"psyche.groups",
 			"psyche.members",
+			"psyche.credentials",
 		] {
 			let error = client
 				.batch_execute(&format!(

@@ -156,6 +156,40 @@ length asked for when the caller names none: Anthropic requires one on every req
 either Psyche asks for 4096. A provider with no `api_key_env` is sent no key. A mistake (an unknown provider, a name used twice, a key variable
 that is not set, an http URL under `public` egress) stops the server at start with its name.
 
+### Stored credentials
+
+With a database, a provider can take its key from Psyche instead of the environment: name a
+credential in the file, then set it with the service key.
+
+```json
+{"name": "openai", "kind": "openai", "base_url": "https://api.openai.com/v1", "credential": "openai"}
+```
+
+```sh
+curl -X PUT $PSYCHE/ai/v1/admin/credentials/openai -H "Authorization: Bearer $SERVICE_KEY" \
+  -d '{"api_key": "sk-…"}'
+# Bedrock: {"access_key_id": "…", "secret_access_key": "…", "session_token": "…"} (token optional)
+# {"name": "openai", "kind": "api_key", "fingerprint": "sha256:3f9a…", "last_four": "x9Qz"}
+```
+
+Before a credential is stored it is **proven**: each provider that names it is sent an empty
+request on the endpoint its calls use. A provider answers that with 401 or 403 when it does not
+take the credential and with a validation error when it does, so the check spends no tokens and
+tests the base URL too. A refused credential, or one that cannot be checked (no answer, a 5xx), is
+not stored, and the provider's reply comes back with the key scrubbed out of it. The next call uses
+a stored credential at once, with no restart, and a change made any other way (SQL included)
+reaches Psyche through the same trigger as keys.
+
+A credential is **written once and never read back**: `GET /ai/v1/admin/credentials` shows each
+one's kind, a fingerprint, its last four characters, the providers that use it, and any name a
+provider asks for that is not stored yet; `DELETE /ai/v1/admin/credentials/<name>` removes one. A
+call to a provider whose credential is not set is refused (502, `provider_auth`) with the command
+that sets it, and nothing is sent. In the database, only Psyche's own role reads
+`psyche.credentials`: no grant to the signed-in or anon roles, nor to the project's service role,
+which bypasses row-level security but still needs a grant. A superuser can read any table, so that
+is the boundary, not encryption. An encryption key would sit in Psyche's environment beside the
+database URL, so it would protect only a copy of the database taken without it.
+
 Each finished call is logged under the `psyche::call` target: operation, model, provider, outcome
 (completed, cancelled, or failed with a class), tokens, cost, time to first byte and total time.
 
