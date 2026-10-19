@@ -464,12 +464,17 @@ fn unix(at: SystemTime) -> u64 {
 		.map_or(0, |d| d.as_secs())
 }
 
-/// Every key, revoked ones included, newest first, as lists show them.
+/// Every key, revoked ones included, newest first, as lists show them. `last_used_at` is its newest
+/// call in the request log, so it is null once that call is past the log's retention;
+/// `last_used_on` is the newest day in the daily totals, kept for good. Both are null for a key never
+/// used. A call is counted whether it was answered or refused.
 pub async fn list(client: &Client) -> Result<Vec<serde_json::Value>, tokio_postgres::Error> {
 	let rows = client
 		.query(
-			"SELECT id::text, name, hint, owner::text, models, created_at, expires_at, revoked_at \
-			 FROM psyche.keys ORDER BY created_at DESC, id",
+			"SELECT id::text, name, hint, owner::text, models, created_at, expires_at, revoked_at, \
+			 (SELECT max(r.at) FROM psyche.requests r WHERE r.key_id = k.id), \
+			 (SELECT max(u.day)::text FROM psyche.usage_daily u WHERE u.key_id = k.id) \
+			 FROM psyche.keys k ORDER BY created_at DESC, id",
 			&[],
 		)
 		.await?;
@@ -485,6 +490,8 @@ pub async fn list(client: &Client) -> Result<Vec<serde_json::Value>, tokio_postg
 				"created_at": unix(row.get(5)),
 				"expires_at": row.get::<_, Option<SystemTime>>(6).map(unix),
 				"revoked_at": row.get::<_, Option<SystemTime>>(7).map(unix),
+				"last_used_at": row.get::<_, Option<SystemTime>>(8).map(unix),
+				"last_used_on": row.get::<_, Option<String>>(9),
 			})
 		})
 		.collect())

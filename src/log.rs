@@ -975,6 +975,74 @@ pub(crate) mod tests {
 	}
 
 	#[tokio::test]
+	async fn a_key_lists_when_it_was_last_used() {
+		let Some((mut client, _)) = fresh_database("last_used").await else {
+			return;
+		};
+		client
+			.batch_execute(
+				"INSERT INTO psyche.keys (name, hash, hint) VALUES
+				   ('used', decode(repeat('a1', 32), 'hex'), 'psy_a'),
+				   ('idle', decode(repeat('b0', 32), 'hex'), 'psy_b')",
+			)
+			.await
+			.unwrap();
+		let used = crate::keys::list(&client)
+			.await
+			.unwrap()
+			.into_iter()
+			.find(|k| k["name"] == "used")
+			.unwrap()["id"]
+			.as_str()
+			.unwrap()
+			.to_string();
+		let now = SystemTime::now();
+		let earlier = now - Duration::from_secs(60);
+		partitions(&client, &[Day::of(now), Day::of(earlier)])
+			.await
+			.unwrap();
+		let by_key = |at: SystemTime, outcome: Outcome| {
+			let mut call = call(at, "a", outcome, Some(Usage::default()));
+			call.who.key = crate::keys::KeyId::parse(&used);
+			call
+		};
+		write(
+			&mut client,
+			&[
+				by_key(earlier, Outcome::Completed),
+				by_key(now, Outcome::Cancelled),
+			],
+		)
+		.await
+		.unwrap();
+
+		let keys = crate::keys::list(&client).await.unwrap();
+		let find = |name: &str| keys.iter().find(|k| k["name"] == name).unwrap().clone();
+		let (used, idle) = (find("used"), find("idle"));
+		// The newest call, to the second, and its day from the totals.
+		let second = now.duration_since(UNIX_EPOCH).unwrap().as_secs();
+		assert_eq!(used["last_used_at"].as_u64(), Some(second));
+		assert_eq!(
+			used["last_used_on"].as_str(),
+			Some(Day::of(now).iso().as_str())
+		);
+		assert!(idle["last_used_at"].is_null() && idle["last_used_on"].is_null());
+
+		// Past the log's retention the call's row is gone, and the day is still known.
+		client
+			.batch_execute("DELETE FROM psyche.requests")
+			.await
+			.unwrap();
+		let keys = crate::keys::list(&client).await.unwrap();
+		let used = keys.iter().find(|k| k["name"] == "used").unwrap();
+		assert!(used["last_used_at"].is_null());
+		assert_eq!(
+			used["last_used_on"].as_str(),
+			Some(Day::of(now).iso().as_str())
+		);
+	}
+
+	#[tokio::test]
 	async fn owners_see_their_own_keys_calls_totals_and_budgets_and_nothing_else() {
 		let Some((mut client, _)) = fresh_database("owners").await else {
 			return;

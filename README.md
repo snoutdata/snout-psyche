@@ -86,6 +86,10 @@ curl $PSYCHE/ai/v1/admin/keys -H "Authorization: Bearer $SERVICE_KEY"           
 curl -X DELETE $PSYCHE/ai/v1/admin/keys/<id> -H "Authorization: Bearer $SERVICE_KEY"  # revoke
 ```
 
+The list gives each key's `created_at` and when it was last used: `last_used_at` (seconds since the
+epoch) from the request log, so null once that call is past the log's retention, and `last_used_on`
+(a UTC day) from the daily totals, kept for good; both are null for a key never used.
+
 Only a key's SHA-256 is stored (`psyche.keys`), so a lost key is replaced, not recovered. `models`
 left out allows every model; `expires_in` is seconds; `owner` is a user's id, for a key that belongs to
 someone. `GET /ai/v1/models` with a key lists only the models it may use, and a call to any other is
@@ -278,14 +282,15 @@ curl "$PSYCHE/ai/v1/admin/usage?by=model&from=2026-10-01&to=2026-10-31" -H "Auth
 #  "cached_tokens": …, "reasoning_tokens": …, "cost": "4.21", "credits_cost": "0.30", "unpriced": 0}]}
 curl "$PSYCHE/ai/v1/admin/requests?limit=50&model=sonnet" -H "Authorization: Bearer $SERVICE_KEY"
 # {"data": [{"at": 1792389374000, "model": "sonnet", "outcome": "completed", "cost": "0.0021", …}],
-#  "next_before": 1792389301000}
+#  "next_before": 1792389301000412}
 ```
 
 `usage` sums the daily totals (kept for good) over UTC days, the last 30 by default and at most 366,
 grouped `by` day, model, provider, operation, key, user or group, the biggest spend first (by day:
 in order), and takes `model`, `key_id`, `user_id` and `group_id` to narrow it. `requests` is the
 request log (kept `PSYCHE_LOG_RETENTION_DAYS`), newest first: `limit` rows (50, at most 500) before
-`before`, in milliseconds since the epoch, which the last page's `next_before` gives; the same
+`before`, the last page's `next_before` (the last row's time in microseconds since the epoch; `at`
+is in milliseconds); the same
 filters, and `outcome` (`completed`, `cancelled`, or an error's code such as `budget_exceeded`).
 
 ### Credits

@@ -1623,9 +1623,10 @@ async fn usage(
 	}
 }
 
-/// The request log, newest first: `limit` rows (50, at most 500) before `before` (milliseconds
+/// The request log, newest first: `limit` rows (50, at most 500) before `before` (microseconds
 /// since the epoch, from the last page's `next_before`), optionally for one model, key, user or
-/// group, or one outcome.
+/// group, or one outcome. The cursor is the last row's own time to the microsecond the log keeps,
+/// never a rounded one: a millisecond rounded up would bring that row back on the next page.
 async fn requests(
 	State(proxy): State<Arc<Proxy>>,
 	headers: HeaderMap,
@@ -1658,9 +1659,10 @@ async fn requests(
 			.query(
 				"SELECT (extract(epoch FROM at) * 1000)::bigint, operation, model, provider, streamed, \
 				 outcome, prompt_tokens, completion_tokens, cached_tokens, reasoning_tokens, first_byte_ms, \
-				 total_ms, cost::text, key_id::text, user_id::text, group_id::text, credits, budget_warning \
+				 total_ms, cost::text, key_id::text, user_id::text, group_id::text, credits, budget_warning, \
+				 (extract(epoch FROM at) * 1000000)::bigint \
 				 FROM psyche.requests \
-				 WHERE ($1::bigint IS NULL OR at < to_timestamp($1::bigint / 1000.0)) \
+				 WHERE ($1::bigint IS NULL OR at < timestamptz 'epoch' + $1::bigint * interval '1 microsecond') \
 				 AND ($2::text IS NULL OR model = $2) AND ($3::text IS NULL OR outcome = $3) \
 				 AND ($4::uuid IS NULL OR key_id = $4) AND ($5::uuid IS NULL OR user_id = $5) \
 				 AND ($6::uuid IS NULL OR group_id = $6) \
@@ -1695,7 +1697,7 @@ async fn requests(
 			})
 			.collect();
 		let next = (data.len() as i64 == limit)
-			.then(|| data.last().and_then(|r| r["at"].as_i64()))
+			.then(|| rows.last().map(|row| row.get::<_, i64>(18)))
 			.flatten();
 		Ok::<_, ApiError>(json!({"object": "list", "data": data, "next_before": next}))
 	}
