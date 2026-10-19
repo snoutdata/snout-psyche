@@ -237,9 +237,13 @@ through and names itself in the `x-psyche-budget-warning` header.
 curl -X POST $PSYCHE/ai/v1/admin/budgets -H "Authorization: Bearer $SERVICE_KEY" \
   -d '{"name": "ci daily", "amount": 5, "period": "day", "key_id": "<key id>"}'
 # period: day, month, rolling with "days": 1-366, or since with "starts_on" (a billing period's
-# first day, set in SQL for now); "hard": false for a soft budget.
+# first day, YYYY-MM-DD); "hard": false for a soft budget.
 # Whom it is for, one of: key_id, "every_user": true, user_id, group_id; none for the project.
 # GET lists them, DELETE /ai/v1/admin/budgets/<id> removes one.
+curl -X PATCH $PSYCHE/ai/v1/admin/budgets/<id> -H "Authorization: Bearer $SERVICE_KEY" \
+  -d '{"amount": 10, "hard": false}'
+# name, amount, period, days, starts_on, hard; whom it is for stays. A new period takes days and
+# starts_on as given, so moving to "day" drops them.
 ```
 
 A budget is kept by **reserving, then settling**. Before a call goes to its provider, its worst
@@ -262,6 +266,27 @@ tightest budget has room for, down to 256, below which the call is refused. It g
 budget sends none. Measured against the fake provider, 300
 calls at once on a key with a $0.001 day: 18 answered, 282 refused, $0.000342 spent. The bound is
 generous where prompts are short, so near its end a budget refuses some calls that would have fit.
+
+### Usage and the log
+
+The admin API reads back what was spent, for a screen or a script:
+
+```sh
+curl "$PSYCHE/ai/v1/admin/usage?by=model&from=2026-10-01&to=2026-10-31" -H "Authorization: Bearer $SERVICE_KEY"
+# {"by": "model", "from": "2026-10-01", "to": "2026-10-31", "data": [{"model": "sonnet",
+#  "requests": 812, "failed": 3, "cancelled": 1, "prompt_tokens": …, "completion_tokens": …,
+#  "cached_tokens": …, "reasoning_tokens": …, "cost": "4.21", "credits_cost": "0.30", "unpriced": 0}]}
+curl "$PSYCHE/ai/v1/admin/requests?limit=50&model=sonnet" -H "Authorization: Bearer $SERVICE_KEY"
+# {"data": [{"at": 1792389374000, "model": "sonnet", "outcome": "completed", "cost": "0.0021", …}],
+#  "next_before": 1792389301000}
+```
+
+`usage` sums the daily totals (kept for good) over UTC days, the last 30 by default and at most 366,
+grouped `by` day, model, provider, operation, key, user or group, the biggest spend first (by day:
+in order), and takes `model`, `key_id`, `user_id` and `group_id` to narrow it. `requests` is the
+request log (kept `PSYCHE_LOG_RETENTION_DAYS`), newest first: `limit` rows (50, at most 500) before
+`before`, in milliseconds since the epoch, which the last page's `next_before` gives; the same
+filters, and `outcome` (`completed`, `cancelled`, or an error's code such as `budget_exceeded`).
 
 ### Credits
 

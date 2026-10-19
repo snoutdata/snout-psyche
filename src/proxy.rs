@@ -33,10 +33,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use axum::Router;
 use axum::body::{Body, Bytes};
 use axum::extract::rejection::BytesRejection;
-use axum::extract::{DefaultBodyLimit, Path, State};
+use axum::extract::{DefaultBodyLimit, Path, RawQuery, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, post, put};
+use axum::routing::{delete, get, patch, post, put};
 use futures_util::{Stream, StreamExt, TryStreamExt};
 use serde_json::{Map, Value, json};
 
@@ -400,7 +400,10 @@ pub fn router(proxy: Arc<Proxy>) -> Router {
 		.route("/admin/keys", get(list_keys).post(create_key))
 		.route("/admin/keys/{id}", delete(revoke_key))
 		.route("/admin/budgets", get(list_budgets).post(create_budget))
-		.route("/admin/budgets/{id}", delete(delete_budget))
+		.route(
+			"/admin/budgets/{id}",
+			patch(edit_budget).delete(delete_budget),
+		)
 		.route("/admin/limits", get(list_limits).post(create_limit))
 		.route("/admin/limits/{id}", delete(delete_limit))
 		.route("/admin/groups", get(list_groups).post(create_group))
@@ -417,6 +420,8 @@ pub fn router(proxy: Arc<Proxy>) -> Router {
 		.route("/admin/models", get(list_models))
 		.route("/admin/models/{*name}", put(set_model).delete(delete_model))
 		.route("/admin/credentials", get(list_credentials))
+		.route("/admin/usage", get(usage))
+		.route("/admin/requests", get(requests))
 		.route(
 			"/admin/credentials/{name}",
 			put(set_credential).delete(delete_credential),
@@ -475,9 +480,12 @@ async fn models(State(proxy): State<Arc<Proxy>>, headers: HeaderMap) -> Response
 		.models()
 		.iter()
 		.filter(|m| caller.may_use(&m.name) && proxy.granted(&m.name, &who))
-		.map(
-			|m| json!({"id": m.name, "object": "model", "created": 0, "owned_by": m.provider.name}),
-		)
+		.map(|m| {
+			// The price each model is charged at, as the admin API writes it (dollars per million
+			// tokens), so a picker can say what a model costs; null when nothing prices it.
+			json!({"id": m.name, "object": "model", "created": 0, "owned_by": m.provider.name,
+				"pricing": m.price.map(|p| p.to_json())})
+		})
 		.collect();
 	axum::Json(json!({"object": "list", "data": data})).into_response()
 }
@@ -613,10 +621,32 @@ struct NewBudget {
 	period: String,
 	#[serde(default)]
 	days: Option<i32>,
+	/// The first day of a `since` budget, `YYYY-MM-DD`.
+	#[serde(default)]
+	starts_on: Option<String>,
 	#[serde(flatten)]
 	whom: Whom,
 	#[serde(default = "yes")]
 	hard: bool,
+}
+
+/// What the admin API changes on a budget; whom it is for stays. A new `period` takes `days` and
+/// `starts_on` as given (absent is none); without one, each is changed only when it is given.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BudgetEdit {
+	#[serde(default)]
+	name: Option<String>,
+	#[serde(default)]
+	amount: Option<f64>,
+	#[serde(default)]
+	period: Option<String>,
+	#[serde(default)]
+	days: Option<i32>,
+	#[serde(default)]
+	starts_on: Option<String>,
+	#[serde(default)]
+	hard: Option<bool>,
 }
 
 fn yes() -> bool {
@@ -717,7 +747,7 @@ async fn reload_limits(proxy: &Proxy, client: &tokio_postgres::Client) {
 }
 
 const WHOM_FIELDS: [&str; 4] = ["key_id", "every_user", "user_id", "group_id"];
-const BUDGET_FIELDS: &[&str] = &["name", "amount", "period", "days", "hard"];
+const BUDGET_FIELDS: &[&str] = &["name", "amount", "period", "days", "starts_on", "hard"];
 const LIMIT_FIELDS: &[&str] = &["name", "requests_per_minute", "tokens_per_minute"];
 
 /// An admin body, refusing a field it does not know (which `deny_unknown_fields` cannot do next to
@@ -1296,7 +1326,7 @@ async fn list_budgets(State(proxy): State<Arc<Proxy>>, headers: HeaderMap) -> Re
 		let rows = client
 			.query(
 				"SELECT id::text, name, amount::text, period, days, hard, created_at, \
-				 key_id::text, every_user, user_id::text, group_id::text \
+				 key_id::text, every_user, user_id::text, group_id::text, starts_on::text \
 				 FROM psyche.budgets ORDER BY created_at, id",
 				&[],
 			)
@@ -1314,6 +1344,7 @@ async fn list_budgets(State(proxy): State<Arc<Proxy>>, headers: HeaderMap) -> Re
 							"days": row.get::<_, Option<i32>>(4),
 							"hard": row.get::<_, bool>(5),
 							"created_at": row.get::<_, SystemTime>(6).duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs()),
+							"starts_on": row.get::<_, Option<String>>(11),
 						}),
 						whom_json(row, 7),
 					)
@@ -1337,12 +1368,7 @@ async fn create_budget(
 		let (_, client) = admin(&proxy, &headers).await?;
 		let body = body.map_err(|r| ApiError::new(Class::BadRequest, r.body_text()))?;
 		let new: NewBudget = admin_body(&body, BUDGET_FIELDS, "A budget")?;
-		if !new.amount.is_finite() || !(0.0..1_000_000.0).contains(&new.amount) {
-			return Err(ApiError::new(
-				Class::BadRequest,
-				"amount is US dollars, from 0 to under 1,000,000.",
-			));
-		}
+		budget_amount(new.amount)?;
 		let (key, every_user, user, group) = new.whom.columns()?;
 		// Six decimals is a millionth of a dollar, finer than any budget needs; numeric takes it
 		// exactly from text.
@@ -1350,21 +1376,332 @@ async fn create_budget(
 		let row = client
 			.query_one(
 				"INSERT INTO psyche.budgets (name, amount, period, days, hard, key_id, every_user, \
-				 user_id, group_id) VALUES ($1, $2::text::numeric, $3, $4, $5, $6, $7, $8, $9) RETURNING id::text",
-				&[&new.name.trim(), &amount, &new.period, &new.days, &new.hard, &key, &every_user, &user, &group],
+				 user_id, group_id, starts_on) VALUES ($1, $2::text::numeric, $3, $4, $5, $6, $7, $8, $9, \
+				 $10::text::date) RETURNING id::text",
+				&[
+					&new.name.trim(),
+					&amount,
+					&new.period,
+					&new.days,
+					&new.hard,
+					&key,
+					&every_user,
+					&user,
+					&group,
+					&new.starts_on,
+				],
 			)
 			.await
 			.map_err(|e| write_error(&e))?;
 		reload_budgets(&proxy, &client).await;
 		Ok::<_, ApiError>(merge(
 			json!({"id": row.get::<_, String>(0), "name": new.name.trim(), "amount": amount,
-				"period": new.period, "days": new.days, "hard": new.hard}),
+				"period": new.period, "days": new.days, "starts_on": new.starts_on, "hard": new.hard}),
 			new.whom.json(),
 		))
 	}
 	.await;
 	match result {
 		Ok(made) => (StatusCode::CREATED, axum::Json(made)).into_response(),
+		Err(error) => error.into_response(),
+	}
+}
+
+/// A budget's amount as the admin API takes it.
+fn budget_amount(amount: f64) -> Result<(), ApiError> {
+	if !amount.is_finite() || !(0.0..1_000_000.0).contains(&amount) {
+		return Err(ApiError::new(
+			Class::BadRequest,
+			"amount is US dollars, from 0 to under 1,000,000.",
+		));
+	}
+	Ok(())
+}
+
+async fn edit_budget(
+	State(proxy): State<Arc<Proxy>>,
+	headers: HeaderMap,
+	Path(id): Path<String>,
+	body: Result<Bytes, BytesRejection>,
+) -> Response {
+	let result = async {
+		let (_, client) = admin(&proxy, &headers).await?;
+		let id = KeyId::parse(&id)
+			.ok_or_else(|| ApiError::new(Class::BadRequest, "A budget's id is a uuid."))?;
+		let body = body.map_err(|r| ApiError::new(Class::BadRequest, r.body_text()))?;
+		let edit: BudgetEdit = serde_json::from_slice(&body).map_err(|e| {
+			ApiError::new(
+				Class::BadRequest,
+				format!(
+					"A budget is changed with name, amount, period, days, starts_on and hard: {e}"
+				),
+			)
+		})?;
+		if let Some(amount) = edit.amount {
+			budget_amount(amount)?;
+		}
+		let amount = edit.amount.map(|a| format!("{a:.6}"));
+		let name = edit.name.as_deref().map(str::trim);
+		let row = client
+			.query_opt(
+				"UPDATE psyche.budgets SET name = coalesce($2, name), \
+				 amount = coalesce($3::text::numeric, amount), hard = coalesce($4, hard), \
+				 period = coalesce($5, period), \
+				 days = CASE WHEN $5::text IS NULL THEN coalesce($6, days) ELSE $6 END, \
+				 starts_on = CASE WHEN $5::text IS NULL THEN coalesce($7::text::date, starts_on) \
+				 ELSE $7::text::date END \
+				 WHERE id = $1 RETURNING name, amount::text, period, days, hard, starts_on::text",
+				&[
+					&id,
+					&name,
+					&amount,
+					&edit.hard,
+					&edit.period,
+					&edit.days,
+					&edit.starts_on,
+				],
+			)
+			.await
+			.map_err(|e| write_error(&e))?
+			.ok_or_else(|| not_found("There is no budget with that id."))?;
+		reload_budgets(&proxy, &client).await;
+		Ok::<_, ApiError>(json!({
+			"id": id.to_string(),
+			"name": row.get::<_, String>(0),
+			"amount": row.get::<_, String>(1),
+			"period": row.get::<_, String>(2),
+			"days": row.get::<_, Option<i32>>(3),
+			"hard": row.get::<_, bool>(4),
+			"starts_on": row.get::<_, Option<String>>(5),
+		}))
+	}
+	.await;
+	match result {
+		Ok(edited) => axum::Json(edited).into_response(),
+		Err(error) => error.into_response(),
+	}
+}
+
+/// A query string's pairs, the last of each name winning.
+fn query_pairs(query: Option<&str>) -> std::collections::HashMap<String, String> {
+	url::form_urlencoded::parse(query.unwrap_or("").as_bytes())
+		.into_owned()
+		.collect()
+}
+
+/// A uuid filter from the query string, refused when it is not one.
+fn uuid_filter(
+	pairs: &std::collections::HashMap<String, String>,
+	name: &str,
+) -> Result<Option<KeyId>, ApiError> {
+	match pairs.get(name).filter(|v| !v.is_empty()) {
+		None => Ok(None),
+		Some(text) => KeyId::parse(text)
+			.map(Some)
+			.ok_or_else(|| ApiError::new(Class::BadRequest, format!("{name} is a uuid."))),
+	}
+}
+
+/// What `GET /admin/usage` groups the daily totals by, and the column each one is.
+const USAGE_BY: [(&str, &str); 7] = [
+	("day", "day::text"),
+	("model", "model"),
+	("provider", "provider"),
+	("operation", "operation"),
+	("key", "key_id::text"),
+	("user", "user_id::text"),
+	("group", "group_id::text"),
+];
+
+/// The daily totals, summed over `from`..=`to` (UTC days, the last 30 by default) and grouped by
+/// one of `USAGE_BY`, optionally for one model, key, user or group.
+async fn usage(
+	State(proxy): State<Arc<Proxy>>,
+	headers: HeaderMap,
+	RawQuery(query): RawQuery,
+) -> Response {
+	let result = async {
+		let (_, client) = admin(&proxy, &headers).await?;
+		let pairs = query_pairs(query.as_deref());
+		let by = pairs.get("by").map_or("day", String::as_str);
+		let column = USAGE_BY
+			.iter()
+			.find(|(name, _)| *name == by)
+			.map(|(_, column)| *column)
+			.ok_or_else(|| {
+				let names: Vec<&str> = USAGE_BY.iter().map(|(name, _)| *name).collect();
+				ApiError::new(
+					Class::BadRequest,
+					format!("by is one of {}.", names.join(", ")),
+				)
+			})?;
+		let day = |name: &str| -> Result<Option<String>, ApiError> {
+			match pairs.get(name).filter(|v| !v.is_empty()) {
+				None => Ok(None),
+				Some(text)
+					if text.len() == 10
+						&& text.as_bytes()[4] == b'-'
+						&& text.as_bytes()[7] == b'-' =>
+				{
+					Ok(Some(text.clone()))
+				}
+				Some(_) => Err(ApiError::new(
+					Class::BadRequest,
+					format!("{name} is a day, YYYY-MM-DD."),
+				)),
+			}
+		};
+		let (from, to) = (day("from")?, day("to")?);
+		let model = pairs.get("model").filter(|v| !v.is_empty()).cloned();
+		let (key, user, group) = (
+			uuid_filter(&pairs, "key_id")?,
+			uuid_filter(&pairs, "user_id")?,
+			uuid_filter(&pairs, "group_id")?,
+		);
+		let span = client
+			.query_one(
+				"SELECT lo::text, hi::text, hi - lo FROM (SELECT \
+				 coalesce($1::text::date, coalesce($2::text::date, current_date) - 29) AS lo, \
+				 coalesce($2::text::date, current_date) AS hi) span",
+				&[&from, &to],
+			)
+			.await
+			.map_err(|e| write_error(&e))?;
+		let (lo, hi, days) = (
+			span.get::<_, String>(0),
+			span.get::<_, String>(1),
+			span.get::<_, i32>(2),
+		);
+		if !(0..=366).contains(&days) {
+			return Err(ApiError::new(
+				Class::BadRequest,
+				"from is on or before to, and at most 366 days before it.",
+			));
+		}
+		let sql = format!(
+			"SELECT {column}, sum(requests)::bigint, sum(failed)::bigint, sum(cancelled)::bigint, \
+			 sum(prompt_tokens)::bigint, sum(completion_tokens)::bigint, sum(cached_tokens)::bigint, \
+			 sum(reasoning_tokens)::bigint, sum(cost)::text, sum(credits_cost)::text, sum(unpriced)::bigint \
+			 FROM psyche.usage_daily WHERE day BETWEEN $1::text::date AND $2::text::date \
+			 AND ($3::text IS NULL OR model = $3) AND ($4::uuid IS NULL OR key_id = $4) \
+			 AND ($5::uuid IS NULL OR user_id = $5) AND ($6::uuid IS NULL OR group_id = $6) \
+			 GROUP BY 1 ORDER BY {order}",
+			order = if by == "day" {
+				"1"
+			} else {
+				"sum(cost) DESC NULLS LAST, 1"
+			},
+		);
+		let rows = client
+			.query(&sql, &[&lo, &hi, &model, &key, &user, &group])
+			.await
+			.map_err(|e| write_error(&e))?;
+		let data: Vec<Value> = rows
+			.iter()
+			.map(|row| {
+				json!({
+					by: row.get::<_, Option<String>>(0),
+					"requests": row.get::<_, i64>(1),
+					"failed": row.get::<_, i64>(2),
+					"cancelled": row.get::<_, i64>(3),
+					"prompt_tokens": row.get::<_, i64>(4),
+					"completion_tokens": row.get::<_, i64>(5),
+					"cached_tokens": row.get::<_, i64>(6),
+					"reasoning_tokens": row.get::<_, i64>(7),
+					"cost": row.get::<_, Option<String>>(8),
+					"credits_cost": row.get::<_, Option<String>>(9),
+					"unpriced": row.get::<_, i64>(10),
+				})
+			})
+			.collect();
+		Ok::<_, ApiError>(json!({"object": "list", "by": by, "from": lo, "to": hi, "data": data}))
+	}
+	.await;
+	match result {
+		Ok(listed) => axum::Json(listed).into_response(),
+		Err(error) => error.into_response(),
+	}
+}
+
+/// The request log, newest first: `limit` rows (50, at most 500) before `before` (milliseconds
+/// since the epoch, from the last page's `next_before`), optionally for one model, key, user or
+/// group, or one outcome.
+async fn requests(
+	State(proxy): State<Arc<Proxy>>,
+	headers: HeaderMap,
+	RawQuery(query): RawQuery,
+) -> Response {
+	let result = async {
+		let (_, client) = admin(&proxy, &headers).await?;
+		let pairs = query_pairs(query.as_deref());
+		let number = |name: &str| -> Result<Option<i64>, ApiError> {
+			pairs
+				.get(name)
+				.filter(|v| !v.is_empty())
+				.map(|v| {
+					v.parse::<i64>().map_err(|_| {
+						ApiError::new(Class::BadRequest, format!("{name} is a number."))
+					})
+				})
+				.transpose()
+		};
+		let limit = number("limit")?.unwrap_or(50).clamp(1, 500);
+		let before = number("before")?;
+		let model = pairs.get("model").filter(|v| !v.is_empty()).cloned();
+		let outcome = pairs.get("outcome").filter(|v| !v.is_empty()).cloned();
+		let (key, user, group) = (
+			uuid_filter(&pairs, "key_id")?,
+			uuid_filter(&pairs, "user_id")?,
+			uuid_filter(&pairs, "group_id")?,
+		);
+		let rows = client
+			.query(
+				"SELECT (extract(epoch FROM at) * 1000)::bigint, operation, model, provider, streamed, \
+				 outcome, prompt_tokens, completion_tokens, cached_tokens, reasoning_tokens, first_byte_ms, \
+				 total_ms, cost::text, key_id::text, user_id::text, group_id::text, credits, budget_warning \
+				 FROM psyche.requests \
+				 WHERE ($1::bigint IS NULL OR at < to_timestamp($1::bigint / 1000.0)) \
+				 AND ($2::text IS NULL OR model = $2) AND ($3::text IS NULL OR outcome = $3) \
+				 AND ($4::uuid IS NULL OR key_id = $4) AND ($5::uuid IS NULL OR user_id = $5) \
+				 AND ($6::uuid IS NULL OR group_id = $6) \
+				 ORDER BY at DESC LIMIT $7",
+				&[&before, &model, &outcome, &key, &user, &group, &limit],
+			)
+			.await
+			.map_err(|e| write_error(&e))?;
+		let data: Vec<Value> = rows
+			.iter()
+			.map(|row| {
+				json!({
+					"at": row.get::<_, i64>(0),
+					"operation": row.get::<_, String>(1),
+					"model": row.get::<_, String>(2),
+					"provider": row.get::<_, String>(3),
+					"streamed": row.get::<_, bool>(4),
+					"outcome": row.get::<_, String>(5),
+					"prompt_tokens": row.get::<_, Option<i32>>(6),
+					"completion_tokens": row.get::<_, Option<i32>>(7),
+					"cached_tokens": row.get::<_, Option<i32>>(8),
+					"reasoning_tokens": row.get::<_, Option<i32>>(9),
+					"first_byte_ms": row.get::<_, i32>(10),
+					"total_ms": row.get::<_, i32>(11),
+					"cost": row.get::<_, Option<String>>(12),
+					"key_id": row.get::<_, Option<String>>(13),
+					"user_id": row.get::<_, Option<String>>(14),
+					"group_id": row.get::<_, Option<String>>(15),
+					"credits": row.get::<_, bool>(16),
+					"budget_warning": row.get::<_, Option<String>>(17),
+				})
+			})
+			.collect();
+		let next = (data.len() as i64 == limit)
+			.then(|| data.last().and_then(|r| r["at"].as_i64()))
+			.flatten();
+		Ok::<_, ApiError>(json!({"object": "list", "data": data, "next_before": next}))
+	}
+	.await;
+	match result {
+		Ok(listed) => axum::Json(listed).into_response(),
 		Err(error) => error.into_response(),
 	}
 }
@@ -2894,6 +3231,225 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn the_admin_api_edits_a_budget_and_reads_usage_and_the_log() {
+		let Some((s, db, key, id)) = with_budgets("admin_reads").await else {
+			return;
+		};
+		let service = jwt::sign(&json!({"role": "service_role"}), SECRET);
+		let send = |method: reqwest::Method, path: &str, body: Option<Value>| {
+			let mut request = s
+				.client
+				.request(method, format!("{}{path}", s.base))
+				.bearer_auth(&service);
+			if let Some(body) = body {
+				request = request.json(&body);
+			}
+			request.send()
+		};
+
+		// A budget from a billing period's first day, made and listed with it, then edited in place.
+		let made: Value = send(
+			reqwest::Method::POST,
+			"/ai/v1/admin/budgets",
+			Some(
+				json!({"name": "team", "amount": 10, "period": "since", "starts_on": "2026-10-01"}),
+			),
+		)
+		.await
+		.unwrap()
+		.json()
+		.await
+		.unwrap();
+		assert_eq!(made["starts_on"], "2026-10-01");
+		let budget = made["id"].as_str().unwrap().to_string();
+		let path = format!("/ai/v1/admin/budgets/{budget}");
+		let edited: Value = send(
+			reqwest::Method::PATCH,
+			&path,
+			Some(json!({"amount": 25, "hard": false})),
+		)
+		.await
+		.unwrap()
+		.json()
+		.await
+		.unwrap();
+		assert_eq!(edited["amount"], "25.000000");
+		assert_eq!(edited["hard"], false);
+		assert_eq!(
+			edited["starts_on"], "2026-10-01",
+			"kept when the period is not changed"
+		);
+		let moved: Value = send(
+			reqwest::Method::PATCH,
+			&path,
+			Some(json!({"period": "rolling", "days": 30})),
+		)
+		.await
+		.unwrap()
+		.json()
+		.await
+		.unwrap();
+		assert_eq!(moved["days"], 30);
+		assert_eq!(
+			moved["starts_on"],
+			Value::Null,
+			"a new period takes only what it is given"
+		);
+		let listed: Value = send(reqwest::Method::GET, "/ai/v1/admin/budgets", None)
+			.await
+			.unwrap()
+			.json()
+			.await
+			.unwrap();
+		let row = listed["data"]
+			.as_array()
+			.unwrap()
+			.iter()
+			.find(|b| b["id"] == budget.as_str())
+			.unwrap();
+		assert_eq!(
+			(row["period"].as_str(), row["days"].as_i64()),
+			(Some("rolling"), Some(30))
+		);
+		for (body, status) in [
+			(json!({"period": "since"}), 400),
+			(json!({"amount": -1}), 400),
+			(json!({"user_id": id}), 400),
+		] {
+			assert_eq!(
+				send(reqwest::Method::PATCH, &path, Some(body.clone()))
+					.await
+					.unwrap()
+					.status(),
+				status,
+				"{body}"
+			);
+		}
+		assert_eq!(
+			send(
+				reqwest::Method::PATCH,
+				"/ai/v1/admin/budgets/00000000-0000-0000-0000-000000000001",
+				Some(json!({"amount": 1}))
+			)
+			.await
+			.unwrap()
+			.status(),
+			404
+		);
+
+		// Usage: the daily totals summed and grouped, and filtered to one key.
+		db.execute(
+			"INSERT INTO psyche.usage_daily (day, operation, model, provider, requests, prompt_tokens, \
+			 completion_tokens, cost, key_id) VALUES \
+			 (current_date, 'chat', 'ok-priced', 'fake', 3, 30, 12, 0.003, $1::text::uuid), \
+			 (current_date - 1, 'chat', 'ok-priced', 'fake', 1, 10, 4, 0.001, NULL), \
+			 (current_date - 1, 'embeddings', 'embed', 'fake', 5, 50, 0, 0.0005, NULL), \
+			 (current_date - 40, 'chat', 'ok-priced', 'fake', 9, 90, 9, 0.009, NULL)",
+			&[&id],
+		)
+		.await
+		.unwrap();
+		let usage = |query: &str| {
+			let query = query.to_string();
+			let request = send(
+				reqwest::Method::GET,
+				&format!("/ai/v1/admin/usage{query}"),
+				None,
+			);
+			async move { request.await.unwrap() }
+		};
+		let by_model: Value = usage("?by=model").await.json().await.unwrap();
+		let models = by_model["data"].as_array().unwrap();
+		assert_eq!(models.len(), 2, "{by_model}");
+		assert_eq!(models[0]["model"], "ok-priced", "the most spent first");
+		assert_eq!(
+			models[0]["requests"], 4,
+			"the day forty back is outside the last thirty"
+		);
+		assert_eq!(models[0]["cost"], "0.004");
+		let by_day: Value = usage("?by=day").await.json().await.unwrap();
+		assert_eq!(by_day["data"].as_array().unwrap().len(), 2);
+		let mine: Value = usage(&format!("?by=key&key_id={id}"))
+			.await
+			.json()
+			.await
+			.unwrap();
+		assert_eq!(mine["data"][0]["key"], id.as_str());
+		assert_eq!(mine["data"][0]["requests"], 3);
+		let wide: Value = usage("?by=model&from=2000-01-01&to=2000-12-31")
+			.await
+			.json()
+			.await
+			.unwrap();
+		assert_eq!(wide["data"].as_array().unwrap().len(), 0);
+		for bad in [
+			"?by=colour",
+			"?from=yesterday",
+			"?from=2020-01-01&to=2026-01-01",
+			"?key_id=nope",
+		] {
+			assert_eq!(usage(bad).await.status(), 400, "{bad}");
+		}
+
+		// The log, newest first and paged by `next_before`.
+		db.batch_execute(
+			"CREATE TABLE IF NOT EXISTS psyche.requests_admin_reads PARTITION OF psyche.requests DEFAULT; \
+			 INSERT INTO psyche.requests (at, operation, model, provider, streamed, outcome, first_byte_ms, \
+			 total_ms, cost) VALUES \
+			 (now() - interval '3 seconds', 'chat', 'ok-priced', 'fake', true, 'completed', 5, 9, 0.001), \
+			 (now() - interval '2 seconds', 'chat', 'ok-priced', 'fake', false, 'budget_exceeded', 0, 0, NULL), \
+			 (now() - interval '1 second', 'embeddings', 'embed', 'fake', false, 'completed', 3, 3, 0.0001)",
+		)
+		.await
+		.unwrap();
+		let page: Value = send(reqwest::Method::GET, "/ai/v1/admin/requests?limit=2", None)
+			.await
+			.unwrap()
+			.json()
+			.await
+			.unwrap();
+		let rows = page["data"].as_array().unwrap();
+		assert_eq!((rows.len(), rows[0]["model"].as_str()), (2, Some("embed")));
+		let next = page["next_before"].as_i64().unwrap();
+		let rest: Value = send(
+			reqwest::Method::GET,
+			&format!("/ai/v1/admin/requests?limit=2&before={next}"),
+			None,
+		)
+		.await
+		.unwrap()
+		.json()
+		.await
+		.unwrap();
+		assert_eq!(rest["data"].as_array().unwrap().len(), 1);
+		assert_eq!(rest["data"][0]["outcome"], "completed");
+		assert_eq!(rest["next_before"], Value::Null);
+		let refused: Value = send(
+			reqwest::Method::GET,
+			"/ai/v1/admin/requests?outcome=budget_exceeded",
+			None,
+		)
+		.await
+		.unwrap()
+		.json()
+		.await
+		.unwrap();
+		assert_eq!(refused["data"].as_array().unwrap().len(), 1);
+
+		// None of it is a caller's: a key is refused.
+		assert_eq!(
+			s.client
+				.get(format!("{}/ai/v1/admin/usage", s.base))
+				.bearer_auth(&key)
+				.send()
+				.await
+				.unwrap()
+				.status(),
+			403
+		);
+	}
+
+	#[tokio::test]
 	async fn budgets_hold_under_concurrency_and_a_long_reply_is_refused_before_it_is_sent() {
 		let Some((mut s, _db, key, id)) = with_budgets("budget_race").await else {
 			return;
@@ -3185,6 +3741,25 @@ mod tests {
 		.unwrap();
 		until(&s, alice, &body, 200).await.text().await.unwrap();
 		assert!(listed().await);
+		// The list says what each model costs.
+		let models: Value = s
+			.client
+			.get(format!("{}/ai/v1/models", s.base))
+			.bearer_auth(&token)
+			.send()
+			.await
+			.unwrap()
+			.json()
+			.await
+			.unwrap();
+		let priced = models["data"]
+			.as_array()
+			.unwrap()
+			.iter()
+			.find(|m| m["id"] == "ok-priced")
+			.unwrap();
+		assert_eq!(priced["pricing"]["input"], 1.0);
+		assert_eq!(priced["pricing"]["output"], 2.5);
 
 		// Her own budget spent, she is refused until she has credits, which then pay.
 		let reply = until(&s, alice, &body, 429).await;
