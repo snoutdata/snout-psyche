@@ -218,7 +218,8 @@ pub struct Held {
 	pub budgets: Option<crate::budgets::Budgets>,
 	pub limits: Option<crate::limits::Limits>,
 	pub members: crate::who::Members,
-	pub credentials: Option<crate::credentials::Held>,
+	/// The providers, models and credentials (`models.rs`).
+	pub catalogue: Option<crate::models::Held>,
 }
 
 /// Which tables to read again.
@@ -228,7 +229,7 @@ struct Stale {
 	budgets: bool,
 	limits: bool,
 	members: bool,
-	credentials: bool,
+	catalogue: bool,
 }
 
 impl Stale {
@@ -237,7 +238,7 @@ impl Stale {
 		budgets: true,
 		limits: true,
 		members: true,
-		credentials: true,
+		catalogue: true,
 	};
 
 	/// From a notification's payload, the table that changed. A group deleted takes its budgets,
@@ -253,7 +254,7 @@ impl Stale {
 			"budgets" => self.budgets = true,
 			"limits" => self.limits = true,
 			"members" => self.members = true,
-			"credentials" => self.credentials = true,
+			"credentials" | "providers" | "models" => self.catalogue = true,
 			"groups" => {
 				self.budgets = true;
 				self.limits = true;
@@ -264,10 +265,10 @@ impl Stale {
 	}
 }
 
-/// Keeps `held` in step with `psyche.keys`, `budgets`, `limits`, `members` and `credentials` for as long as the
-/// process runs: loads them, then reloads the table each `psyche_changed` names and all of them
-/// every [`RELOAD_EVERY`], reconnecting when the connection is lost. `ready` is told after the first
-/// load.
+/// Keeps `held` in step with `psyche.keys`, `budgets`, `limits`, `members`, `providers`, `models`
+/// and `credentials` for as long as the process runs: loads them, then reloads the table each
+/// `psyche_changed` names and all of them every [`RELOAD_EVERY`], reconnecting when the connection
+/// is lost. `ready` is told after the first load.
 pub async fn watch(url: String, held: Held, ready: Option<tokio::sync::oneshot::Sender<()>>) {
 	let mut ready = ready;
 	loop {
@@ -298,8 +299,8 @@ async fn listen(
 		if let Some(limits) = held.limits.as_ref().filter(|_| stale.limits) {
 			limits.replace(crate::limits::load(client).await?);
 		}
-		if let Some(credentials) = held.credentials.as_ref().filter(|_| stale.credentials) {
-			credentials.replace(&crate::credentials::load(client).await?);
+		if let Some(catalogue) = held.catalogue.as_ref().filter(|_| stale.catalogue) {
+			catalogue.reload(client).await?;
 		}
 		Ok(())
 	};

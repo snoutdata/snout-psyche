@@ -65,6 +65,37 @@ impl Price {
 	}
 }
 
+/// Picodollars per token as dollars per million tokens, the way prices are written.
+fn per_million(picodollars: u64) -> f64 {
+	picodollars as f64 / 1_000_000.0
+}
+
+fn rates_json(rates: &Rates) -> serde_json::Value {
+	serde_json::json!({
+		"input": per_million(rates.input),
+		"output": per_million(rates.output),
+		"cache_read": per_million(rates.cache_read),
+		"cache_write": per_million(rates.cache_write),
+	})
+}
+
+impl Price {
+	/// The price as it is written (dollars per million tokens, the fee in dollars), for the admin
+	/// API.
+	pub fn to_json(&self) -> serde_json::Value {
+		let mut out = rates_json(&self.rates);
+		if self.request > 0 {
+			out["request"] = serde_json::json!(self.request as f64 / PICO as f64);
+		}
+		if let Some((above, long)) = &self.long_context {
+			let mut long = rates_json(long);
+			long["above"] = serde_json::json!(above);
+			out["long_context"] = long;
+		}
+		out
+	}
+}
+
 /// How a price is written: dollars per million tokens.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -276,6 +307,25 @@ impl tokio_postgres::types::ToSql for Dollars {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn a_price_reads_back_as_it_was_written() {
+		let written = serde_json::json!({"input": 2.2, "output": 11, "cache_read": 0.11, "request": 0.001,
+			"long_context": {"above": 272000, "input": 4.4, "output": 22}});
+		let price = serde_json::from_value::<PriceEntry>(written)
+			.unwrap()
+			.price()
+			.unwrap();
+		let shown = price.to_json();
+		assert_eq!(shown["input"], 2.2);
+		assert_eq!(shown["cache_write"], 2.2, "defaults to the input price");
+		assert_eq!(shown["long_context"]["above"], 272000);
+		let again = serde_json::from_value::<PriceEntry>(shown)
+			.unwrap()
+			.price()
+			.unwrap();
+		assert_eq!(again, price);
+	}
 	use bytes::BytesMut;
 	use tokio_postgres::types::{ToSql, Type};
 

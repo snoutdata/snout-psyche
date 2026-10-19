@@ -99,13 +99,14 @@ keys, and only the service key works.
 
 ## Configuration
 
-Every setting is an environment variable. Nothing secret has a default: without its JWT secret and
-its providers file the server refuses to start, and says which one is missing.
+Every setting is an environment variable. Nothing secret has a default: without its JWT secret, and
+without a providers file or a database to keep its providers in, the server refuses to start and
+says what is missing.
 
 | Variable | Default | Secret | What it is |
 | --- | --- | --- | --- |
 | `PSYCHE_JWT_SECRET` | (required) | yes | The project's JWT secret, which callers' tokens are verified with. At least 32 characters. |
-| `PSYCHE_PROVIDERS_FILE` | (required) | no | The providers and models file (below). |
+| `PSYCHE_PROVIDERS_FILE` | (required without `DATABASE_URL`) | no | The providers and models file (below). With a database it seeds the providers and models tables, and may be left out. |
 | `PSYCHE_ADDR` | `0.0.0.0:5300` | no | Where the API listens. |
 | `PSYCHE_EGRESS` | `public` | no | `public`: https to public addresses only. `private`: anywhere, http included, for a self-hosted server beside its own model servers. |
 | `PSYCHE_FIRST_BYTE_TIMEOUT_S` | `300` | no | How long to wait for a provider's response to begin. |
@@ -156,10 +157,41 @@ length asked for when the caller names none: Anthropic requires one on every req
 either Psyche asks for 4096. A provider with no `api_key_env` is sent no key. A mistake (an unknown provider, a name used twice, a key variable
 that is not set, an http URL under `public` egress) stops the server at start with its name.
 
+### Providers and models in the database
+
+With a database, the providers and models are rows of `psyche.providers` and `psyche.models`, and
+those rows are what Psyche serves. The providers file, when there is one, is written into them at
+each start. The admin API (service key) and plain SQL add and change them, and a change is served
+at once, with no restart:
+
+```sh
+curl -X PUT $PSYCHE/ai/v1/admin/providers/openai -H "Authorization: Bearer $SERVICE_KEY" \
+  -d '{"kind": "openai", "base_url": "https://api.openai.com/v1", "credential": "openai"}'
+curl -X PUT $PSYCHE/ai/v1/admin/models/fast -H "Authorization: Bearer $SERVICE_KEY" \
+  -d '{"provider": "openai", "upstream": "gpt-4o-mini", "price": {"input": 0.15, "output": 0.6}}'
+# GET /ai/v1/admin/providers and /ai/v1/admin/models list them; DELETE removes one.
+```
+
+A model takes the same fields as in the file, plus `"enabled": false` to stop serving it. A model's
+name may contain `/` (`openai/gpt-4o`). Before a model is written it is built against its provider,
+so one that could not be served is refused with the reason and nothing is stored. The model list
+shows the price each model is charged at and where it comes from (`model`, its own; `catalogue`,
+the one Psyche ships; none), and a row that is not served says why.
+
+Two rules keep the file and the tables apart:
+
+- **A provider from the file stays the file's.** Its key may come from Psyche's environment, so the
+  admin API refuses to change or remove it (409), and a row changed in SQL is not served until the
+  next start writes the file's back. Psyche never sends an environment key anywhere the file did not
+  name. A provider made through the API takes a stored credential, or no key at all.
+- **A model from the file can be edited**: its price, its limits, whether it is served. The edit
+  marks it `edited`, and the file no longer writes over it. Removing one through the API disables
+  it rather than deleting it, since the next start would put it back.
+
 ### Stored credentials
 
 With a database, a provider can take its key from Psyche instead of the environment: name a
-credential in the file, then set it with the service key.
+credential on the provider (in the file or through the admin API), then set it with the service key.
 
 ```json
 {"name": "openai", "kind": "openai", "base_url": "https://api.openai.com/v1", "credential": "openai"}
@@ -286,7 +318,8 @@ can show "your AI usage" with the data API and no code of its own. The policies 
 ### Prices
 
 A call's cost is the tokens the provider reported at the model's price. The price comes from the
-model's `price` in the providers file, in US dollars per million tokens as providers publish them:
+model's `price` (in the providers file, or on its row), in US dollars per million tokens as
+providers publish them:
 
 ```json
 {"name": "sonnet", "provider": "bedrock", "upstream": "us.anthropic.claude-sonnet-5-5",

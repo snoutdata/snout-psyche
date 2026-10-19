@@ -24,6 +24,7 @@ pub mod layout;
 pub mod limits;
 pub mod log;
 pub mod migrations;
+pub mod models;
 pub mod net;
 pub mod price;
 pub mod providers;

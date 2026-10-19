@@ -17,9 +17,11 @@ pub struct Config {
 	/// `PSYCHE_JWT_SECRET` (secret, required): the project's JWT secret, which callers' tokens are
 	/// verified with. At least 32 characters.
 	pub jwt_secret: String,
-	/// `PSYCHE_PROVIDERS_FILE` (required): the catalogue (`providers.rs`). The file holds no keys;
-	/// it names the environment variables that do, and those are secret.
-	pub providers_file: String,
+	/// `PSYCHE_PROVIDERS_FILE`: the catalogue (`providers.rs`). The file holds no keys; it names the
+	/// environment variables that do, and those are secret. Required without a database; with one
+	/// it only seeds `psyche.providers` and `psyche.models` (`models.rs`), and may be left out when
+	/// they are managed through the admin API.
+	pub providers_file: Option<String>,
 	/// `PSYCHE_EGRESS`, `public` (default) or `private`: where Psyche may send (`net.rs`).
 	pub egress: Egress,
 	pub timeouts: Timeouts,
@@ -110,10 +112,14 @@ impl Config {
 				"PSYCHE_JWT_SECRET is at least 32 characters.".into(),
 			));
 		}
-		let providers_file = require(
-			"PSYCHE_PROVIDERS_FILE",
-			"the file that lists the providers and models Psyche serves",
-		)?;
+		let providers_file = match get("PSYCHE_PROVIDERS_FILE") {
+			Some(file) => Some(file),
+			None if get("DATABASE_URL").is_some() => None,
+			None => Some(require(
+				"PSYCHE_PROVIDERS_FILE",
+				"the file that lists the providers and models Psyche serves (or DATABASE_URL, to keep them in tables)",
+			)?),
+		};
 		let addr = get("PSYCHE_ADDR").unwrap_or_else(|| "0.0.0.0:5300".into());
 		let addr = addr
 			.parse::<SocketAddr>()
@@ -201,6 +207,9 @@ mod tests {
 		);
 		let config = Config::from_map(&env).unwrap();
 		assert_eq!(config.log.unwrap().retention_days, 30);
+		// With a database the providers can live in its tables alone.
+		env.remove("PSYCHE_PROVIDERS_FILE");
+		assert_eq!(Config::from_map(&env).unwrap().providers_file, None);
 	}
 
 	#[test]

@@ -47,6 +47,7 @@ use crate::error::{ApiError, Class, scrub};
 use crate::jwt::{self, Role};
 use crate::keys::{self, Key, KeyId, Refusal};
 use crate::limits::{self, Limits, Taken};
+use crate::models;
 use crate::net;
 use crate::price::{Dollars, Price};
 use crate::providers::{Kind, Live, Model, Provider};
@@ -65,10 +66,11 @@ const EMBED_CONCURRENCY: usize = 8;
 
 /// The server: the catalogue, the one outbound client, and the rules for callers.
 pub struct Proxy {
-	/// The catalogue calls use: the providers file's, with any stored credentials filled in.
+	/// The catalogue calls use: the providers file's, or with a database the providers and models
+	/// tables', with any stored credentials filled in.
 	pub catalogue: Live,
-	/// The providers file's catalogue and the stored credentials, when there is a database.
-	pub credentials: Option<credentials::Held>,
+	/// The tables behind it (`models.rs`), when there is a database.
+	pub tables: Option<models::Held>,
 	pub http: reqwest::Client,
 	pub jwt_secret: String,
 	pub timeouts: Timeouts,
@@ -403,6 +405,13 @@ pub fn router(proxy: Arc<Proxy>) -> Router {
 			"/admin/members/{user_id}",
 			put(set_member).delete(remove_member),
 		)
+		.route("/admin/providers", get(list_providers))
+		.route(
+			"/admin/providers/{name}",
+			put(set_provider).delete(delete_provider),
+		)
+		.route("/admin/models", get(list_models))
+		.route("/admin/models/{*name}", put(set_model).delete(delete_model))
 		.route("/admin/credentials", get(list_credentials))
 		.route(
 			"/admin/credentials/{name}",
@@ -732,31 +741,161 @@ fn admin_body<T: serde::de::DeserializeOwned>(
 		.map_err(|e| ApiError::new(Class::BadRequest, format!("{}: {e}", known())))
 }
 
-/// The stored credentials, for the admin API: who has them, never what they are.
-fn held_credentials(proxy: &Proxy) -> Result<&credentials::Held, ApiError> {
-	proxy.credentials.as_ref().ok_or_else(|| {
+/// The providers, models and credentials tables, for the admin API.
+fn held_tables(proxy: &Proxy) -> Result<&models::Held, ApiError> {
+	proxy.tables.as_ref().ok_or_else(|| {
 		ApiError::new(
 			Class::BadRequest,
-			"This Psyche has no database (DATABASE_URL), so it stores no credentials.",
+			"This Psyche has no database (DATABASE_URL), so its providers and models are its providers file and nothing else.",
 		)
 	})
 }
 
-/// Reads the credentials again after the admin API changed them, so the next call uses them.
-async fn reload_credentials(held: &credentials::Held, client: &tokio_postgres::Client) {
-	match credentials::load(client).await {
-		Ok(stored) => held.replace(&stored),
-		Err(error) => {
-			tracing::warn!(error = %crate::db_message(&error), "could not reload the credentials")
+/// Reads the catalogue again after the admin API changed a credential, so the next call uses it.
+async fn reload_credentials(held: &models::Held, client: &tokio_postgres::Client) {
+	if let Err(error) = held.reload(client).await {
+		tracing::warn!(error = %crate::db_message(&error), "could not reload the credentials")
+	}
+}
+
+fn refused(refusal: models::Refused) -> ApiError {
+	match refusal {
+		models::Refused::Invalid(message) => ApiError::new(Class::BadRequest, message),
+		models::Refused::Conflict(message) => {
+			let mut error = ApiError::new(Class::BadRequest, message);
+			error.status = Some(StatusCode::CONFLICT);
+			error
 		}
+		models::Refused::NotFound(message) => not_found(&message),
+		models::Refused::Database(error) => database_error(&error),
+	}
+}
+
+async fn list_providers(State(proxy): State<Arc<Proxy>>, headers: HeaderMap) -> Response {
+	let result = async {
+		let (_, client) = admin(&proxy, &headers).await?;
+		let held = held_tables(&proxy)?;
+		models::list_providers(&client, held).await.map_err(refused)
+	}
+	.await;
+	match result {
+		Ok(data) => axum::Json(json!({"object": "list", "data": data})).into_response(),
+		Err(error) => error.into_response(),
+	}
+}
+
+async fn set_provider(
+	State(proxy): State<Arc<Proxy>>,
+	headers: HeaderMap,
+	Path(name): Path<String>,
+	body: Result<Bytes, BytesRejection>,
+) -> Response {
+	let result = async {
+		let (_, client) = admin(&proxy, &headers).await?;
+		let held = held_tables(&proxy)?;
+		let body = body.map_err(|r| ApiError::new(Class::BadRequest, r.body_text()))?;
+		let new: models::NewProvider = serde_json::from_slice(&body).map_err(|e| {
+			ApiError::new(
+				Class::BadRequest,
+				format!("A provider is made from kind, base_url, region and credential: {e}"),
+			)
+		})?;
+		models::put_provider(&client, held, &name, new)
+			.await
+			.map_err(refused)
+	}
+	.await;
+	match result {
+		Ok(made) => axum::Json(made).into_response(),
+		Err(error) => error.into_response(),
+	}
+}
+
+async fn delete_provider(
+	State(proxy): State<Arc<Proxy>>,
+	headers: HeaderMap,
+	Path(name): Path<String>,
+) -> Response {
+	let result = async {
+		let (_, client) = admin(&proxy, &headers).await?;
+		let held = held_tables(&proxy)?;
+		models::delete_provider(&client, held, &name)
+			.await
+			.map_err(refused)
+	}
+	.await;
+	match result {
+		Ok(()) => StatusCode::NO_CONTENT.into_response(),
+		Err(error) => error.into_response(),
+	}
+}
+
+async fn list_models(State(proxy): State<Arc<Proxy>>, headers: HeaderMap) -> Response {
+	let result = async {
+		let (_, client) = admin(&proxy, &headers).await?;
+		let held = held_tables(&proxy)?;
+		models::list_models(&client, held).await.map_err(refused)
+	}
+	.await;
+	match result {
+		Ok(data) => axum::Json(json!({"object": "list", "data": data})).into_response(),
+		Err(error) => error.into_response(),
+	}
+}
+
+async fn set_model(
+	State(proxy): State<Arc<Proxy>>,
+	headers: HeaderMap,
+	Path(name): Path<String>,
+	body: Result<Bytes, BytesRejection>,
+) -> Response {
+	let result = async {
+		let (_, client) = admin(&proxy, &headers).await?;
+		let held = held_tables(&proxy)?;
+		let body = body.map_err(|r| ApiError::new(Class::BadRequest, r.body_text()))?;
+		let new: models::NewModel = serde_json::from_slice(&body).map_err(|e| {
+			ApiError::new(
+				Class::BadRequest,
+				format!(
+					"A model is made from provider, upstream, prompt_caching, max_output_tokens, reasoning, embeddings, price and enabled: {e}"
+				),
+			)
+		})?;
+		models::put_model(&client, held, &name, new)
+			.await
+			.map_err(refused)
+	}
+	.await;
+	match result {
+		Ok(made) => axum::Json(made).into_response(),
+		Err(error) => error.into_response(),
+	}
+}
+
+async fn delete_model(
+	State(proxy): State<Arc<Proxy>>,
+	headers: HeaderMap,
+	Path(name): Path<String>,
+) -> Response {
+	let result = async {
+		let (_, client) = admin(&proxy, &headers).await?;
+		let held = held_tables(&proxy)?;
+		models::delete_model(&client, held, &name)
+			.await
+			.map_err(refused)
+	}
+	.await;
+	match result {
+		Ok(done) => axum::Json(done).into_response(),
+		Err(error) => error.into_response(),
 	}
 }
 
 async fn list_credentials(State(proxy): State<Arc<Proxy>>, headers: HeaderMap) -> Response {
 	let result = async {
 		let (_, client) = admin(&proxy, &headers).await?;
-		let held = held_credentials(&proxy)?;
-		credentials::list(&client, &held.base)
+		let held = held_tables(&proxy)?;
+		credentials::list(&client, &held.live.get())
 			.await
 			.map_err(|e| database_error(&e))
 	}
@@ -777,7 +916,8 @@ async fn set_credential(
 ) -> Response {
 	let result = async {
 		let (_, client) = admin(&proxy, &headers).await?;
-		let held = held_credentials(&proxy)?;
+		let held = held_tables(&proxy)?;
+		let served = held.live.get();
 		let name = credentials::name(&name).map_err(|m| ApiError::new(Class::BadRequest, m))?;
 		let body = body.map_err(|r| ApiError::new(Class::BadRequest, r.body_text()))?;
 		let new: credentials::NewCredential = serde_json::from_slice(&body)
@@ -785,8 +925,7 @@ async fn set_credential(
 		let stored = new
 			.stored()
 			.map_err(|m| ApiError::new(Class::BadRequest, m))?;
-		let providers: Vec<&Provider> = held
-			.base
+		let providers: Vec<&Provider> = served
 			.credentialed()
 			.into_iter()
 			.filter(|p| p.credential.as_deref() == Some(name))
@@ -795,12 +934,12 @@ async fn set_credential(
 			return Err(ApiError::new(
 				Class::BadRequest,
 				format!(
-					"No provider in the providers file takes the credential {name}, so it cannot be checked. Name it with \"credential\": \"{name}\" first."
+					"No provider that serves a model takes the credential {name}, so it cannot be checked. Name it with \"credential\": \"{name}\" on a provider with a model first."
 				),
 			));
 		}
 		for provider in providers {
-			let model = held.base.first_model_of(&provider.name).ok_or_else(|| {
+			let model = served.first_model_of(&provider.name).ok_or_else(|| {
 				ApiError::new(
 					Class::BadRequest,
 					format!("{} serves no model, so the credential cannot be checked.", provider.name),
@@ -830,7 +969,7 @@ async fn delete_credential(
 ) -> Response {
 	let result = async {
 		let (_, client) = admin(&proxy, &headers).await?;
-		let held = held_credentials(&proxy)?;
+		let held = held_tables(&proxy)?;
 		let name = credentials::name(&name).map_err(|m| ApiError::new(Class::BadRequest, m))?;
 		let deleted = client
 			.execute("DELETE FROM psyche.credentials WHERE name = $1", &[&name])
@@ -2284,7 +2423,7 @@ mod tests {
 		base: String,
 		fake: Fake,
 		/// The file's catalogue and the live one, for a watcher a test starts.
-		credentials: credentials::Held,
+		tables: models::Held,
 		calls: tokio::sync::mpsc::UnboundedReceiver<Call>,
 		client: reqwest::Client,
 	}
@@ -2317,7 +2456,7 @@ mod tests {
 			limits: Option<Limits>,
 		) -> Self {
 			let fake = Fake::start().await;
-			let catalogue = crate::providers::Catalogue::from_json(
+			let file = crate::providers::Spec::from_json(
 				&format!(
 					r#"{{"providers": [
 						{{"name": "fake", "kind": "openai", "base_url": "{0}/v1", "api_key_env": "FAKE_KEY"}},
@@ -2376,14 +2515,11 @@ mod tests {
 				timeouts.idle = Duration::from_secs(5);
 			}
 			let (tx, calls) = tokio::sync::mpsc::unbounded_channel();
-			let live = Live::new(catalogue.clone());
-			let held = credentials::Held {
-				base: catalogue,
-				live: live.clone(),
-			};
+			let live = Live::new(crate::providers::Catalogue::build(&file).unwrap());
+			let held = models::Held::new(file, live.clone(), Egress::Private);
 			let proxy = Arc::new(Proxy {
 				catalogue: live,
-				credentials: keys.as_ref().map(|_| held.clone()),
+				tables: keys.as_ref().map(|_| held.clone()),
 				http: net::client(Egress::Private).unwrap(),
 				jwt_secret: SECRET.into(),
 				timeouts,
@@ -2399,7 +2535,7 @@ mod tests {
 			Self {
 				base,
 				fake,
-				credentials: held,
+				tables: held,
 				calls,
 				client: reqwest::Client::new(),
 			}
@@ -2546,7 +2682,7 @@ mod tests {
 				members: Members::default(),
 				budgets: None,
 				limits: None,
-				credentials: None,
+				catalogue: None,
 			},
 			Some(ready),
 		));
@@ -2683,7 +2819,7 @@ mod tests {
 
 	/// Psyche with keys and budgets, on a fresh database, and a key of its own.
 	async fn with_budgets(name: &str) -> Option<(Setup, tokio_postgres::Client, String, String)> {
-		let (db, url) = crate::log::tests::fresh_database(name).await?;
+		let (mut db, url) = crate::log::tests::fresh_database(name).await?;
 		let store = keys::Store::default();
 		let members = Members::default();
 		let budgets = Budgets::default();
@@ -2700,6 +2836,13 @@ mod tests {
 			Some(limits.clone()),
 		)
 		.await;
+		// As at start: the file written into the tables, which are then what is served.
+		assert!(
+			models::seed(&mut db, &s.tables.file)
+				.await
+				.unwrap()
+				.is_empty()
+		);
 		let (ready, loaded) = tokio::sync::oneshot::channel();
 		tokio::spawn(keys::watch(
 			url,
@@ -2708,7 +2851,7 @@ mod tests {
 				budgets: Some(budgets),
 				limits: Some(limits),
 				members,
-				credentials: Some(s.credentials.clone()),
+				catalogue: Some(s.tables.clone()),
 			},
 			Some(ready),
 		));
@@ -3252,6 +3395,306 @@ mod tests {
 			.unwrap();
 		assert_eq!(gone.status(), 204);
 		assert_eq!(call("via-store-aws").await.unwrap().status(), 502);
+	}
+
+	#[tokio::test]
+	async fn providers_and_models_are_tables_the_file_seeds_and_the_admin_api_edits() {
+		let Some((mut s, mut db, _key, _id)) = with_budgets("models").await else {
+			return;
+		};
+		// The calls below borrow these rather than `s`, which the call log needs mutably.
+		let (client, base) = (s.client.clone(), s.base.clone());
+		let (client, base) = (&client, &base);
+		let service = || jwt::sign(&json!({"role": "service_role"}), SECRET);
+		let admin = |method: reqwest::Method, path: &str, body: Option<Value>| {
+			let request = client
+				.request(method, format!("{base}/ai/v1/admin/{path}"))
+				.bearer_auth(service());
+			match body {
+				Some(body) => request.json(&body).send(),
+				None => request.send(),
+			}
+		};
+		let list = |what: &'static str| async move {
+			let listed: Value = admin(reqwest::Method::GET, what, None)
+				.await
+				.unwrap()
+				.json()
+				.await
+				.unwrap();
+			listed["data"].as_array().unwrap().clone()
+		};
+		let row = |rows: &[Value], name: &str| {
+			rows.iter()
+				.find(|r| r["name"] == name)
+				.unwrap_or_else(|| panic!("{name} in {rows:?}"))
+				.clone()
+		};
+		let call = |model: &str| {
+			client
+				.post(format!("{base}/ai/v1/chat/completions"))
+				.bearer_auth(service())
+				.json(&chat(model, false))
+				.send()
+		};
+		// A change made in SQL reaches Psyche through the trigger; waits until `model` answers
+		// `status`.
+		let until = |model: &'static str, status: u16| async move {
+			for _ in 0..250 {
+				if call(model).await.unwrap().status() == status {
+					return true;
+				}
+				tokio::time::sleep(Duration::from_millis(20)).await;
+			}
+			false
+		};
+
+		// The file is in the tables, and is what is served.
+		let models = list("models").await;
+		let ok = row(&models, "ok");
+		assert_eq!(
+			(
+				ok["origin"].clone(),
+				ok["served"].clone(),
+				ok["edited"].clone()
+			),
+			(json!("file"), json!(true), json!(false))
+		);
+		assert_eq!(
+			ok["price_from"],
+			Value::Null,
+			"the fake is not in the catalogue"
+		);
+		let priced = row(&models, "ok-priced");
+		assert_eq!(priced["price_from"], "model");
+		assert_eq!(priced["price"]["input"], 1.0);
+		assert_eq!(priced["price"]["output"], 2.5);
+		let providers = list("providers").await;
+		assert_eq!(row(&providers, "fake")["key"], "environment");
+		let stored = row(&providers, "stored");
+		assert_eq!(stored["key"], "credential");
+		assert_eq!(stored["credential_stored"], false);
+		assert!(!Value::Array(providers).to_string().contains(Fake::KEY));
+
+		// The file's providers are the file's: their key may be Psyche's own.
+		let (status, _, message) = error_of(
+			admin(
+				reqwest::Method::PUT,
+				"providers/fake",
+				Some(json!({"kind": "openai", "base_url": "https://elsewhere.example/v1"})),
+			)
+			.await
+			.unwrap(),
+		)
+		.await;
+		assert_eq!(status, 409);
+		assert!(message.contains("providers file"), "{message}");
+		let gone = admin(reqwest::Method::DELETE, "providers/fake", None);
+		assert_eq!(gone.await.unwrap().status(), 409);
+
+		// A provider and a model made here, then its credential, proven on that model: no restart.
+		let origin = s.fake.origin.clone();
+		let made = admin(
+			reqwest::Method::PUT,
+			"providers/mine",
+			Some(
+				json!({"kind": "openai", "base_url": format!("{origin}/v1"), "credential": "mine"}),
+			),
+		);
+		assert_eq!(made.await.unwrap().status(), 200);
+		let made: Value = admin(
+			reqwest::Method::PUT,
+			"models/mine-ok",
+			Some(
+				json!({"provider": "mine", "upstream": "fake-ok", "price": {"input": 3, "output": 6}}),
+			),
+		)
+		.await
+		.unwrap()
+		.json()
+		.await
+		.unwrap();
+		assert_eq!(made["price_from"], "model", "{made}");
+		let (status, code, _) = error_of(call("mine-ok").await.unwrap()).await;
+		assert_eq!((status, code.as_str()), (502, "provider_auth"));
+		let proven = admin(
+			reqwest::Method::PUT,
+			"credentials/mine",
+			Some(json!({"api_key": Fake::KEY})),
+		);
+		assert_eq!(proven.await.unwrap().status(), 200);
+		while s.calls.try_recv().is_ok() {}
+		assert_eq!(call("mine-ok").await.unwrap().status(), 200);
+		assert_eq!(s.fake.last().body["model"], "fake-ok");
+		let charged = s.call().await;
+		assert_eq!(charged.model, "mine-ok");
+		assert_eq!(
+			charged.price.unwrap().rates.input,
+			3_000_000,
+			"the row's price"
+		);
+
+		// A model with a slash in its name, as OpenRouter's are.
+		let made = admin(
+			reqwest::Method::PUT,
+			"models/org/ok",
+			Some(json!({"provider": "fake", "upstream": "fake-ok"})),
+		);
+		assert_eq!(made.await.unwrap().status(), 200);
+		assert_eq!(call("org/ok").await.unwrap().status(), 200);
+
+		// What cannot be served is refused with the reason, and nothing is written.
+		for (path, body, said) in [
+			(
+				"models/x",
+				json!({"provider": "nobody"}),
+				"no provider named nobody",
+			),
+			(
+				"models/x",
+				json!({"provider": "fake", "embeddings": "titan"}),
+				"only a Bedrock model",
+			),
+			(
+				"models/x",
+				json!({"provider": "fake", "price": {"input": -1, "output": 1}}),
+				"price",
+			),
+			(
+				"models/x",
+				json!({"provider": "fake", "max_output_tokens": 0}),
+				"max_output_tokens",
+			),
+			(
+				"models/x",
+				json!({"provider": "fake", "api_key": "k"}),
+				"unknown field",
+			),
+			(
+				"providers/b",
+				json!({"kind": "bedrock", "region": "us-west-2"}),
+				"stored credential",
+			),
+			(
+				"providers/p",
+				json!({"kind": "openai", "base_url": "ftp://example.com"}),
+				"",
+			),
+			(
+				"providers/p",
+				json!({"kind": "openai", "base_url": format!("{origin}/v1"), "region": "us-west-2"}),
+				"region",
+			),
+		] {
+			let (status, _, message) = error_of(
+				admin(reqwest::Method::PUT, path, Some(body.clone()))
+					.await
+					.unwrap(),
+			)
+			.await;
+			assert_eq!(status, 400, "{body}: {message}");
+			assert!(message.contains(said), "{body}: {message}");
+		}
+		let x: i64 = db
+			.query_one("SELECT count(*) FROM psyche.models WHERE name = 'x'", &[])
+			.await
+			.unwrap()
+			.get(0);
+		assert_eq!(x, 0);
+
+		// A model from the file is edited in place, and the next start leaves the edit alone.
+		let edited = admin(
+			reqwest::Method::PUT,
+			"models/ok",
+			Some(
+				json!({"provider": "fake", "upstream": "fake-ok", "price": {"input": 5, "output": 5}}),
+			),
+		);
+		assert_eq!(edited.await.unwrap().status(), 200);
+		assert!(
+			models::seed(&mut db, &s.tables.file)
+				.await
+				.unwrap()
+				.is_empty()
+		);
+		s.tables.reload(&db).await.unwrap();
+		let ok = row(&list("models").await, "ok");
+		assert_eq!(
+			(ok["edited"].clone(), ok["price"]["input"].clone()),
+			(json!(true), json!(5.0))
+		);
+
+		// Removed, it is disabled, since the next start would put it back; and it stays away.
+		let removed: Value = admin(reqwest::Method::DELETE, "models/ok", None)
+			.await
+			.unwrap()
+			.json()
+			.await
+			.unwrap();
+		assert_eq!(
+			removed,
+			json!({"name": "ok", "deleted": false, "disabled": true})
+		);
+		assert!(
+			models::seed(&mut db, &s.tables.file)
+				.await
+				.unwrap()
+				.is_empty()
+		);
+		s.tables.reload(&db).await.unwrap();
+		let (status, code, _) = error_of(call("ok").await.unwrap()).await;
+		assert_eq!((status, code.as_str()), (404, "model_not_found"));
+
+		// Made in plain SQL, a model is served at once.
+		db.batch_execute(
+			"INSERT INTO psyche.models (name, provider, upstream) VALUES ('sql-made', 'fake', 'fake-ok')",
+		)
+		.await
+		.unwrap();
+		assert!(until("sql-made", 200).await, "the insert reached Psyche");
+
+		// A file provider changed in SQL is not served with the environment's key at an address
+		// the file did not name; the next start puts the file's back.
+		db.batch_execute(
+			"UPDATE psyche.providers SET base_url = 'http://127.0.0.1:9/v1' WHERE name = 'fake'",
+		)
+		.await
+		.unwrap();
+		assert!(
+			until("sql-made", 404).await,
+			"the file's provider is left out"
+		);
+		let fake = row(&list("providers").await, "fake");
+		assert!(
+			fake["problem"].as_str().unwrap().contains("providers file"),
+			"{fake}"
+		);
+		let sql_made = row(&list("models").await, "sql-made");
+		assert_eq!(sql_made["served"], false);
+		assert!(sql_made["problem"].as_str().is_some(), "{sql_made}");
+		models::seed(&mut db, &s.tables.file).await.unwrap();
+		assert!(until("sql-made", 200).await, "the file's provider is back");
+
+		// A provider with models is not removed; without them it is.
+		let (status, _, message) = error_of(
+			admin(reqwest::Method::DELETE, "providers/mine", None)
+				.await
+				.unwrap(),
+		)
+		.await;
+		assert_eq!(status, 409);
+		assert!(message.contains("mine-ok"), "{message}");
+		let removed: Value = admin(reqwest::Method::DELETE, "models/mine-ok", None)
+			.await
+			.unwrap()
+			.json()
+			.await
+			.unwrap();
+		assert_eq!(removed["deleted"], true);
+		let gone = admin(reqwest::Method::DELETE, "providers/mine", None);
+		assert_eq!(gone.await.unwrap().status(), 204);
+		let (status, code, _) = error_of(call("mine-ok").await.unwrap()).await;
+		assert_eq!((status, code.as_str()), (404, "model_not_found"));
 	}
 
 	#[test]

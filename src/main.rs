@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use axum::serve::ListenerExt;
 use snout_psyche::config::Config;
-use snout_psyche::providers::Catalogue;
+use snout_psyche::providers::{Catalogue, Spec};
 use snout_psyche::proxy::{Keys, Proxy, router};
 
 #[tokio::main]
@@ -22,33 +22,26 @@ async fn main() {
 	}
 
 	let config = Config::from_env().unwrap_or_else(|error| fail(2, &error.to_string()));
-	let text = std::fs::read_to_string(&config.providers_file).unwrap_or_else(|error| {
-		fail(
-			2,
-			&format!(
-				"cannot read PSYCHE_PROVIDERS_FILE ({}): {error}",
-				config.providers_file
-			),
-		)
-	});
-	let catalogue = Catalogue::from_json(&text, &std::env::vars().collect(), config.egress)
-		.unwrap_or_else(|error| fail(2, &error.to_string()));
-	let http = snout_psyche::net::client(config.egress).unwrap_or_else(|error| fail(1, &error));
-	let models = catalogue.models().len();
-	for model in catalogue.unpriced() {
-		// PS14: served, and logged with no cost. A price in the providers file silences it.
-		tracing::warn!(
-			model,
-			"no price for this model: its calls are logged with no cost; give it a price in the providers file"
-		);
-	}
-	// What calls use: the file's catalogue, with stored credentials filled in once they are loaded.
-	let live = snout_psyche::providers::Live::new(catalogue.clone());
-	let credentials = snout_psyche::credentials::Held {
-		base: catalogue,
-		live: live.clone(),
+	// The providers file: the catalogue itself without a database, its seed with one.
+	let file = match &config.providers_file {
+		None => Spec::default(),
+		Some(path) => {
+			let text = std::fs::read_to_string(path).unwrap_or_else(|error| {
+				fail(
+					2,
+					&format!("cannot read PSYCHE_PROVIDERS_FILE ({path}): {error}"),
+				)
+			});
+			Spec::from_json(&text, &std::env::vars().collect(), config.egress)
+				.unwrap_or_else(|error| fail(2, &error.to_string()))
+		}
 	};
-	let held_credentials = config.log.is_some().then(|| credentials.clone());
+	let catalogue = Catalogue::build(&file).unwrap_or_else(|error| fail(2, &error.to_string()));
+	let http = snout_psyche::net::client(config.egress).unwrap_or_else(|error| fail(1, &error));
+	// What calls use: the file's catalogue, until the tables are read.
+	let live = snout_psyche::providers::Live::new(catalogue);
+	let tables = snout_psyche::models::Held::new(file, live.clone(), config.egress);
+	let held_tables = config.log.is_some().then(|| tables.clone());
 	// The request log: the schema migrated before the first call, then a task of its own that the
 	// calls are handed to. A database that cannot be migrated stops the start, since a log that
 	// silently is not kept is worse than none.
@@ -91,7 +84,7 @@ async fn main() {
 					budgets: Some(budgets.clone()),
 					limits: Some(limits.clone()),
 					members: keys.members.clone(),
-					credentials: Some(credentials.clone()),
+					catalogue: Some(tables.clone()),
 				},
 				Some(ready),
 			));
@@ -118,8 +111,8 @@ async fn main() {
 		}
 	};
 	let proxy = Arc::new(Proxy {
-		catalogue: live,
-		credentials: held_credentials,
+		catalogue: live.clone(),
+		tables: held_tables,
 		http,
 		jwt_secret: config.jwt_secret.clone(),
 		timeouts: config.timeouts,
@@ -129,6 +122,14 @@ async fn main() {
 		budgets,
 		limits,
 	});
+	let models = live.get().models().len();
+	for model in live.get().unpriced() {
+		// PS14: served, and logged with no cost. A price on the model silences it.
+		tracing::warn!(
+			model,
+			"no price for this model: its calls are logged with no cost; give it a price"
+		);
+	}
 	let listener = tokio::net::TcpListener::bind(config.addr)
 		.await
 		.unwrap_or_else(|error| fail(1, &format!("cannot listen on {}: {error}", config.addr)))

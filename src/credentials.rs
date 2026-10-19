@@ -20,27 +20,11 @@ use std::time::{Duration, SystemTime};
 use serde_json::{Value, json};
 use tokio_postgres::Client;
 
-use crate::providers::{
-	Catalogue, Kind, Live, Model, Provider, Secret, Stored, credential_name_ok,
-};
+use crate::providers::{Catalogue, Kind, Model, Provider, Secret, Stored, credential_name_ok};
 use crate::sigv4::{self, Credentials};
 
 /// How long a proof waits for the provider.
 const PROVE_WITHIN: Duration = Duration::from_secs(15);
-
-/// The catalogue as the file describes it, and the one calls use, which holds the stored
-/// credentials.
-#[derive(Clone, Debug)]
-pub struct Held {
-	pub base: Catalogue,
-	pub live: Live,
-}
-
-impl Held {
-	pub fn replace(&self, stored: &HashMap<String, Stored>) {
-		self.live.set(self.base.with_credentials(stored));
-	}
-}
 
 /// What the admin API takes: an API key, or AWS credentials for a Bedrock provider.
 #[derive(Debug, Default, serde::Deserialize)]

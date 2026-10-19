@@ -1,9 +1,10 @@
 //! The catalogue: which providers Psyche may call, with which credential, and which model names it
 //! answers to.
 //!
-//! In Phase 1 it is a JSON file (`PSYCHE_PROVIDERS_FILE`), the standalone case. From Phase 3 the same
-//! shape is rows in the project's `psyche` schema, and the file only seeds them. A provider's key is
-//! never in the file: the file names the environment variable that holds it (`api_key_env`), so the
+//! Without a database it is a JSON file (`PSYCHE_PROVIDERS_FILE`), the standalone case. With one,
+//! the same shape is rows of `psyche.providers` and `psyche.models`, which the file seeds and the
+//! admin API edits (`models.rs`); both are read into a [`Spec`] and built the same way. A provider's
+//! key is never in the file: the file names the environment variable that holds it (`api_key_env`), so the
 //! file can be committed and shared.
 //!
 //! ```json
@@ -67,6 +68,21 @@ pub enum Kind {
 	Bedrock,
 }
 
+impl Kind {
+	pub fn as_str(self) -> &'static str {
+		match self {
+			Kind::Openai => "openai",
+			Kind::Anthropic => "anthropic",
+			Kind::Bedrock => "bedrock",
+		}
+	}
+}
+
+/// Reads one of the enums below from the word a row holds for it.
+pub fn word<T: serde::de::DeserializeOwned>(text: &str) -> Option<T> {
+	serde_json::from_value(serde_json::Value::String(text.to_string())).ok()
+}
+
 /// How a model takes `reasoning_effort`, which differs by model and cannot be guessed from the
 /// family (2026-10-18, against Bedrock: Claude Sonnet 5 refuses the budget form older Claude models
 /// take, and gpt-5.6-luna refuses `reasoning_effort` by that name).
@@ -81,6 +97,16 @@ pub enum Reasoning {
 	Effort,
 }
 
+impl Reasoning {
+	pub fn as_str(self) -> &'static str {
+		match self {
+			Reasoning::Budget => "budget",
+			Reasoning::Adaptive => "adaptive",
+			Reasoning::Effort => "effort",
+		}
+	}
+}
+
 /// The InvokeModel body a Bedrock embedding model takes (`embeddings.rs`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -89,6 +115,15 @@ pub enum Embeddings {
 	Titan,
 	/// `{texts, input_type, embedding_types, output_dimension}`, up to 96 texts: Cohere v3 and v4.
 	Cohere,
+}
+
+impl Embeddings {
+	pub fn as_str(self) -> &'static str {
+		match self {
+			Embeddings::Titan => "titan",
+			Embeddings::Cohere => "cohere",
+		}
+	}
 }
 
 /// A credential, which never prints.
@@ -254,11 +289,20 @@ pub struct Catalogue {
 	by_name: HashMap<String, Arc<Model>>,
 }
 
+/// A catalogue before its models are built: the providers, resolved (with what the environment
+/// holds for them), and the models as written. The providers file is read into one, and so are the
+/// `psyche.providers` and `psyche.models` rows (`models.rs`), so both build the same way.
+#[derive(Debug, Clone, Default)]
+pub struct Spec {
+	pub providers: Vec<Arc<Provider>>,
+	pub models: Vec<ModelSpec>,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct File {
 	providers: Vec<ProviderEntry>,
-	models: Vec<ModelEntry>,
+	models: Vec<ModelSpec>,
 }
 
 #[derive(Deserialize)]
@@ -290,23 +334,210 @@ struct AwsEntry {
 	session_token_env: Option<String>,
 }
 
-#[derive(Deserialize)]
+/// A model as the file or a row writes it.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ModelEntry {
-	name: String,
-	provider: String,
+pub struct ModelSpec {
+	pub name: String,
+	pub provider: String,
 	#[serde(default)]
-	upstream: Option<String>,
+	pub upstream: Option<String>,
 	#[serde(default)]
-	prompt_caching: bool,
+	pub prompt_caching: bool,
 	#[serde(default)]
-	max_output_tokens: Option<u64>,
+	pub max_output_tokens: Option<u64>,
 	#[serde(default)]
-	reasoning: Option<Reasoning>,
+	pub reasoning: Option<Reasoning>,
 	#[serde(default)]
-	embeddings: Option<Embeddings>,
+	pub embeddings: Option<Embeddings>,
+	/// As written, in dollars per million tokens (`price.rs`); checked when the model is built.
 	#[serde(default)]
-	price: Option<PriceEntry>,
+	pub price: Option<serde_json::Value>,
+}
+
+impl Provider {
+	/// A provider as a row describes it: no secret from the environment, only a stored credential.
+	pub fn from_row(
+		name: &str,
+		kind: Kind,
+		base_url: Option<&str>,
+		region: Option<&str>,
+		credential: Option<&str>,
+		egress: Egress,
+	) -> Result<Provider, String> {
+		let entry = ProviderEntry {
+			name: name.to_string(),
+			kind,
+			base_url: base_url.map(str::to_string),
+			api_key_env: None,
+			region: region.map(str::to_string),
+			aws: None,
+			credential: credential.map(str::to_string),
+		};
+		resolve(entry, &HashMap::new(), egress).map_err(|e| e.0)
+	}
+}
+
+/// Checks a provider as the file or a row writes it, and reads its secrets from `env`.
+fn resolve(
+	entry: ProviderEntry,
+	env: &HashMap<String, String>,
+	egress: Egress,
+) -> Result<Provider, ConfigError> {
+	let name = entry.name.clone();
+	let fail = |what: String| ConfigError(format!("provider {name}: {what}"));
+	let region = match (&entry.kind, &entry.region) {
+		(Kind::Bedrock, None) => {
+			return Err(fail("a Bedrock provider names its region".into()));
+		}
+		(Kind::Bedrock, Some(region))
+			if region.is_empty()
+				|| !region
+					.bytes()
+					.all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-') =>
+		{
+			return Err(fail(format!("{region} is not an AWS region")));
+		}
+		(Kind::Bedrock, Some(region)) => Some(region.clone()),
+		(_, Some(_)) => return Err(fail("only a Bedrock provider takes a region".into())),
+		(_, None) => None,
+	};
+	let base_url = match (&entry.base_url, &region) {
+		(Some(base), _) => base.clone(),
+		(None, Some(region)) => format!("https://bedrock-runtime.{region}.amazonaws.com"),
+		(None, None) => return Err(fail("base_url is missing".into())),
+	};
+	let base_url = url::Url::parse(&base_url)
+		.map_err(|_| fail(format!("base_url is not a URL: {base_url}")))?;
+	check_base_url(&base_url, egress).map_err(&fail)?;
+	let read = |var: &str| {
+		env.get(var)
+			.map(|v| v.trim())
+			.filter(|v| !v.is_empty())
+			.map(Secret::new)
+			.ok_or_else(|| fail(format!("takes a credential from {var}, which is not set")))
+	};
+	let api_key = entry.api_key_env.as_deref().map(read).transpose()?;
+	let aws = match (entry.aws, &region) {
+		(None, _) => None,
+		(Some(_), None) => {
+			return Err(fail("only a Bedrock provider takes aws credentials".into()));
+		}
+		(Some(aws), Some(region)) => {
+			if api_key.is_some() {
+				return Err(fail("takes either api_key_env or aws, not both".into()));
+			}
+			Some(Aws {
+				region: region.clone(),
+				credentials: Credentials {
+					access_key_id: read(&aws.access_key_id_env)?.expose().to_string(),
+					secret_access_key: read(&aws.secret_access_key_env)?,
+					session_token: aws.session_token_env.as_deref().map(read).transpose()?,
+				},
+			})
+		}
+	};
+	if let Some(credential) = &entry.credential {
+		if api_key.is_some() || aws.is_some() {
+			return Err(fail(
+				"takes a stored credential or api_key_env or aws, only one".into(),
+			));
+		}
+		if !credential_name_ok(credential) {
+			return Err(fail(format!(
+				"{credential} is not a credential's name: lowercase letters, digits, - and _, up to 63"
+			)));
+		}
+	}
+	if entry.kind == Kind::Bedrock
+		&& api_key.is_none()
+		&& aws.is_none()
+		&& entry.credential.is_none()
+	{
+		return Err(fail(
+			"a Bedrock provider takes api_key_env (a Bedrock API key), aws credentials or a stored credential"
+				.into(),
+		));
+	}
+	Ok(Provider {
+		name: entry.name,
+		kind: entry.kind,
+		base_url,
+		api_key,
+		aws,
+		region,
+		credential: entry.credential,
+	})
+}
+
+impl Spec {
+	/// Reads a providers file. `env` is where each `api_key_env` is looked up.
+	pub fn from_json(
+		text: &str,
+		env: &HashMap<String, String>,
+		egress: Egress,
+	) -> Result<Self, ConfigError> {
+		let file: File = serde_json::from_str(text)
+			.map_err(|e| ConfigError(format!("the providers file is not valid: {e}")))?;
+		let mut spec = Spec::default();
+		for entry in file.providers {
+			if spec.provider(&entry.name).is_some() {
+				return Err(ConfigError(format!(
+					"the providers file names the provider {} twice",
+					entry.name
+				)));
+			}
+			spec.providers.push(Arc::new(resolve(entry, env, egress)?));
+		}
+		spec.models = file.models;
+		Ok(spec)
+	}
+
+	pub fn provider(&self, name: &str) -> Option<&Arc<Provider>> {
+		self.providers.iter().find(|p| p.name == name)
+	}
+}
+
+/// Builds one model of `spec`, against its provider.
+pub fn build_model(
+	spec: &ModelSpec,
+	provider: &Arc<Provider>,
+	prices: &price::Catalogue,
+) -> Result<Model, String> {
+	if spec.embeddings.is_some() && provider.kind != Kind::Bedrock {
+		return Err(
+			"only a Bedrock model names its embeddings form; other providers take OpenAI's request as it is"
+				.into(),
+		);
+	}
+	let upstream = spec
+		.upstream
+		.clone()
+		.filter(|u| !u.is_empty())
+		.unwrap_or_else(|| spec.name.clone());
+	let price = match &spec.price {
+		Some(written) => Some(
+			serde_json::from_value::<PriceEntry>(written.clone())
+				.map_err(|e| format!("price: {e}"))?
+				.price()?,
+		),
+		None => prices.find(&Place {
+			kind: provider.kind,
+			region: provider.region.as_deref(),
+			host: provider.base_url.host_str(),
+			upstream: &upstream,
+		}),
+	};
+	Ok(Model {
+		upstream,
+		name: spec.name.clone(),
+		provider: provider.clone(),
+		prompt_caching: spec.prompt_caching,
+		max_output_tokens: spec.max_output_tokens.filter(|n| *n > 0),
+		reasoning: spec.reasoning,
+		embeddings: spec.embeddings,
+		price,
+	})
 }
 
 impl Catalogue {
@@ -316,158 +547,55 @@ impl Catalogue {
 		env: &HashMap<String, String>,
 		egress: Egress,
 	) -> Result<Self, ConfigError> {
-		let file: File = serde_json::from_str(text)
-			.map_err(|e| ConfigError(format!("the providers file is not valid: {e}")))?;
-		let mut providers: HashMap<String, Arc<Provider>> = HashMap::new();
-		for entry in file.providers {
-			if providers.contains_key(&entry.name) {
-				return Err(ConfigError(format!(
-					"the providers file names the provider {} twice",
-					entry.name
-				)));
-			}
-			let name = entry.name.clone();
-			let fail = |what: String| ConfigError(format!("provider {name}: {what}"));
-			let region = match (&entry.kind, &entry.region) {
-				(Kind::Bedrock, None) => {
-					return Err(fail("a Bedrock provider names its region".into()));
-				}
-				(Kind::Bedrock, Some(region))
-					if region.is_empty()
-						|| !region
-							.bytes()
-							.all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-') =>
-				{
-					return Err(fail(format!("{region} is not an AWS region")));
-				}
-				(Kind::Bedrock, Some(region)) => Some(region.clone()),
-				(_, Some(_)) => return Err(fail("only a Bedrock provider takes a region".into())),
-				(_, None) => None,
-			};
-			let base_url = match (&entry.base_url, &region) {
-				(Some(base), _) => base.clone(),
-				(None, Some(region)) => format!("https://bedrock-runtime.{region}.amazonaws.com"),
-				(None, None) => return Err(fail("base_url is missing".into())),
-			};
-			let base_url = url::Url::parse(&base_url)
-				.map_err(|_| fail(format!("base_url is not a URL: {base_url}")))?;
-			check_base_url(&base_url, egress).map_err(&fail)?;
-			let read = |var: &str| {
-				env.get(var)
-					.map(|v| v.trim())
-					.filter(|v| !v.is_empty())
-					.map(Secret::new)
-					.ok_or_else(|| fail(format!("takes a credential from {var}, which is not set")))
-			};
-			let api_key = entry.api_key_env.as_deref().map(read).transpose()?;
-			let aws = match (entry.aws, &region) {
-				(None, _) => None,
-				(Some(_), None) => {
-					return Err(fail("only a Bedrock provider takes aws credentials".into()));
-				}
-				(Some(aws), Some(region)) => {
-					if api_key.is_some() {
-						return Err(fail("takes either api_key_env or aws, not both".into()));
-					}
-					Some(Aws {
-						region: region.clone(),
-						credentials: Credentials {
-							access_key_id: read(&aws.access_key_id_env)?.expose().to_string(),
-							secret_access_key: read(&aws.secret_access_key_env)?,
-							session_token: aws
-								.session_token_env
-								.as_deref()
-								.map(read)
-								.transpose()?,
-						},
-					})
-				}
-			};
-			if let Some(credential) = &entry.credential {
-				if api_key.is_some() || aws.is_some() {
-					return Err(fail(
-						"takes a stored credential or api_key_env or aws, only one".into(),
-					));
-				}
-				if !credential_name_ok(credential) {
-					return Err(fail(format!(
-						"{credential} is not a credential's name: lowercase letters, digits, - and _, up to 63"
-					)));
-				}
-			}
-			if entry.kind == Kind::Bedrock
-				&& api_key.is_none()
-				&& aws.is_none()
-				&& entry.credential.is_none()
-			{
-				return Err(fail(
-					"a Bedrock provider takes api_key_env (a Bedrock API key), aws credentials or a stored credential"
-						.into(),
-				));
-			}
-			providers.insert(
-				entry.name.clone(),
-				Arc::new(Provider {
-					name: entry.name,
-					kind: entry.kind,
-					base_url,
-					api_key,
-					aws,
-					region,
-					credential: entry.credential,
-				}),
-			);
-		}
+		Self::build(&Spec::from_json(text, env, egress)?)
+	}
+
+	/// Builds every model of `spec`, stopping at the first mistake: a file that is wrong stops the
+	/// start.
+	pub fn build(spec: &Spec) -> Result<Self, ConfigError> {
+		let (catalogue, skipped) = Self::assemble(spec, true)?;
+		debug_assert!(skipped.is_empty());
+		Ok(catalogue)
+	}
+
+	/// Builds the models of `spec` it can, and says why it left out each of the others: rows are
+	/// edited one at a time, and one that is wrong must not take the others down.
+	pub fn build_lenient(spec: &Spec) -> Result<(Self, Vec<(String, String)>), ConfigError> {
+		Self::assemble(spec, false)
+	}
+
+	fn assemble(spec: &Spec, strict: bool) -> Result<(Self, Vec<(String, String)>), ConfigError> {
 		let prices = price::Catalogue::shipped()?;
 		let mut catalogue = Catalogue::default();
+		let mut skipped = Vec::new();
 		let mut seen = HashSet::new();
-		for entry in file.models {
-			if !seen.insert(entry.name.clone()) {
-				return Err(ConfigError(format!(
+		for entry in &spec.models {
+			let built = if !seen.insert(entry.name.clone()) {
+				Err(format!(
 					"the providers file names the model {} twice",
 					entry.name
-				)));
-			}
-			let provider = providers.get(&entry.provider).cloned().ok_or_else(|| {
-				ConfigError(format!(
-					"model {} names the provider {}, which the file does not define",
-					entry.name, entry.provider
 				))
-			})?;
-			if entry.embeddings.is_some() && provider.kind != Kind::Bedrock {
-				return Err(ConfigError(format!(
-					"model {}: only a Bedrock model names its embeddings form; other providers take OpenAI's request as it is",
-					entry.name
-				)));
-			}
-			let upstream = entry.upstream.unwrap_or_else(|| entry.name.clone());
-			let price = match &entry.price {
-				Some(price) => Some(
-					price
-						.price()
-						.map_err(|e| ConfigError(format!("model {}: {e}", entry.name)))?,
-				),
-				None => prices.find(&Place {
-					kind: provider.kind,
-					region: provider.region.as_deref(),
-					host: provider.base_url.host_str(),
-					upstream: &upstream,
-				}),
+			} else {
+				match spec.provider(&entry.provider) {
+					None => Err(format!(
+						"model {} names the provider {}, which is not among the providers",
+						entry.name, entry.provider
+					)),
+					Some(provider) => build_model(entry, provider, &prices)
+						.map_err(|e| format!("model {}: {e}", entry.name)),
+				}
 			};
-			let model = Arc::new(Model {
-				upstream,
-				name: entry.name,
-				provider,
-				prompt_caching: entry.prompt_caching,
-				max_output_tokens: entry.max_output_tokens.filter(|n| *n > 0),
-				reasoning: entry.reasoning,
-				embeddings: entry.embeddings,
-				price,
-			});
-			catalogue.by_name.insert(model.name.clone(), model.clone());
-			catalogue.models.push(model);
+			match built {
+				Ok(model) => {
+					let model = Arc::new(model);
+					catalogue.by_name.insert(model.name.clone(), model.clone());
+					catalogue.models.push(model);
+				}
+				Err(why) if strict => return Err(ConfigError(why)),
+				Err(why) => skipped.push((entry.name.clone(), why)),
+			}
 		}
-		Ok(catalogue)
+		Ok((catalogue, skipped))
 	}
 
 	pub fn model(&self, name: &str) -> Option<&Arc<Model>> {
