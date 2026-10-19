@@ -790,6 +790,7 @@ mod tests {
 				aws: None,
 				region: None,
 				credential: None,
+				auth_header: None,
 			}),
 			upstream: "claude-sonnet-4-5".into(),
 			prompt_caching: caching,

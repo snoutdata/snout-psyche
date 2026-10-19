@@ -16,6 +16,11 @@
 //! unspent; and a call whose provider reported no usage is charged its whole reservation here,
 //! but logged with no cost, so a restart forgets that charge.
 //!
+//! **Credits** are a user's balance beside their budgets (`psyche.credits`): when the user's own
+//! budgets (theirs, every user's, their group's) have no room for a call and the user's credits are
+//! on and have room, the call is paid wholly by credits instead, and counts against the project's
+//! and its key's budgets only. A call is never split between the two.
+//!
 //! A reply with no cap of its own (the caller named none, and the model's entry names no
 //! `max_output_tokens`) is sent one when a hard budget applies: [`UNCAPPED_OUTPUT`] tokens, or what
 //! the tightest hard budget still has room for if that is less, so the provider cannot run past what
@@ -72,6 +77,8 @@ pub enum Period {
 	Month,
 	/// The last N days, today included.
 	Rolling(u32),
+	/// From a day on (a billing period's first), up to [`HISTORY_DAYS`] back.
+	Since(Day),
 }
 
 impl Period {
@@ -81,6 +88,7 @@ impl Period {
 			Period::Day => today,
 			Period::Month => month_start(today),
 			Period::Rolling(days) => today.saturating_sub(days.clamp(1, HISTORY_DAYS) - 1),
+			Period::Since(day) => day.min(today).max(today.saturating_sub(HISTORY_DAYS - 1)),
 		}
 	}
 
@@ -90,8 +98,31 @@ impl Period {
 			Period::Month => "a month".into(),
 			Period::Rolling(1) => "a day".into(),
 			Period::Rolling(days) => format!("every {days} days"),
+			Period::Since(day) => format!("since {}", date(day)),
 		}
 	}
+}
+
+/// A day as `YYYY-MM-DD` (Howard Hinnant's civil-from-days).
+fn date(day: Day) -> String {
+	let z = i64::from(day) + 719_468;
+	let era = z.div_euclid(146_097);
+	let doe = z - era * 146_097;
+	let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+	let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+	let mp = (5 * doy + 2) / 153;
+	let d = doy - (153 * mp + 2) / 5 + 1;
+	let m = if mp < 10 { mp + 3 } else { mp - 9 };
+	let y = yoe + era * 400 + i64::from(m <= 2);
+	format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// A user's credits, as `psyche.credits` holds them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Credits {
+	/// Picodollars granted in all.
+	pub granted: u64,
+	pub enabled: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -115,6 +146,11 @@ struct Ledger {
 	spent: HashMap<(Subject, Day), u64>,
 	/// Picodollars reserved by calls in flight, per subject.
 	reserved: HashMap<Subject, u64>,
+	credits: HashMap<UserId, Credits>,
+	/// Picodollars credits have paid, ever, per user.
+	credits_used: HashMap<UserId, u64>,
+	/// Picodollars of credits held by calls in flight, per user.
+	credits_reserved: HashMap<UserId, u64>,
 	/// The last day old buckets were dropped on.
 	pruned: Day,
 }
@@ -132,6 +168,21 @@ impl Ledger {
 			.map(|day| self.spent.get(&(subject, day)).copied().unwrap_or(0))
 			.sum()
 	}
+
+	/// What `who`'s credits can still pay, when they are on; `None` when there are none to use.
+	fn credits_left(&self, who: &Who) -> Option<u64> {
+		let user = who.user?;
+		let credits = self.credits.get(&user).filter(|c| c.enabled)?;
+		let used = self.credits_used.get(&user).copied().unwrap_or(0);
+		let held = self.credits_reserved.get(&user).copied().unwrap_or(0);
+		Some(credits.granted.saturating_sub(used.saturating_add(held)))
+	}
+}
+
+/// Whether credits may stand in for a budget on this subject: the user's own, every user's and
+/// their group's, never the project's or a key's.
+fn credits_cover(subject: Subject) -> bool {
+	matches!(subject, Subject::User(_) | Subject::Group(_))
 }
 
 /// A refusal: the budget, and the sentence that says why.
@@ -184,6 +235,26 @@ impl Budgets {
 		Ok(())
 	}
 
+	/// Every user's credits, from `psyche.credits`.
+	pub fn replace_credits(&self, credits: HashMap<UserId, Credits>) {
+		self.ledger().credits = credits;
+	}
+
+	/// What credits have paid for `user` (from the daily totals, at start).
+	pub fn add_credits_used(&self, user: UserId, picodollars: u64) {
+		let mut ledger = self.ledger();
+		let used = ledger.credits_used.entry(user).or_insert(0);
+		*used = used.saturating_add(picodollars);
+	}
+
+	/// What `user`'s credits can still pay, if they have any on.
+	pub fn credits_left(&self, user: UserId) -> Option<u64> {
+		self.ledger().credits_left(&Who {
+			user: Some(user),
+			..Who::default()
+		})
+	}
+
 	/// Spend already settled (from the log, at start).
 	pub fn add_spent(&self, subject: Subject, day: Day, picodollars: u64) {
 		let mut ledger = self.ledger();
@@ -196,27 +267,44 @@ impl Budgets {
 	pub fn room(&self, who: &Who, now: SystemTime) -> Option<u64> {
 		let today = day_of(now);
 		let ledger = self.ledger();
-		ledger
-			.over(who)
-			.filter(|(b, _)| b.hard)
-			.map(|(b, subject)| {
-				let reserved = ledger.reserved.get(&subject).copied().unwrap_or(0);
-				b.limit.saturating_sub(
-					ledger
-						.spent(subject, b.period, today)
-						.saturating_add(reserved),
-				)
-			})
-			.min()
+		let mut own: Option<u64> = None;
+		let mut others: Option<u64> = None;
+		for (b, subject) in ledger.over(who).filter(|(b, _)| b.hard) {
+			let reserved = ledger.reserved.get(&subject).copied().unwrap_or(0);
+			let room = b.limit.saturating_sub(
+				ledger
+					.spent(subject, b.period, today)
+					.saturating_add(reserved),
+			);
+			let slot = if credits_cover(subject) {
+				&mut own
+			} else {
+				&mut others
+			};
+			*slot = Some(slot.map_or(room, |r| r.min(room)));
+		}
+		// Credits widen the user's own budgets, never the project's or a key's.
+		let own = match (own, ledger.credits_left(who)) {
+			(Some(room), Some(credits)) => Some(room.max(credits)),
+			(room, _) => room,
+		};
+		match (own, others) {
+			(Some(a), Some(b)) => Some(a.min(b)),
+			(a, b) => a.or(b),
+		}
 	}
 
 	/// Reserves `amount` picodollars for a call by `key`, or refuses it. A soft budget it would not
 	/// fit is named in the reservation's warnings instead.
 	pub fn reserve(&self, who: &Who, amount: u64, now: SystemTime) -> Result<Reservation, Over> {
 		let today = day_of(now);
-		let subjects = subjects(who);
+		let mut subjects = subjects(who);
 		let mut ledger = self.ledger();
 		let mut warnings = Vec::new();
+		// The first hard budget the call would not fit, and whether credits could stand in for every
+		// such budget.
+		let mut refusal: Option<Over> = None;
+		let mut coverable = true;
 		for (budget, subject) in ledger.over(who) {
 			let spent = ledger.spent(subject, budget.period, today);
 			let reserved = ledger.reserved.get(&subject).copied().unwrap_or(0);
@@ -228,18 +316,40 @@ impl Budgets {
 				warnings.push(budget.name.clone());
 				continue;
 			}
-			let left = budget.limit.saturating_sub(used);
-			return Err(Over {
-				budget: budget.name.clone(),
-				message: format!(
-					"The budget {} ({} {}) has {} left, and this call could cost up to {}.",
-					budget.name,
-					money(budget.limit),
-					budget.period.describe(),
-					money(left),
-					money(amount),
-				),
-			});
+			coverable &= credits_cover(subject);
+			if refusal.is_none() {
+				let left = budget.limit.saturating_sub(used);
+				refusal = Some(Over {
+					budget: budget.name.clone(),
+					message: format!(
+						"The budget {} ({} {}) has {} left, and this call could cost up to {}.",
+						budget.name,
+						money(budget.limit),
+						budget.period.describe(),
+						money(left),
+						money(amount),
+					),
+				});
+			}
+		}
+		let mut credits = None;
+		if let Some(over) = refusal {
+			match (coverable, ledger.credits_left(who), who.user) {
+				(true, Some(left), Some(user)) if left >= amount => {
+					// Paid by credits: held against them, and the project's and key's budgets only.
+					credits = Some(user);
+					subjects.retain(|s| !credits_cover(*s));
+					let held = ledger.credits_reserved.entry(user).or_insert(0);
+					*held = held.saturating_add(amount);
+				}
+				(true, Some(left), _) => {
+					return Err(Over {
+						message: format!("{} The credits have {} left.", over.message, money(left)),
+						..over
+					});
+				}
+				_ => return Err(over),
+			}
 		}
 		for subject in &subjects {
 			let held = ledger.reserved.entry(*subject).or_insert(0);
@@ -250,6 +360,7 @@ impl Budgets {
 			subjects,
 			amount,
 			warnings,
+			credits,
 			settled: false,
 		})
 	}
@@ -273,6 +384,8 @@ pub struct Reservation {
 	amount: u64,
 	/// The soft budgets this call goes over.
 	pub warnings: Vec<String>,
+	/// The user whose credits pay for this call, when they do.
+	pub credits: Option<UserId>,
 	settled: bool,
 }
 
@@ -309,6 +422,16 @@ impl Reservation {
 			}
 			let bucket = ledger.spent.entry((*subject, day)).or_insert(0);
 			*bucket = bucket.saturating_add(charge);
+		}
+		if let Some(user) = self.credits {
+			if let Some(held) = ledger.credits_reserved.get_mut(&user) {
+				*held = held.saturating_sub(self.amount);
+				if *held == 0 {
+					ledger.credits_reserved.remove(&user);
+				}
+			}
+			let used = ledger.credits_used.entry(user).or_insert(0);
+			*used = used.saturating_add(charge);
 		}
 		// The first settle of each day lets the days past the history go.
 		if day > ledger.pruned {
@@ -353,7 +476,8 @@ pub async fn load(client: &tokio_postgres::Client) -> Result<Vec<Budget>, tokio_
 	let rows = client
 		.query(
 			"SELECT id::text, name, key_id::text, (amount * 1000000000000)::bigint, period, days, hard, \
-			 every_user, user_id::text, group_id::text FROM psyche.budgets",
+			 every_user, user_id::text, group_id::text, (starts_on - date '1970-01-01')::int \
+			 FROM psyche.budgets",
 			&[],
 		)
 		.await?;
@@ -364,6 +488,7 @@ pub async fn load(client: &tokio_postgres::Client) -> Result<Vec<Budget>, tokio_
 				("day", _) => Period::Day,
 				("month", _) => Period::Month,
 				("rolling", Some(days)) if days > 0 => Period::Rolling(days as u32),
+				("since", _) => Period::Since(row.get::<_, Option<i32>>(10)?.max(0) as Day),
 				_ => return None,
 			};
 			Some(Budget {
@@ -374,6 +499,30 @@ pub async fn load(client: &tokio_postgres::Client) -> Result<Vec<Budget>, tokio_
 				period,
 				hard: row.get(6),
 			})
+		})
+		.collect())
+}
+
+/// Every user's credits, from `psyche.credits`.
+pub async fn load_credits(
+	client: &tokio_postgres::Client,
+) -> Result<HashMap<UserId, Credits>, tokio_postgres::Error> {
+	let rows = client
+		.query(
+			"SELECT user_id::text, (granted * 1000000000000)::bigint, enabled FROM psyche.credits",
+			&[],
+		)
+		.await?;
+	Ok(rows
+		.iter()
+		.filter_map(|row| {
+			Some((
+				KeyId::parse(row.get(0))?,
+				Credits {
+					granted: u64::try_from(row.get::<_, i64>(1)).unwrap_or(0),
+					enabled: row.get(2),
+				},
+			))
 		})
 		.collect())
 }
@@ -389,14 +538,15 @@ pub async fn load_spent(
 	let rows = client
 		.query(
 			"SELECT (day - date '1970-01-01')::int, key_id::text, user_id::text, group_id::text, \
-			 (sum(cost) * 1000000000000)::bigint FROM psyche.usage_daily \
-			 WHERE day >= date '1970-01-01' + $1::int GROUP BY 1, 2, 3, 4",
+			 (sum(cost) * 1000000000000)::bigint, (sum(credits_cost) * 1000000000000)::bigint \
+			 FROM psyche.usage_daily WHERE day >= date '1970-01-01' + $1::int GROUP BY 1, 2, 3, 4",
 			&[&(today.saturating_sub(HISTORY_DAYS) as i32)],
 		)
 		.await?;
 	for row in rows {
 		let day = row.get::<_, i32>(0).max(0) as Day;
 		let spent = u64::try_from(row.get::<_, i64>(4)).unwrap_or(0);
+		let by_credits = u64::try_from(row.get::<_, i64>(5)).unwrap_or(0);
 		let id = |n: usize| row.get::<_, Option<&str>>(n).and_then(KeyId::parse);
 		let who = Who {
 			key: id(1),
@@ -404,7 +554,26 @@ pub async fn load_spent(
 			group: id(3),
 		};
 		for subject in subjects(&who) {
-			budgets.add_spent(subject, day, spent);
+			// What credits paid is not the user's or the group's budgets' to count.
+			let counted = if credits_cover(subject) {
+				spent.saturating_sub(by_credits)
+			} else {
+				spent
+			};
+			budgets.add_spent(subject, day, counted);
+		}
+	}
+	// Credits never reset, so what they paid is read back from the first day.
+	for row in client
+		.query(
+			"SELECT user_id::text, (sum(credits_cost) * 1000000000000)::bigint FROM psyche.usage_daily \
+			 WHERE credits_cost > 0 AND user_id IS NOT NULL GROUP BY 1",
+			&[],
+		)
+		.await?
+	{
+		if let Some(user) = row.get::<_, Option<&str>>(0).and_then(KeyId::parse) {
+			budgets.add_credits_used(user, u64::try_from(row.get::<_, i64>(1)).unwrap_or(0));
 		}
 	}
 	Ok(())
@@ -431,6 +600,116 @@ mod tests {
 			period,
 			hard,
 		}
+	}
+
+	#[test]
+	fn a_since_window_counts_from_its_day_and_names_it() {
+		assert_eq!(date(0), "1970-01-01");
+		assert_eq!(date(20_744), "2026-10-18");
+		assert_eq!(date(20_513), "2026-03-01");
+		let now = SystemTime::UNIX_EPOCH + Duration::from_secs(20_744 * 86_400 + 3_600);
+		let today = day_of(now);
+		let alice = KeyId([1; 16]);
+		let who = Who {
+			user: Some(alice),
+			..Who::default()
+		};
+		let budgets = Budgets::default();
+		budgets.replace(vec![budget(
+			"period",
+			Scope::User(alice),
+			1,
+			Period::Since(today - 2),
+			true,
+		)]);
+		// The day before the period is not counted; the one inside it is.
+		budgets.add_spent(Subject::User(alice), today - 3, PICO);
+		budgets.add_spent(Subject::User(alice), today - 1, PICO / 2);
+		let over = budgets.reserve(&who, PICO * 6 / 10, now).unwrap_err();
+		assert!(
+			over.message.contains("since 2026-10-16"),
+			"{}",
+			over.message
+		);
+		assert!(budgets.reserve(&who, PICO * 4 / 10, now).is_ok());
+		// A period that has not begun counts today alone.
+		assert_eq!(Period::Since(today + 5).start(today), today);
+	}
+
+	#[test]
+	fn credits_pay_when_the_user_s_own_budgets_are_full_and_never_past_the_project_s() {
+		let budgets = Budgets::default();
+		let alice = KeyId([1; 16]);
+		let who = Who {
+			user: Some(alice),
+			..Who::default()
+		};
+		let now = SystemTime::now();
+		budgets.replace(vec![
+			budget("project", Scope::Project, 10, Period::Day, true),
+			budget("everyone", Scope::EveryUser, 1, Period::Day, true),
+		]);
+		budgets
+			.reserve(&who, PICO, now)
+			.unwrap()
+			.settle(Some(PICO), now);
+		// Her own dollar is spent, and she has no credits: refused, naming the budget.
+		let over = budgets.reserve(&who, PICO / 2, now).unwrap_err();
+		assert_eq!(over.budget, "everyone");
+		// Credits on: the call is paid by them, and her own budget is left as it was.
+		budgets.replace_credits(HashMap::from([(
+			alice,
+			Credits {
+				granted: 2 * PICO,
+				enabled: true,
+			},
+		)]));
+		let paid = budgets.reserve(&who, PICO / 2, now).unwrap();
+		assert_eq!(paid.credits, Some(alice));
+		assert_eq!(
+			budgets.room(&who, now),
+			Some(3 * PICO / 2),
+			"credits less what is held"
+		);
+		paid.settle(Some(2 * PICO / 5), now);
+		assert_eq!(budgets.credits_left(alice), Some(8 * PICO / 5));
+		// Still over her own budget, by the dollar the budgets paid, not by what credits paid.
+		assert_eq!(
+			budgets
+				.ledger()
+				.spent(Subject::User(alice), Period::Day, day_of(now)),
+			PICO
+		);
+		// More than the credits hold is refused, saying what they hold.
+		let over = budgets.reserve(&who, 5 * PICO, now).unwrap_err();
+		assert!(
+			over.message.contains("The credits have $1.60 left"),
+			"{}",
+			over.message
+		);
+		// Switched off, they pay nothing.
+		budgets.replace_credits(HashMap::from([(
+			alice,
+			Credits {
+				granted: 2 * PICO,
+				enabled: false,
+			},
+		)]));
+		assert!(budgets.reserve(&who, PICO / 10, now).is_err());
+		assert_eq!(budgets.credits_left(alice), None);
+		// And never past the project's budget, whatever the credits hold.
+		budgets.replace_credits(HashMap::from([(
+			alice,
+			Credits {
+				granted: 100 * PICO,
+				enabled: true,
+			},
+		)]));
+		budgets.add_spent(Subject::Project, day_of(now), 10 * PICO);
+		assert_eq!(
+			budgets.reserve(&who, PICO / 10, now).unwrap_err().budget,
+			"project"
+		);
 	}
 
 	#[test]

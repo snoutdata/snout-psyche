@@ -150,6 +150,10 @@ pub struct Call {
 	/// From sending the request to the provider's response headers.
 	pub first_byte: Duration,
 	pub total: Duration,
+	/// Paid by the user's credits rather than their budgets (`budgets.rs`).
+	pub credits: bool,
+	/// The soft budgets the call went over, as the response's header names them.
+	pub budget_warning: Option<String>,
 }
 
 impl Call {
@@ -464,12 +468,13 @@ async fn models(State(proxy): State<Arc<Proxy>>, headers: HeaderMap) -> Response
 		Ok(caller) => caller,
 		Err(error) => return error.into_response(),
 	};
+	let who = caller.who(proxy.keys.as_ref().map(|k| &k.members));
 	let data: Vec<Value> = proxy
 		.catalogue
 		.get()
 		.models()
 		.iter()
-		.filter(|m| caller.may_use(&m.name))
+		.filter(|m| caller.may_use(&m.name) && proxy.granted(&m.name, &who))
 		.map(
 			|m| json!({"id": m.name, "object": "model", "created": 0, "owned_by": m.provider.name}),
 		)
@@ -1393,6 +1398,11 @@ async fn delete_budget(
 }
 
 impl Proxy {
+	/// Whether `who` may use `model` by its grants (`models.rs`); every model without a database.
+	fn granted(&self, model: &str, who: &Who) -> bool {
+		self.tables.as_ref().is_none_or(|t| t.allows(model, who))
+	}
+
 	/// Takes a call's request and tokens from every rate limit on it, or refuses it with when to
 	/// try again. `prompt_bound` is `None` when no limit applies.
 	fn take(
@@ -1576,6 +1586,12 @@ impl Proxy {
 					),
 				)
 			})?;
+		if !self.granted(&model.name, &who) {
+			return Err(ApiError::new(
+				Class::Forbidden,
+				format!("{} is not open to this account.", model.name),
+			));
+		}
 		if !caller.may_use(&model.name) {
 			return Err(ApiError::new(
 				Class::Forbidden,
@@ -1696,6 +1712,8 @@ impl Proxy {
 				who,
 				first_byte: Duration::ZERO,
 				total: Duration::ZERO,
+				credits: false,
+				budget_warning: None,
 			},
 			started,
 			reservation,
@@ -1782,6 +1800,8 @@ impl Proxy {
 				who,
 				first_byte: Duration::ZERO,
 				total: Duration::ZERO,
+				credits: false,
+				budget_warning: None,
 			},
 			started: Instant::now(),
 			reservation,
@@ -2242,6 +2262,10 @@ impl Drop for Record {
 			taken.settle(self.call.usage.map(|u| u.total()));
 		}
 		if let Some(reservation) = self.reservation.take() {
+			self.call.credits = reservation.credits.is_some();
+			if !reservation.warnings.is_empty() {
+				self.call.budget_warning = Some(reservation.warnings.join(", "));
+			}
 			let charge = match (self.billable, self.call.cost()) {
 				(false, _) => Some(0),
 				(true, cost) => cost.map(|c| c.0),
@@ -3094,6 +3118,163 @@ mod tests {
 		)
 	}
 
+	/// A change made in SQL reaches Psyche through the trigger: calls as `sub` until the answer is
+	/// `status`.
+	async fn until(s: &Setup, sub: &str, body: &Value, status: u16) -> reqwest::Response {
+		for _ in 0..250 {
+			let reply = as_user(s, sub, body).await;
+			if reply.status() == status {
+				return reply;
+			}
+			tokio::time::sleep(Duration::from_millis(20)).await;
+		}
+		panic!("{sub} never got {status}");
+	}
+
+	#[tokio::test]
+	async fn an_account_is_held_to_its_grants_and_pays_with_credits_once_its_budget_is_spent() {
+		let Some((mut s, db, _key, _id)) = with_budgets("accounts").await else {
+			return;
+		};
+		let alice = "00000000-0000-4000-8000-00000000a11c";
+		let body = json!({"model": "ok-priced", "max_tokens": 8, "messages": [{"role": "user", "content": "hi"}]});
+		for budget in [
+			json!({"name": "project", "amount": 10, "period": "month"}),
+			json!({"name": "each user", "amount": 0.0002, "period": "day", "every_user": true}),
+		] {
+			assert_eq!(
+				add(&s, "/ai/v1/admin/budgets", budget)
+					.await
+					.unwrap()
+					.status(),
+				201
+			);
+		}
+		as_user(&s, alice, &body).await.text().await.unwrap();
+
+		// Granted only: refused, and not listed, until she is granted it.
+		db.batch_execute("UPDATE psyche.models SET access = 'granted' WHERE name = 'ok-priced'")
+			.await
+			.unwrap();
+		let (status, _, message) = error_of(until(&s, alice, &body, 403).await).await;
+		assert_eq!(status, 403);
+		assert!(message.contains("not open to this account"), "{message}");
+		let token = jwt::sign(
+			&json!({"role": "authenticated", "sub": alice, "exp": now() + 3600}),
+			SECRET,
+		);
+		let listed = || async {
+			let models: Value = s
+				.client
+				.get(format!("{}/ai/v1/models", s.base))
+				.bearer_auth(&token)
+				.send()
+				.await
+				.unwrap()
+				.json()
+				.await
+				.unwrap();
+			models.to_string().contains("\"ok-priced\"")
+		};
+		assert!(!listed().await);
+		db.execute(
+			"INSERT INTO psyche.model_grants (model, user_id) VALUES ('ok-priced', $1::text::uuid)",
+			&[&alice],
+		)
+		.await
+		.unwrap();
+		until(&s, alice, &body, 200).await.text().await.unwrap();
+		assert!(listed().await);
+
+		// Her own budget spent, she is refused until she has credits, which then pay.
+		let reply = until(&s, alice, &body, 429).await;
+		assert_eq!(error_of(reply).await.1, "budget_exceeded");
+		db.execute(
+			"INSERT INTO psyche.credits (user_id, granted) VALUES ($1::text::uuid, 0.001)",
+			&[&alice],
+		)
+		.await
+		.unwrap();
+		until(&s, alice, &body, 200).await.text().await.unwrap();
+		let mut paid = false;
+		while let Ok(call) = s.calls.try_recv() {
+			paid |= call.credits;
+		}
+		if !paid {
+			paid = s.call().await.credits;
+		}
+		assert!(paid, "the last call was paid by credits");
+		// Switched off, they pay nothing.
+		db.batch_execute("UPDATE psyche.credits SET enabled = false")
+			.await
+			.unwrap();
+		assert_eq!(
+			error_of(until(&s, alice, &body, 429).await).await.1,
+			"budget_exceeded"
+		);
+
+		// After a restart, what credits paid is read back: off her budget, and off her balance.
+		db.batch_execute("UPDATE psyche.credits SET enabled = true")
+			.await
+			.unwrap();
+		db.execute(
+			"INSERT INTO psyche.usage_daily (day, operation, model, provider, requests, cost, \
+			 credits_cost, user_id) VALUES (current_date - 1, 'chat', 'ok-priced', 'fake', 1, \
+			 0.0004, 0.0003, $1::text::uuid)",
+			&[&alice],
+		)
+		.await
+		.unwrap();
+		let again = Budgets::default();
+		again.replace_credits(crate::budgets::load_credits(&db).await.unwrap());
+		crate::budgets::load_spent(&db, &again, SystemTime::now())
+			.await
+			.unwrap();
+		let user = KeyId::parse(alice).unwrap();
+		assert_eq!(
+			again.credits_left(user),
+			Some(700_000_000),
+			"$0.001 less $0.0003"
+		);
+
+		// A provider behind a gate takes its stored key in the gate's header, proof included.
+		let service = || jwt::sign(&json!({"role": "service_role"}), SECRET);
+		let put = |path: String, body: Value| {
+			s.client
+				.put(format!("{}/ai/v1/admin/{path}", s.base))
+				.bearer_auth(service())
+				.json(&body)
+				.send()
+		};
+		let made = put(
+			"providers/gated".into(),
+			json!({"kind": "openai", "base_url": format!("{}/v1", s.fake.origin),
+				"credential": "gated", "auth_header": Fake::GATE_HEADER}),
+		);
+		assert_eq!(made.await.unwrap().status(), 200);
+		let made = put(
+			"models/via-gate".into(),
+			json!({"provider": "gated", "upstream": "fake-ok", "price": {"input": 1, "output": 1}}),
+		);
+		assert_eq!(made.await.unwrap().status(), 200);
+		let made = put("credentials/gated".into(), json!({"api_key": Fake::KEY}));
+		assert_eq!(made.await.unwrap().status(), 200, "proven through the gate");
+		let reply = s
+			.post("/ai/v1/chat/completions", chat("via-gate", false))
+			.send()
+			.await
+			.unwrap();
+		assert_eq!(reply.status(), 200);
+		let seen = s.fake.last();
+		assert_eq!(seen.gate.as_deref(), Some(Fake::KEY));
+		assert_eq!(seen.authorization, None, "no Bearer token beside it");
+		let bad = put(
+			"providers/bad".into(),
+			json!({"kind": "openai", "base_url": format!("{}/v1", s.fake.origin), "auth_header": "Host"}),
+		);
+		assert_eq!(bad.await.unwrap().status(), 400);
+	}
+
 	#[tokio::test]
 	async fn signed_in_users_are_held_to_their_own_budget_their_group_s_and_their_limit() {
 		let Some((mut s, _db, _key, _id)) = with_budgets("users").await else {
@@ -3707,6 +3888,7 @@ mod tests {
 			aws: None,
 			region: None,
 			credential: None,
+			auth_header: None,
 		};
 		let openai = provider(Kind::Openai, "https://api.openai.com/v1");
 		assert_eq!(cap_field(&openai, Operation::Chat), "max_completion_tokens");

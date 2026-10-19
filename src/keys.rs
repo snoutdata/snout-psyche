@@ -254,7 +254,8 @@ impl Stale {
 			"budgets" => self.budgets = true,
 			"limits" => self.limits = true,
 			"members" => self.members = true,
-			"credentials" | "providers" | "models" => self.catalogue = true,
+			"credentials" | "providers" | "models" | "model_grants" => self.catalogue = true,
+			"credits" => self.budgets = true,
 			"groups" => {
 				self.budgets = true;
 				self.limits = true;
@@ -295,6 +296,7 @@ async fn listen(
 		}
 		if let Some(budgets) = held.budgets.as_ref().filter(|_| stale.budgets) {
 			budgets.replace(crate::budgets::load(client).await?);
+			budgets.replace_credits(crate::budgets::load_credits(client).await?);
 		}
 		if let Some(limits) = held.limits.as_ref().filter(|_| stale.limits) {
 			limits.replace(crate::limits::load(client).await?);

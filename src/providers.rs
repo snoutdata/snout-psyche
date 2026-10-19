@@ -161,6 +161,9 @@ pub struct Provider {
 	/// The stored credential it takes (`psyche.credentials`), by name. Its key or AWS credentials
 	/// are filled in from there, and are `None` until one is stored.
 	pub credential: Option<String>,
+	/// The header the key is sent in, for a server behind a gateway that checks one, instead of the
+	/// provider's own way (a Bearer token, or Anthropic's `x-api-key`).
+	pub auth_header: Option<String>,
 }
 
 /// A stored credential, as `psyche.credentials` holds it.
@@ -256,6 +259,9 @@ impl Provider {
 			}
 			return request;
 		}
+		if let (Some(header), Some(key)) = (&self.auth_header, &self.api_key) {
+			return request.header(header.as_str(), key.expose());
+		}
 		match (self.kind, &self.api_key) {
 			(_, None) => request,
 			(Kind::Openai | Kind::Bedrock, Some(key)) => request.bearer_auth(key.expose()),
@@ -323,6 +329,8 @@ struct ProviderEntry {
 	/// A stored credential, by name, instead of `api_key_env` or `aws`.
 	#[serde(default)]
 	credential: Option<String>,
+	#[serde(default)]
+	auth_header: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -363,6 +371,7 @@ impl Provider {
 		base_url: Option<&str>,
 		region: Option<&str>,
 		credential: Option<&str>,
+		auth_header: Option<&str>,
 		egress: Egress,
 	) -> Result<Provider, String> {
 		let entry = ProviderEntry {
@@ -373,6 +382,7 @@ impl Provider {
 			region: region.map(str::to_string),
 			aws: None,
 			credential: credential.map(str::to_string),
+			auth_header: auth_header.map(str::to_string),
 		};
 		resolve(entry, &HashMap::new(), egress).map_err(|e| e.0)
 	}
@@ -449,6 +459,18 @@ fn resolve(
 			)));
 		}
 	}
+	if let Some(header) = &entry.auth_header
+		&& !auth_header_ok(header)
+	{
+		return Err(fail(format!(
+			"{header} is not a header a key can be sent in: lowercase letters, digits and -, up to 64, and not one HTTP itself uses"
+		)));
+	}
+	if entry.auth_header.is_some() && entry.kind == Kind::Bedrock {
+		return Err(fail(
+			"a Bedrock provider signs its own requests, so it takes no auth_header".into(),
+		));
+	}
 	if entry.kind == Kind::Bedrock
 		&& api_key.is_none()
 		&& aws.is_none()
@@ -467,7 +489,20 @@ fn resolve(
 		aws,
 		region,
 		credential: entry.credential,
+		auth_header: entry.auth_header,
 	})
+}
+
+/// A header a key may be sent in.
+pub fn auth_header_ok(name: &str) -> bool {
+	(1..=64).contains(&name.len())
+		&& name
+			.bytes()
+			.all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+		&& !matches!(
+			name,
+			"host" | "content-type" | "content-length" | "transfer-encoding" | "connection"
+		)
 }
 
 impl Spec {

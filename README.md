@@ -172,7 +172,9 @@ curl -X PUT $PSYCHE/ai/v1/admin/models/fast -H "Authorization: Bearer $SERVICE_K
 # GET /ai/v1/admin/providers and /ai/v1/admin/models list them; DELETE removes one.
 ```
 
-A model takes the same fields as in the file, plus `"enabled": false` to stop serving it. A model's
+A model takes the same fields as in the file, plus `"enabled": false` to stop serving it and
+`"access"` (above). A provider may take `"auth_header"`, the header its stored key is sent in
+instead of a Bearer token, for a server behind a gateway that checks one. A model's
 name may contain `/` (`openai/gpt-4o`). Before a model is written it is built against its provider,
 so one that could not be served is refused with the reason and nothing is stored. The model list
 shows the price each model is charged at and where it comes from (`model`, its own; `catalogue`,
@@ -234,7 +236,8 @@ through and names itself in the `x-psyche-budget-warning` header.
 ```sh
 curl -X POST $PSYCHE/ai/v1/admin/budgets -H "Authorization: Bearer $SERVICE_KEY" \
   -d '{"name": "ci daily", "amount": 5, "period": "day", "key_id": "<key id>"}'
-# period: day, month, or rolling with "days": 1-366; "hard": false for a soft budget.
+# period: day, month, rolling with "days": 1-366, or since with "starts_on" (a billing period's
+# first day, set in SQL for now); "hard": false for a soft budget.
 # Whom it is for, one of: key_id, "every_user": true, user_id, group_id; none for the project.
 # GET lists them, DELETE /ai/v1/admin/budgets/<id> removes one.
 ```
@@ -259,6 +262,23 @@ tightest budget has room for, down to 256, below which the call is refused. It g
 budget sends none. Measured against the fake provider, 300
 calls at once on a key with a $0.001 day: 18 answered, 282 refused, $0.000342 spent. The bound is
 generous where prompts are short, so near its end a budget refuses some calls that would have fit.
+
+### Credits
+
+A signed-in user can also have **credits** (`psyche.credits`: dollars granted in all, and whether
+they are on), which pay for a call only when the user's own budgets (their own, every user's,
+their group's) have no room for it. A call is paid wholly by the budgets or wholly by credits, never
+split, and credits never stand in for the project's budget or a key's. The request log marks a call
+credits paid (`credits`), and the daily totals keep what credits paid apart (`credits_cost`), so
+neither the budgets nor the balance forget it on a restart. A refusal says what the credits have
+left.
+
+### Model access
+
+A model is open to everyone, or, with `"access": "granted"` on it, only to the users and groups in
+`psyche.model_grants` (a model being tried by a few, or one a plan includes). A signed-in user, and
+a key a user owns, are held to it: a model they are not granted is refused (403) and left out of
+`/ai/v1/models`. The project's own keys and the service key use every model.
 
 ### Rate limits
 

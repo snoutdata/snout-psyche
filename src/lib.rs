@@ -77,6 +77,7 @@ pub mod fuzz {
 				aws: None,
 				region: None,
 				credential: None,
+				auth_header: None,
 			}),
 			upstream: "u".into(),
 			prompt_caching: true,

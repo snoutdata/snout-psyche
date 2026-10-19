@@ -50,7 +50,8 @@
 //! Bedrock does. Each vector's first number is its text's length, the token count is the words,
 //! in `X-Amzn-Bedrock-Input-Token-Count`. `fake-throttle` and `fake-unavailable` fail as above.
 //!
-//! A request without `Authorization: Bearer` + [`Fake::KEY`] gets OpenAI's 401, which echoes the
+//! A request without `Authorization: Bearer` + [`Fake::KEY`] (or the key in [`Fake::GATE_HEADER`],
+//! as a gateway in front of a server checks one) gets OpenAI's 401, which echoes the
 //! key it was given, as OpenAI's does: that is what proves Psyche scrubs its own key from errors.
 //! Everything received is kept ([`Fake::last`]), and a stream the client dropped before its end is
 //! counted ([`Fake::cancelled`]).
@@ -74,6 +75,8 @@ pub struct Seen {
 	/// Anthropic's key header.
 	pub api_key: Option<String>,
 	pub anthropic_version: Option<String>,
+	/// The key presented in [`Fake::GATE_HEADER`], as a gateway in front of a server checks one.
+	pub gate: Option<String>,
 	pub body: Value,
 }
 
@@ -96,6 +99,8 @@ const REPLY: [&str; 4] = ["Hello ", "from ", "the ", "fake."];
 impl Fake {
 	/// The key the fake accepts.
 	pub const KEY: &'static str = "sk-fake-provider-key-0123456789";
+	/// A header an OpenAI-style request may present [`Fake::KEY`] in instead of a Bearer token.
+	pub const GATE_HEADER: &'static str = "x-gate-key";
 	/// The AWS credentials Bedrock's half checks signatures with.
 	pub const AWS_ACCESS_KEY_ID: &'static str = "AKIDFAKEPROVIDER";
 	pub const AWS_SECRET: &'static str = "fake-secret-access-key-0123456789";
@@ -187,6 +192,7 @@ async fn answer(
 			authorization: authorization.clone(),
 			api_key: header("x-api-key"),
 			anthropic_version: header("anthropic-version"),
+			gate: header(Fake::GATE_HEADER),
 			body: body.clone(),
 		});
 	}
@@ -197,9 +203,11 @@ async fn answer(
 		return anthropic(shared, &headers, &body);
 	}
 
+	let gate = header(Fake::GATE_HEADER);
 	let presented = authorization
 		.as_deref()
 		.and_then(|a| a.strip_prefix("Bearer "))
+		.or(gate.as_deref())
 		.unwrap_or("");
 	if presented != Fake::KEY {
 		return error(

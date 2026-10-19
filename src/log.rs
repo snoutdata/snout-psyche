@@ -148,6 +148,8 @@ struct Totals {
 	cost: u64,
 	/// Calls counted whose model has no price, so they are missing from `cost`.
 	unpriced: i64,
+	/// Picodollars of `cost` paid by credits.
+	credits_cost: u64,
 }
 
 type Id = Option<crate::keys::KeyId>;
@@ -184,7 +186,12 @@ fn totals(batch: &[Call]) -> BTreeMap<Key, Totals> {
 			}
 		}
 		match (call.usage.is_some(), call.cost()) {
-			(_, Some(cost)) => t.cost = t.cost.saturating_add(cost.0),
+			(_, Some(cost)) => {
+				t.cost = t.cost.saturating_add(cost.0);
+				if call.credits {
+					t.credits_cost = t.credits_cost.saturating_add(cost.0);
+				}
+			}
 			(true, None) => t.unpriced += 1,
 			(false, None) => {}
 		}
@@ -215,7 +222,8 @@ async fn write(client: &mut Client, batch: &[Call]) -> Result<(), tokio_postgres
 		.copy_in(
 			"COPY psyche.requests (at, operation, model, provider, streamed, outcome, \
 			 prompt_tokens, completion_tokens, cached_tokens, cache_write_tokens, reasoning_tokens, \
-			 first_byte_ms, total_ms, cost, key_id, user_id, group_id) FROM STDIN BINARY",
+			 first_byte_ms, total_ms, cost, key_id, user_id, group_id, credits, budget_warning) \
+			 FROM STDIN BINARY",
 		)
 		.await?;
 	let writer = BinaryCopyInWriter::new(
@@ -238,6 +246,8 @@ async fn write(client: &mut Client, batch: &[Call]) -> Result<(), tokio_postgres
 			Type::UUID,
 			Type::UUID,
 			Type::UUID,
+			Type::BOOL,
+			Type::TEXT,
 		],
 	);
 	let mut writer = std::pin::pin!(writer);
@@ -263,6 +273,8 @@ async fn write(client: &mut Client, batch: &[Call]) -> Result<(), tokio_postgres
 				&call.who.key,
 				&call.who.user,
 				&call.who.group,
+				&call.credits,
+				&call.budget_warning,
 			])
 			.await?;
 	}
@@ -272,6 +284,7 @@ async fn write(client: &mut Client, batch: &[Call]) -> Result<(), tokio_postgres
 	let mut columns: (Vec<String>, Vec<&str>, Vec<&str>, Vec<&str>) = Default::default();
 	let mut counts: [Vec<i64>; 10] = Default::default();
 	let mut costs: Vec<Dollars> = Vec::new();
+	let mut credit_costs: Vec<Dollars> = Vec::new();
 	let mut ids: [Vec<Id>; 3] = Default::default();
 	for ((day, operation, model, provider, key, user, group), t) in &totals {
 		ids[0].push(*key);
@@ -296,18 +309,19 @@ async fn write(client: &mut Client, batch: &[Call]) -> Result<(), tokio_postgres
 			list.push(n);
 		}
 		costs.push(Dollars(t.cost));
+		credit_costs.push(Dollars(t.credits_cost));
 	}
 	let [r, f, c, un, pt, ct, cr, cw, rt, up] = &counts;
 	tx.execute(
 		"INSERT INTO psyche.usage_daily AS u (day, operation, model, provider, requests, failed, \
 		 cancelled, uncounted, prompt_tokens, completion_tokens, cached_tokens, cache_write_tokens, \
-		 reasoning_tokens, unpriced, cost, key_id, user_id, group_id) \
-		 SELECT d::date, o, m, p, r, f, c, un, pt, ct, cr, cw, rt, up, co, k, us, g \
+		 reasoning_tokens, unpriced, cost, key_id, user_id, group_id, credits_cost) \
+		 SELECT d::date, o, m, p, r, f, c, un, pt, ct, cr, cw, rt, up, co, k, us, g, cc \
 		 FROM unnest($1::text[], $2::text[], \
 		 $3::text[], $4::text[], $5::int8[], $6::int8[], $7::int8[], $8::int8[], $9::int8[], \
 		 $10::int8[], $11::int8[], $12::int8[], $13::int8[], $14::int8[], $15::numeric[], $16::uuid[], \
-		 $17::uuid[], $18::uuid[]) \
-		 AS t(d, o, m, p, r, f, c, un, pt, ct, cr, cw, rt, up, co, k, us, g) \
+		 $17::uuid[], $18::uuid[], $19::numeric[]) \
+		 AS t(d, o, m, p, r, f, c, un, pt, ct, cr, cw, rt, up, co, k, us, g, cc) \
 		 ON CONFLICT (day, operation, model, provider, \
 		 (coalesce(key_id, '00000000-0000-0000-0000-000000000000'::uuid)), \
 		 (coalesce(user_id, '00000000-0000-0000-0000-000000000000'::uuid)), \
@@ -319,10 +333,28 @@ async fn write(client: &mut Client, batch: &[Call]) -> Result<(), tokio_postgres
 		 cached_tokens = u.cached_tokens + excluded.cached_tokens, \
 		 cache_write_tokens = u.cache_write_tokens + excluded.cache_write_tokens, \
 		 reasoning_tokens = u.reasoning_tokens + excluded.reasoning_tokens, \
-		 unpriced = u.unpriced + excluded.unpriced, cost = u.cost + excluded.cost",
+		 unpriced = u.unpriced + excluded.unpriced, cost = u.cost + excluded.cost, \
+		 credits_cost = u.credits_cost + excluded.credits_cost",
 		&[
-			&columns.0, &columns.1, &columns.2, &columns.3, r, f, c, un, pt, ct, cr, cw, rt, up,
-			&costs, &ids[0], &ids[1], &ids[2],
+			&columns.0,
+			&columns.1,
+			&columns.2,
+			&columns.3,
+			r,
+			f,
+			c,
+			un,
+			pt,
+			ct,
+			cr,
+			cw,
+			rt,
+			up,
+			&costs,
+			&ids[0],
+			&ids[1],
+			&ids[2],
+			&credit_costs,
 		],
 	)
 	.await?;
@@ -566,6 +598,8 @@ pub(crate) mod tests {
 			who: Default::default(),
 			first_byte: Duration::from_millis(120),
 			total: Duration::from_millis(900),
+			credits: false,
+			budget_warning: None,
 		}
 	}
 
@@ -626,6 +660,7 @@ pub(crate) mod tests {
 				reasoning_tokens: 10,
 				cost: 0,
 				unpriced: 2,
+				credits_cost: 0,
 			}
 		);
 	}

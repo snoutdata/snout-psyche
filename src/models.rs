@@ -15,18 +15,20 @@
 //!
 //! Without a database the file is the catalogue, as before.
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex, RwLock};
 
 use serde_json::{Value, json};
 use tokio_postgres::Client;
 
+use crate::keys::KeyId;
 use crate::net::Egress;
 use crate::price::{self, PriceEntry};
 use crate::providers::{
 	Catalogue, Embeddings, Kind, Live, ModelSpec, Provider, Reasoning, Spec, build_model,
 	credential_name_ok, word,
 };
+use crate::who::{GroupId, UserId, Who};
 
 /// The catalogue as the file describes it, and the one calls use: the rows, with the stored
 /// credentials filled in.
@@ -37,6 +39,15 @@ pub struct Held {
 	pub egress: Egress,
 	/// What the last reload left out, so each is warned about once, not every minute.
 	left_out: Arc<Mutex<Vec<(String, String)>>>,
+	/// The models only some may use, and who (`access = 'granted'`, `psyche.model_grants`).
+	access: Arc<RwLock<HashMap<String, Grants>>>,
+}
+
+/// Who a model that is not everyone's is granted to.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Grants {
+	pub users: HashSet<UserId>,
+	pub groups: HashSet<GroupId>,
 }
 
 impl std::fmt::Debug for Held {
@@ -52,6 +63,23 @@ impl Held {
 			live,
 			egress,
 			left_out: Default::default(),
+			access: Default::default(),
+		}
+	}
+
+	/// Whether `who` may use `model`. Only a user, or a key a user owns, is held to a model's
+	/// grants; the project's own keys and the service key use every model.
+	pub fn allows(&self, model: &str, who: &Who) -> bool {
+		let Some(user) = who.user else {
+			return true;
+		};
+		let access = self.access.read().unwrap_or_else(|p| p.into_inner());
+		match access.get(model) {
+			None => true,
+			Some(grants) => {
+				grants.users.contains(&user)
+					|| who.group.is_some_and(|g| grants.groups.contains(&g))
+			}
 		}
 	}
 
@@ -59,7 +87,9 @@ impl Held {
 	pub async fn reload(&self, client: &Client) -> Result<(), tokio_postgres::Error> {
 		let (catalogue, left_out) = self.read(client).await?;
 		let stored = crate::credentials::load(client).await?;
+		let access = load_access(client).await?;
 		self.live.set(catalogue.with_credentials(&stored));
+		*self.access.write().unwrap_or_else(|p| p.into_inner()) = access;
 		let mut last = self.left_out.lock().unwrap_or_else(|p| p.into_inner());
 		for (name, why) in &left_out {
 			if !last.contains(&(name.clone(), why.clone())) {
@@ -86,6 +116,38 @@ impl Held {
 	}
 }
 
+/// The models only some may use, with their grants.
+async fn load_access(client: &Client) -> Result<HashMap<String, Grants>, tokio_postgres::Error> {
+	let mut access: HashMap<String, Grants> = HashMap::new();
+	for row in client
+		.query(
+			"SELECT name FROM psyche.models WHERE access = 'granted'",
+			&[],
+		)
+		.await?
+	{
+		access.insert(row.get(0), Grants::default());
+	}
+	for row in client
+		.query(
+			"SELECT model, user_id::text, group_id::text FROM psyche.model_grants",
+			&[],
+		)
+		.await?
+	{
+		let Some(grants) = access.get_mut(row.get::<_, &str>(0)) else {
+			continue;
+		};
+		if let Some(user) = row.get::<_, Option<&str>>(1).and_then(KeyId::parse) {
+			grants.users.insert(user);
+		}
+		if let Some(group) = row.get::<_, Option<&str>>(2).and_then(KeyId::parse) {
+			grants.groups.insert(group);
+		}
+	}
+	Ok(access)
+}
+
 /// Writes the file's providers and models into the tables: new ones added, the file's own
 /// rewritten (a model only while it is not `edited`), and the file's own that it no longer names
 /// removed when nothing depends on them. A row the project made under the same name is kept, and
@@ -97,17 +159,18 @@ pub async fn seed(client: &mut Client, file: &Spec) -> Result<Vec<String>, tokio
 	for provider in &file.providers {
 		let written = tx
 			.execute(
-				"INSERT INTO psyche.providers (name, kind, base_url, region, credential, origin) \
-				 VALUES ($1, $2, $3, $4, $5, 'file') ON CONFLICT (name) DO UPDATE SET \
+				"INSERT INTO psyche.providers (name, kind, base_url, region, credential, auth_header, \
+				 origin) VALUES ($1, $2, $3, $4, $5, $6, 'file') ON CONFLICT (name) DO UPDATE SET \
 				 kind = excluded.kind, base_url = excluded.base_url, region = excluded.region, \
-				 credential = excluded.credential, updated_at = clock_timestamp() \
-				 WHERE psyche.providers.origin = 'file'",
+				 credential = excluded.credential, auth_header = excluded.auth_header, \
+				 updated_at = clock_timestamp() WHERE psyche.providers.origin = 'file'",
 				&[
 					&provider.name,
 					&provider.kind.as_str(),
 					&provider.base_url.as_str(),
 					&provider.region,
 					&provider.credential,
+					&provider.auth_header,
 				],
 			)
 			.await?;
@@ -190,8 +253,8 @@ pub async fn load(
 	let mut left_out = Vec::new();
 	for row in client
 		.query(
-			"SELECT name, kind, base_url, region, credential, origin FROM psyche.providers \
-			 ORDER BY created_at, name",
+			"SELECT name, kind, base_url, region, credential, origin, auth_header \
+			 FROM psyche.providers ORDER BY created_at, name",
 			&[],
 		)
 		.await?
@@ -200,6 +263,7 @@ pub async fn load(
 		let base_url: String = row.get(2);
 		let region: Option<String> = row.get(3);
 		let credential: Option<String> = row.get(4);
+		let auth_header: Option<String> = row.get(6);
 		let Some(kind) = word::<Kind>(row.get(1)) else {
 			continue;
 		};
@@ -209,7 +273,8 @@ pub async fn load(
 					if theirs.kind == kind
 						&& theirs.base_url.as_str() == base_url
 						&& theirs.region == region
-						&& theirs.credential == credential =>
+						&& theirs.credential == credential
+						&& theirs.auth_header == auth_header =>
 				{
 					spec.providers.push(theirs.clone());
 				}
@@ -230,6 +295,7 @@ pub async fn load(
 			Some(&base_url),
 			region.as_deref(),
 			credential.as_deref(),
+			auth_header.as_deref(),
 			egress,
 		) {
 			Ok(provider) => spec.providers.push(Arc::new(provider)),
@@ -309,6 +375,9 @@ pub struct NewProvider {
 	pub region: Option<String>,
 	#[serde(default)]
 	pub credential: Option<String>,
+	/// The header the key is sent in, instead of the provider's own way.
+	#[serde(default)]
+	pub auth_header: Option<String>,
 }
 
 /// Makes or replaces a provider through the admin API. One from the providers file is refused.
@@ -342,21 +411,24 @@ pub async fn put_provider(
 		new.base_url.as_deref(),
 		new.region.as_deref(),
 		new.credential.as_deref(),
+		new.auth_header.as_deref(),
 		held.egress,
 	)
 	.map_err(Refused::Invalid)?;
 	client
 		.execute(
-			"INSERT INTO psyche.providers (name, kind, base_url, region, credential) \
-			 VALUES ($1, $2, $3, $4, $5) ON CONFLICT (name) DO UPDATE SET kind = excluded.kind, \
+			"INSERT INTO psyche.providers (name, kind, base_url, region, credential, auth_header) \
+			 VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (name) DO UPDATE SET kind = excluded.kind, \
 			 base_url = excluded.base_url, region = excluded.region, \
-			 credential = excluded.credential, updated_at = clock_timestamp()",
+			 credential = excluded.credential, auth_header = excluded.auth_header, \
+			 updated_at = clock_timestamp()",
 			&[
 				&name,
 				&provider.kind.as_str(),
 				&provider.base_url.as_str(),
 				&provider.region,
 				&provider.credential,
+				&provider.auth_header,
 			],
 		)
 		.await?;
@@ -367,6 +439,7 @@ pub async fn put_provider(
 		"base_url": provider.base_url.as_str(),
 		"region": provider.region,
 		"credential": provider.credential,
+		"auth_header": provider.auth_header,
 		"origin": "api",
 	}))
 }
@@ -435,6 +508,9 @@ pub struct NewModel {
 	pub price: Option<Value>,
 	#[serde(default = "yes")]
 	pub enabled: bool,
+	/// `everyone` (the default), or `granted`: only the users and groups in `psyche.model_grants`.
+	#[serde(default)]
+	pub access: Option<String>,
 }
 
 fn yes() -> bool {
@@ -451,6 +527,13 @@ pub async fn put_model(
 	new: NewModel,
 ) -> Result<Value, Refused> {
 	let name = name_ok(name, 200)?;
+	let access = new.access.as_deref().unwrap_or("everyone");
+	if !matches!(access, "everyone" | "granted") {
+		return Err(Refused::Invalid(
+			"access is everyone, or granted (only the users and groups in psyche.model_grants)."
+				.into(),
+		));
+	}
 	if new
 		.max_output_tokens
 		.is_some_and(|n| n == 0 || n > i32::MAX as u64)
@@ -493,12 +576,13 @@ pub async fn put_model(
 	client
 		.execute(
 			"INSERT INTO psyche.models (name, provider, upstream, prompt_caching, max_output_tokens, \
-			 reasoning, embeddings, price, enabled) \
-			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8::text::jsonb, $9) \
+			 reasoning, embeddings, price, enabled, access) \
+			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8::text::jsonb, $9, $10) \
 			 ON CONFLICT (name) DO UPDATE SET provider = excluded.provider, \
 			 upstream = excluded.upstream, prompt_caching = excluded.prompt_caching, \
 			 max_output_tokens = excluded.max_output_tokens, reasoning = excluded.reasoning, \
-			 embeddings = excluded.embeddings, price = excluded.price, enabled = excluded.enabled",
+			 embeddings = excluded.embeddings, price = excluded.price, enabled = excluded.enabled, \
+			 access = excluded.access",
 			&[
 				&name,
 				&spec.provider,
@@ -509,6 +593,7 @@ pub async fn put_model(
 				&spec.embeddings.map(Embeddings::as_str),
 				&spec.price.as_ref().map(Value::to_string),
 				&new.enabled,
+				&access,
 			],
 		)
 		.await?;
@@ -518,6 +603,7 @@ pub async fn put_model(
 		"provider": spec.provider,
 		"upstream": model.upstream,
 		"enabled": new.enabled,
+		"access": access,
 		"price": model.price.map(|p| p.to_json()),
 		"price_from": price_from(spec.price.is_some(), model.price.is_some()),
 	}))
@@ -568,8 +654,8 @@ pub async fn list_providers(client: &Client, held: &Held) -> Result<Vec<Value>, 
 	let rows = client
 		.query(
 			"SELECT p.name, p.kind, p.base_url, p.region, p.credential, p.origin, \
-			 coalesce(array_agg(m.name ORDER BY m.name) FILTER (WHERE m.name IS NOT NULL), '{}') \
-			 FROM psyche.providers p LEFT JOIN psyche.models m ON m.provider = p.name \
+			 coalesce(array_agg(m.name ORDER BY m.name) FILTER (WHERE m.name IS NOT NULL), '{}'), \
+			 p.auth_header FROM psyche.providers p LEFT JOIN psyche.models m ON m.provider = p.name \
 			 GROUP BY p.name ORDER BY p.created_at, p.name",
 			&[],
 		)
@@ -600,6 +686,7 @@ pub async fn list_providers(client: &Client, held: &Held) -> Result<Vec<Value>, 
 				"key": key,
 				"origin": origin,
 				"models": row.get::<_, Vec<String>>(6),
+				"auth_header": row.get::<_, Option<String>>(7),
 				"problem": left_out.iter().find(|(n, _)| *n == name).map(|(_, why)| why),
 			})
 		})
@@ -613,8 +700,9 @@ pub async fn list_models(client: &Client, held: &Held) -> Result<Vec<Value>, Ref
 	let rows = client
 		.query(
 			"SELECT name, provider, upstream, prompt_caching, max_output_tokens, reasoning, \
-			 embeddings, price::text, enabled, origin, edited FROM psyche.models \
-			 ORDER BY created_at, name",
+			 embeddings, price::text, enabled, origin, edited, access, \
+			 (SELECT count(*) FROM psyche.model_grants g WHERE g.model = m.name) \
+			 FROM psyche.models m ORDER BY created_at, name",
 			&[],
 		)
 		.await?;
@@ -649,6 +737,8 @@ pub async fn list_models(client: &Client, held: &Held) -> Result<Vec<Value>, Ref
 				"served": model.is_some(),
 				"origin": row.get::<_, String>(9),
 				"edited": row.get::<_, bool>(10),
+				"access": row.get::<_, String>(11),
+				"grants": row.get::<_, i64>(12),
 				"problem": if enabled { problem } else { None },
 			})
 		})
