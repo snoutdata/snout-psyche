@@ -44,6 +44,18 @@ pub enum Subject {
 	Group(GroupId),
 }
 
+impl Subject {
+	/// Whose budget or limit this is, as a refusal names it: `project`, `key`, `user` or `group`.
+	pub fn label(self) -> &'static str {
+		match self {
+			Subject::Project => "project",
+			Subject::Key(_) => "key",
+			Subject::User(_) => "user",
+			Subject::Group(_) => "group",
+		}
+	}
+}
+
 impl Scope {
 	/// What this scope holds a call by `who` to, if it holds it at all. `overridden` is the users
 	/// with a scope of their own, whom the every-user scope leaves alone.

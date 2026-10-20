@@ -101,6 +101,8 @@ impl State {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Refused {
 	pub message: String,
+	/// Whose limit refused: [`crate::who::Subject::label`].
+	pub scope: &'static str,
 	/// `None` when waiting would not help.
 	pub retry_after: Option<Duration>,
 }
@@ -179,7 +181,7 @@ impl Limits {
 			.filter_map(|l| Some((l, (l.id, l.scope.subject(who, overridden)?))))
 			.collect();
 		let need = tokens as f64;
-		let mut longest: Option<(Duration, &Limit, &'static str)> = None;
+		let mut longest: Option<(Duration, &Limit, &'static str, Subject)> = None;
 		for (limit, at) in &scope {
 			let bucket = buckets
 				.entry(*at)
@@ -189,6 +191,7 @@ impl Limits {
 				&& tokens > u64::from(tpm)
 			{
 				return Err(Refused {
+					scope: at.1.label(),
 					message: format!(
 						"This call could use up to {tokens} tokens, more than the limit {} allows in a minute ({tpm}). Ask for fewer with max_tokens, or send less.",
 						limit.name
@@ -207,18 +210,19 @@ impl Limits {
 					.map(|tpm| (wait(bucket.tokens, need, tpm), "tokens")),
 			];
 			for (after, what) in short.into_iter().flatten() {
-				if longest.is_none_or(|(d, _, _)| after > d) {
-					longest = Some((after, limit, what));
+				if longest.is_none_or(|(d, _, _, _)| after > d) {
+					longest = Some((after, limit, what, at.1));
 				}
 			}
 		}
-		if let Some((after, limit, what)) = longest {
+		if let Some((after, limit, what, at)) = longest {
 			let per_minute = match what {
 				"requests" => limit.requests_per_minute,
 				_ => limit.tokens_per_minute,
 			}
 			.unwrap_or(0);
 			return Err(Refused {
+				scope: at.label(),
 				message: format!(
 					"The limit {} ({per_minute} {what} a minute) is used up; try again in {}.",
 					limit.name,

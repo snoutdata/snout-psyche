@@ -79,6 +79,9 @@ pub enum Period {
 	Rolling(u32),
 	/// From a day on (a billing period's first), up to [`HISTORY_DAYS`] back.
 	Since(Day),
+	/// A month at a time from a day on, starting again on each of its anniversaries: a billing
+	/// period that renews by itself.
+	Monthly(Day),
 }
 
 impl Period {
@@ -89,6 +92,7 @@ impl Period {
 			Period::Month => month_start(today),
 			Period::Rolling(days) => today.saturating_sub(days.clamp(1, HISTORY_DAYS) - 1),
 			Period::Since(day) => day.min(today).max(today.saturating_sub(HISTORY_DAYS - 1)),
+			Period::Monthly(day) => anniversary(day, today),
 		}
 	}
 
@@ -99,12 +103,13 @@ impl Period {
 			Period::Rolling(1) => "a day".into(),
 			Period::Rolling(days) => format!("every {days} days"),
 			Period::Since(day) => format!("since {}", date(day)),
+			Period::Monthly(day) => format!("a month from the {}", ordinal(civil(day).2)),
 		}
 	}
 }
 
-/// A day as `YYYY-MM-DD` (Howard Hinnant's civil-from-days).
-fn date(day: Day) -> String {
+/// A day as year, month and day of the month (Howard Hinnant's civil-from-days).
+fn civil(day: Day) -> (i64, u32, u32) {
 	let z = i64::from(day) + 719_468;
 	let era = z.div_euclid(146_097);
 	let doe = z - era * 146_097;
@@ -113,7 +118,59 @@ fn date(day: Day) -> String {
 	let mp = (5 * doy + 2) / 153;
 	let d = doy - (153 * mp + 2) / 5 + 1;
 	let m = if mp < 10 { mp + 3 } else { mp - 9 };
-	let y = yoe + era * 400 + i64::from(m <= 2);
+	(yoe + era * 400 + i64::from(m <= 2), m as u32, d as u32)
+}
+
+/// The day a year, month and day of the month fall on (days-from-civil, the inverse of [`civil`]).
+fn from_civil(y: i64, m: u32, d: u32) -> Day {
+	let y = if m <= 2 { y - 1 } else { y };
+	let era = y.div_euclid(400);
+	let yoe = y - era * 400;
+	let mp = i64::from((m + 9) % 12);
+	let doy = (153 * mp + 2) / 5 + i64::from(d) - 1;
+	let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+	(era * 146_097 + doe - 719_468).max(0) as Day
+}
+
+/// How many days month `m` of year `y` has.
+fn month_days(y: i64, m: u32) -> u32 {
+	let (ny, nm) = if m == 12 { (y + 1, 1) } else { (y, m + 1) };
+	(from_civil(ny, nm, 1) - from_civil(y, m, 1)) as u32
+}
+
+/// The latest anniversary of `anchor` on or before `today`: the same day of the month, or the
+/// month's last day when it is shorter. `today` itself when `anchor` is later.
+fn anniversary(anchor: Day, today: Day) -> Day {
+	if anchor >= today {
+		return today;
+	}
+	let (ay, am, ad) = civil(anchor);
+	let (ty, tm, _) = civil(today);
+	let on = |months: i64| {
+		let index = ay * 12 + i64::from(am) - 1 + months;
+		let (y, m) = (index.div_euclid(12), index.rem_euclid(12) as u32 + 1);
+		from_civil(y, m, ad.min(month_days(y, m)))
+	};
+	let months = ty * 12 + i64::from(tm) - (ay * 12 + i64::from(am));
+	let day = on(months);
+	if day <= today { day } else { on(months - 1) }
+}
+
+/// `1st`, `2nd`, `3rd`, `4th`, … `31st`.
+fn ordinal(n: u32) -> String {
+	let suffix = match (n % 10, n % 100) {
+		(_, 11..=13) => "th",
+		(1, _) => "st",
+		(2, _) => "nd",
+		(3, _) => "rd",
+		_ => "th",
+	};
+	format!("{n}{suffix}")
+}
+
+/// A day as `YYYY-MM-DD`.
+fn date(day: Day) -> String {
+	let (y, m, d) = civil(day);
 	format!("{y:04}-{m:02}-{d:02}")
 }
 
@@ -190,6 +247,8 @@ fn credits_cover(subject: Subject) -> bool {
 pub struct Over {
 	pub budget: String,
 	pub message: String,
+	/// Whose budget refused: [`Subject::label`].
+	pub scope: &'static str,
 }
 
 /// Every budget and the spend against them, shared by every call.
@@ -321,6 +380,7 @@ impl Budgets {
 				let left = budget.limit.saturating_sub(used);
 				refusal = Some(Over {
 					budget: budget.name.clone(),
+					scope: subject.label(),
 					message: format!(
 						"The budget {} ({} {}) has {} left, and this call could cost up to {}.",
 						budget.name,
@@ -489,6 +549,7 @@ pub async fn load(client: &tokio_postgres::Client) -> Result<Vec<Budget>, tokio_
 				("month", _) => Period::Month,
 				("rolling", Some(days)) if days > 0 => Period::Rolling(days as u32),
 				("since", _) => Period::Since(row.get::<_, Option<i32>>(10)?.max(0) as Day),
+				("monthly", _) => Period::Monthly(row.get::<_, Option<i32>>(10)?.max(0) as Day),
 				_ => return None,
 			};
 			Some(Budget {
@@ -634,6 +695,70 @@ mod tests {
 		assert!(budgets.reserve(&who, PICO * 4 / 10, now).is_ok());
 		// A period that has not begun counts today alone.
 		assert_eq!(Period::Since(today + 5).start(today), today);
+	}
+
+	#[test]
+	fn a_monthly_window_starts_again_on_each_anniversary_and_says_whose_budget_refused() {
+		let day = |y, m, d| from_civil(y, m, d);
+		assert_eq!(date(day(2026, 6, 13)), "2026-06-13");
+		// Four months on from the 13th of June, the window is the one that began on the 13th of October.
+		let monthly = Period::Monthly(day(2026, 6, 13));
+		assert_eq!(monthly.start(day(2026, 10, 20)), day(2026, 10, 13));
+		assert_eq!(monthly.start(day(2026, 10, 13)), day(2026, 10, 13));
+		assert_eq!(monthly.start(day(2026, 10, 12)), day(2026, 9, 13));
+		// The 31st is a shorter month's last day, and the next long month's 31st again.
+		let end = Period::Monthly(day(2026, 1, 31));
+		assert_eq!(end.start(day(2026, 2, 28)), day(2026, 2, 28));
+		assert_eq!(end.start(day(2026, 3, 30)), day(2026, 2, 28));
+		assert_eq!(end.start(day(2026, 3, 31)), day(2026, 3, 31));
+		assert_eq!(end.start(day(2028, 2, 29)), day(2028, 2, 29));
+		// Across a year, and before it begins.
+		assert_eq!(monthly.start(day(2027, 1, 2)), day(2026, 12, 13));
+		assert_eq!(monthly.start(day(2026, 6, 1)), day(2026, 6, 1));
+		assert_eq!(monthly.describe(), "a month from the 13th");
+		assert_eq!(
+			(
+				ordinal(1),
+				ordinal(2),
+				ordinal(3),
+				ordinal(11),
+				ordinal(22),
+				ordinal(31)
+			),
+			(
+				"1st".into(),
+				"2nd".into(),
+				"3rd".into(),
+				"11th".into(),
+				"22nd".into(),
+				"31st".into()
+			)
+		);
+
+		// Spend from before the window's first day does not count against it.
+		let budgets = Budgets::default();
+		let alice = KeyId([5; 16]);
+		let who = Who {
+			user: Some(alice),
+			..Who::default()
+		};
+		let now = SystemTime::now();
+		let today = day_of(now);
+		budgets.replace(vec![budget(
+			"team",
+			Scope::User(alice),
+			1,
+			Period::Monthly(today.saturating_sub(40)),
+			true,
+		)]);
+		budgets.add_spent(Subject::User(alice), today.saturating_sub(35), PICO);
+		assert!(budgets.reserve(&who, PICO / 2, now).is_ok());
+		budgets.replace(vec![
+			budget("team", Scope::User(alice), 1, Period::Monthly(today), true),
+			budget("project", Scope::Project, 1, Period::Day, true),
+		]);
+		let over = budgets.reserve(&who, 2 * PICO, now).unwrap_err();
+		assert_eq!((over.budget.as_str(), over.scope), ("team", "user"));
 	}
 
 	#[test]

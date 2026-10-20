@@ -285,8 +285,9 @@ through and names itself in the `x-psyche-budget-warning` header.
 ```sh
 curl -X POST $PSYCHE/ai/v1/admin/budgets -H "Authorization: Bearer $SERVICE_KEY" \
   -d '{"name": "ci daily", "amount": 5, "period": "day", "key_id": "<key id>"}'
-# period: day, month, rolling with "days": 1-366, or since with "starts_on" (a billing period's
-# first day, YYYY-MM-DD); "hard": false for a soft budget.
+# period: day, month, rolling with "days": 1-366, since with "starts_on" (a billing period's
+# first day, YYYY-MM-DD), or monthly with "starts_on" (a month at a time, starting again on each
+# anniversary of that day, a short month's last day for the 31st); "hard": false for a soft budget.
 # Whom it is for, one of: key_id, "every_user": true, user_id, group_id; none for the project.
 # GET lists them, DELETE /ai/v1/admin/budgets/<id> removes one.
 curl -X PATCH $PSYCHE/ai/v1/admin/budgets/<id> -H "Authorization: Bearer $SERVICE_KEY" \
@@ -301,8 +302,9 @@ token is at least a byte; an inline image counts 2,000 tokens) and the reply's c
 the model's `max_output_tokens`), at the model's price. When it ends, the reservation becomes what
 the provider reported. So two calls that each fit cannot both be sent into room for one, and a long
 reply cannot run through a budget: its room was taken before it started. A refusal is a 429 with
-the code `budget_exceeded` (OpenAI's type `insufficient_quota`) and a sentence naming the budget,
-what it has left and what the call could cost. A model with no price cannot be budgeted, so a call
+the code `budget_exceeded` (OpenAI's type `insufficient_quota`), a sentence naming the budget,
+what it has left and what the call could cost, and `scope`: whose budget it was (`project`, `key`,
+`user` or `group`), so an app can tell its user's own budget from the project's. A model with no price cannot be budgeted, so a call
 to one that a budget covers is refused.
 
 Spend is held in memory, per day, and read at start from `psyche.usage_daily` (which keeps each
@@ -367,8 +369,8 @@ curl -X POST $PSYCHE/ai/v1/admin/limits -H "Authorization: Bearer $SERVICE_KEY" 
 
 They are token buckets in memory, refilled continuously. A call takes one request and its token
 bound (the same worst case a budget reserves) from every limit on it, and gives back what it did
-not use when it ends. Over a limit, it is refused with 429, the code `rate_limit_exceeded`, a
-`retry-after` and a sentence saying which limit; a call whose bound is more than a limit's whole
+not use when it ends. Over a limit, it is refused with 429, the code `rate_limit_exceeded`, its
+`scope` as for a budget, a `retry-after` and a sentence saying which limit; a call whose bound is more than a limit's whole
 minute is refused without a `retry-after`, since waiting would not help. Every response to a call
 a limit applies to carries OpenAI's `x-ratelimit-limit-*`, `-remaining-*` and `-reset-*` headers
 for requests and tokens, from the tightest limit. A limit that is not changed keeps its bucket

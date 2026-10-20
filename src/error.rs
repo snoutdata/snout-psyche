@@ -124,6 +124,9 @@ pub struct ApiError {
 	pub status: Option<StatusCode>,
 	/// `retry-after`, passed on from a provider that rate-limited.
 	pub retry_after: Option<String>,
+	/// For a budget or limit of Psyche's own: whose it is (`project`, `key`, `user`, `group`), so a
+	/// client can tell its own budget from the project's.
+	pub scope: Option<&'static str>,
 }
 
 impl ApiError {
@@ -134,7 +137,13 @@ impl ApiError {
 			provider: None,
 			status: None,
 			retry_after: None,
+			scope: None,
 		}
+	}
+
+	pub fn scoped(mut self, scope: &'static str) -> Self {
+		self.scope = Some(scope);
+		self
 	}
 
 	pub fn from_provider(mut self, provider: &str) -> Self {
@@ -148,7 +157,7 @@ impl ApiError {
 
 	/// The body, as JSON: OpenAI's `{"error": {...}}`.
 	pub fn body(&self) -> serde_json::Value {
-		json!({
+		let mut body = json!({
 			"error": {
 				"message": self.message,
 				"type": self.class.kind(),
@@ -156,7 +165,11 @@ impl ApiError {
 				"param": null,
 				"provider": self.provider,
 			}
-		})
+		});
+		if let Some(scope) = self.scope {
+			body["error"]["scope"] = scope.into();
+		}
+		body
 	}
 }
 

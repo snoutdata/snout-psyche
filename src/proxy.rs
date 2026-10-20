@@ -1871,7 +1871,8 @@ impl Proxy {
 		match limits.take(who, prompt.saturating_add(output), Instant::now()) {
 			Ok((taken, headers)) => Ok((Some(taken), headers)),
 			Err(refused) => {
-				let mut error = ApiError::new(Class::Limited, refused.message);
+				let mut error =
+					ApiError::new(Class::Limited, refused.message).scoped(refused.scope);
 				error.retry_after = refused
 					.retry_after
 					.map(|d| d.as_secs_f64().ceil().max(1.0).to_string());
@@ -1905,7 +1906,7 @@ impl Proxy {
 		budgets
 			.reserve(who, amount, SystemTime::now())
 			.map(Some)
-			.map_err(|over| ApiError::new(Class::Budget, over.message))
+			.map_err(|over| ApiError::new(Class::Budget, over.message).scoped(over.scope))
 	}
 
 	/// The reply cap to send for a call that names none, when a hard budget applies: the default, or
@@ -3824,6 +3825,8 @@ mod tests {
 				429 => {
 					let body: Value = reply.json().await.unwrap();
 					assert_eq!(body["error"]["code"], "budget_exceeded");
+					// Whose budget refused, so a client can tell its own from the project's.
+					assert_eq!(body["error"]["scope"], "key");
 					assert!(
 						body["error"]["message"]
 							.as_str()
@@ -4854,6 +4857,7 @@ mod tests {
 		assert!((1..=20).contains(&wait), "{wait}");
 		let body: Value = refused.json().await.unwrap();
 		assert_eq!(body["error"]["code"], "rate_limit_exceeded");
+		assert_eq!(body["error"]["scope"], "key");
 		assert!(
 			body["error"]["message"]
 				.as_str()
