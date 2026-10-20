@@ -83,10 +83,11 @@ pub fn last_four(secret: &str) -> String {
 }
 
 /// Sends `provider`, holding `stored`, an empty request on the endpoint `model`'s calls use, and
-/// says whether it took the credential. A refusal is the provider's 401 or 403; anything else it
-/// answers with below 500, a validation error included, means the credential was accepted; a 5xx
-/// or no answer means it could not be checked. The credential is scrubbed from what the provider
-/// says back.
+/// says whether it took the credential. A refusal is the provider's 401 or 403; a 404 means
+/// nothing at that address serves these calls (a base URL missing its `/v1`, say), so it proves
+/// nothing either way and is refused too; anything else it answers with below 500, a validation
+/// error included, means the credential was accepted; a 5xx or no answer means it could not be
+/// checked. The credential is scrubbed from what the provider says back.
 pub async fn prove(
 	http: &reqwest::Client,
 	provider: &Provider,
@@ -150,6 +151,21 @@ pub async fn prove(
 		return Err(format!(
 			"{} refused this credential ({status}): {}",
 			provider.name,
+			said.chars().take(300).collect::<String>()
+		));
+	}
+	if status == 404 {
+		let text = response.text().await.unwrap_or_default();
+		let said = crate::error::scrub(&text, &[secret_of(stored)]);
+		let check = if provider.kind == Kind::Bedrock {
+			"its region, and that the model is offered there"
+		} else {
+			"its base_url, which usually ends in /v1"
+		};
+		return Err(format!(
+			"{} answered 404 at {}, so nothing there serves these calls and the credential could not be checked; check {check}: {}",
+			provider.name,
+			crate::error::scrub(url.as_str(), &[secret_of(stored)]),
 			said.chars().take(300).collect::<String>()
 		));
 	}
@@ -312,5 +328,45 @@ mod tests {
 		assert!(half.stored().is_err());
 		assert!(NewCredential::default().stored().is_err());
 		assert!(name("openai-prod").is_ok() && name("Open AI").is_err() && name("").is_err());
+	}
+
+	#[tokio::test]
+	async fn an_address_that_serves_nothing_proves_nothing() {
+		let fake = crate::fake::Fake::start().await;
+		let spec = crate::providers::Spec::from_json(
+			&format!(
+				r#"{{"providers": [
+					{{"name": "here", "kind": "openai", "base_url": "{0}/v1", "credential": "c"}},
+					{{"name": "lost", "kind": "openai", "base_url": "{0}/missing/v1", "credential": "c"}}
+				],
+				"models": [
+					{{"name": "ok", "provider": "here", "upstream": "fake-ok"}},
+					{{"name": "lost-ok", "provider": "lost", "upstream": "fake-ok"}}
+				]}}"#,
+				fake.origin
+			),
+			&std::collections::HashMap::new(),
+			crate::net::Egress::Private,
+		)
+		.unwrap();
+		let catalogue = crate::providers::Catalogue::build(&spec).unwrap();
+		let http = crate::net::client(crate::net::Egress::Private).unwrap();
+		let key = Stored::ApiKey(Secret::new(crate::fake::Fake::KEY.to_string()));
+		let prove_on = |provider: &str, model: &str| {
+			prove(
+				&http,
+				spec.provider(provider).unwrap(),
+				catalogue.model(model).unwrap(),
+				&key,
+			)
+		};
+		assert_eq!(prove_on("here", "ok").await, Ok(()));
+		let refused = prove_on("lost", "lost-ok").await.unwrap_err();
+		assert!(refused.contains("answered 404"), "{refused}");
+		assert!(
+			refused.contains("/missing/v1/chat/completions"),
+			"{refused}"
+		);
+		assert!(!refused.contains(crate::fake::Fake::KEY), "{refused}");
 	}
 }

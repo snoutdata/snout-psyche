@@ -213,8 +213,9 @@ curl -X PUT $PSYCHE/ai/v1/admin/credentials/openai -H "Authorization: Bearer $SE
 Before a credential is stored it is **proven**: each provider that names it is sent an empty
 request on the endpoint its calls use. A provider answers that with 401 or 403 when it does not
 take the credential and with a validation error when it does, so the check spends no tokens and
-tests the base URL too. A refused credential, or one that cannot be checked (no answer, a 5xx), is
-not stored, and the provider's reply comes back with the key scrubbed out of it. The next call uses
+tests the base URL too: a 404 means nothing at that address serves these calls (a base URL missing
+its `/v1`, say), which proves nothing, so it is refused as well. A refused credential, or one that
+cannot be checked (no answer, a 5xx), is not stored, and the provider's reply comes back with the key scrubbed out of it. The next call uses
 a stored credential at once, with no restart, and a change made any other way (SQL included)
 reaches Psyche through the same trigger as keys.
 

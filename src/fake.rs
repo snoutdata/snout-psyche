@@ -53,6 +53,8 @@
 //! A request without `Authorization: Bearer` + [`Fake::KEY`] (or the key in [`Fake::GATE_HEADER`],
 //! as a gateway in front of a server checks one) gets OpenAI's 401, which echoes the
 //! key it was given, as OpenAI's does: that is what proves Psyche scrubs its own key from errors.
+//! A request whose path starts with `/missing/` gets OpenAI's 404, as a provider answers an address
+//! it does not serve (a base URL without its `/v1`), whatever key it holds.
 //! Everything received is kept ([`Fake::last`]), and a stream the client dropped before its end is
 //! counted ([`Fake::cancelled`]).
 
@@ -195,6 +197,13 @@ async fn answer(
 			gate: header(Fake::GATE_HEADER),
 			body: body.clone(),
 		});
+	}
+	if uri.path().starts_with("/missing/") {
+		return error(
+			StatusCode::NOT_FOUND,
+			&format!("Invalid URL (POST {})", uri.path()),
+			"invalid_request_error",
+		);
 	}
 	if uri.path().starts_with("/model/") {
 		return bedrock(shared, &uri, &headers, &raw, &body);
