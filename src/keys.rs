@@ -254,7 +254,9 @@ impl Stale {
 			"budgets" => self.budgets = true,
 			"limits" => self.limits = true,
 			"members" => self.members = true,
-			"credentials" | "providers" | "models" | "model_grants" => self.catalogue = true,
+			"credentials" | "providers" | "models" | "model_grants" | "routes" => {
+				self.catalogue = true;
+			}
 			"credits" => self.budgets = true,
 			"groups" => {
 				self.budgets = true;

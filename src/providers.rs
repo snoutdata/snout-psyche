@@ -293,6 +293,48 @@ pub struct Model {
 pub struct Catalogue {
 	models: Vec<Arc<Model>>,
 	by_name: HashMap<String, Arc<Model>>,
+	routes: Vec<Arc<Route>>,
+}
+
+/// A name a caller may ask for that stands for several models (PS15): tried in turn, each next one
+/// only when the one before failed for a reason that was not the caller's (`proxy.rs`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Route {
+	pub name: String,
+	/// The models, as written; those not in the catalogue are skipped and named by the admin API.
+	pub targets: Vec<String>,
+	pub sort: Sort,
+}
+
+/// The order a route tries its models in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Sort {
+	/// As written.
+	#[default]
+	Order,
+	/// The cheapest first, by input plus output price per token; a model with no price last, and
+	/// a tie kept in written order.
+	Price,
+}
+
+impl Sort {
+	pub fn as_str(self) -> &'static str {
+		match self {
+			Sort::Order => "order",
+			Sort::Price => "price",
+		}
+	}
+}
+
+/// A route as the file or a row writes it.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RouteSpec {
+	pub name: String,
+	pub targets: Vec<String>,
+	#[serde(default)]
+	pub sort: Sort,
 }
 
 /// A catalogue before its models are built: the providers, resolved (with what the environment
@@ -302,6 +344,7 @@ pub struct Catalogue {
 pub struct Spec {
 	pub providers: Vec<Arc<Provider>>,
 	pub models: Vec<ModelSpec>,
+	pub routes: Vec<RouteSpec>,
 }
 
 #[derive(Deserialize)]
@@ -309,6 +352,8 @@ pub struct Spec {
 struct File {
 	providers: Vec<ProviderEntry>,
 	models: Vec<ModelSpec>,
+	#[serde(default)]
+	routes: Vec<RouteSpec>,
 }
 
 #[derive(Deserialize)]
@@ -525,6 +570,7 @@ impl Spec {
 			spec.providers.push(Arc::new(resolve(entry, env, egress)?));
 		}
 		spec.models = file.models;
+		spec.routes = file.routes;
 		Ok(spec)
 	}
 
@@ -630,7 +676,65 @@ impl Catalogue {
 				Err(why) => skipped.push((entry.name.clone(), why)),
 			}
 		}
+		for entry in &spec.routes {
+			let why = if !seen.insert(entry.name.clone()) {
+				Some(format!(
+					"the route {} has the name of a model or another route",
+					entry.name
+				))
+			} else if entry.targets.is_empty() {
+				Some(format!("the route {} names no models", entry.name))
+			} else if strict
+				&& let Some(missing) = entry
+					.targets
+					.iter()
+					.find(|t| !catalogue.by_name.contains_key(*t))
+			{
+				Some(format!(
+					"the route {} names the model {missing}, which is not among the models",
+					entry.name
+				))
+			} else {
+				None
+			};
+			match why {
+				Some(why) if strict => return Err(ConfigError(why)),
+				Some(why) => skipped.push((entry.name.clone(), why)),
+				None => catalogue.routes.push(Arc::new(Route {
+					name: entry.name.clone(),
+					targets: entry.targets.clone(),
+					sort: entry.sort,
+				})),
+			}
+		}
 		Ok((catalogue, skipped))
+	}
+
+	pub fn route(&self, name: &str) -> Option<&Arc<Route>> {
+		self.routes.iter().find(|r| r.name == name)
+	}
+
+	/// Every route, in the order the catalogue lists them.
+	pub fn routes(&self) -> &[Arc<Route>] {
+		&self.routes
+	}
+
+	/// The models a route tries, in the order it tries them: those in the catalogue, sorted as it
+	/// says.
+	pub fn targets(&self, route: &Route) -> Vec<Arc<Model>> {
+		let mut models: Vec<Arc<Model>> = route
+			.targets
+			.iter()
+			.filter_map(|t| self.by_name.get(t).cloned())
+			.collect();
+		if route.sort == Sort::Price {
+			// A stable sort, so equal prices keep the written order.
+			models.sort_by_key(|m| {
+				m.price
+					.map_or(u64::MAX, |p| p.rates.input.saturating_add(p.rates.output))
+			});
+		}
+		models
 	}
 
 	pub fn model(&self, name: &str) -> Option<&Arc<Model>> {
@@ -687,6 +791,7 @@ impl Catalogue {
 			out.by_name.insert(model.name.clone(), model.clone());
 			out.models.push(model);
 		}
+		out.routes = self.routes.clone();
 		out
 	}
 

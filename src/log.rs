@@ -222,7 +222,7 @@ async fn write(client: &mut Client, batch: &[Call]) -> Result<(), tokio_postgres
 		.copy_in(
 			"COPY psyche.requests (at, operation, model, provider, streamed, outcome, \
 			 prompt_tokens, completion_tokens, cached_tokens, cache_write_tokens, reasoning_tokens, \
-			 first_byte_ms, total_ms, cost, key_id, user_id, group_id, credits, budget_warning) \
+			 first_byte_ms, total_ms, cost, key_id, user_id, group_id, credits, budget_warning, route, attempt) \
 			 FROM STDIN BINARY",
 		)
 		.await?;
@@ -248,6 +248,8 @@ async fn write(client: &mut Client, batch: &[Call]) -> Result<(), tokio_postgres
 			Type::UUID,
 			Type::BOOL,
 			Type::TEXT,
+			Type::TEXT,
+			Type::INT2,
 		],
 	);
 	let mut writer = std::pin::pin!(writer);
@@ -275,6 +277,8 @@ async fn write(client: &mut Client, batch: &[Call]) -> Result<(), tokio_postgres
 				&call.who.group,
 				&call.credits,
 				&call.budget_warning,
+				&call.route,
+				&i16::try_from(call.attempt).unwrap_or(i16::MAX),
 			])
 			.await?;
 	}
@@ -600,6 +604,8 @@ pub(crate) mod tests {
 			total: Duration::from_millis(900),
 			credits: false,
 			budget_warning: None,
+			route: None,
+			attempt: 1,
 		}
 	}
 

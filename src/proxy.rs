@@ -154,6 +154,10 @@ pub struct Call {
 	pub credits: bool,
 	/// The soft budgets the call went over, as the response's header names them.
 	pub budget_warning: Option<String>,
+	/// The route the caller named, or `models` for OpenRouter's fallback list; `None` for a model.
+	pub route: Option<String>,
+	/// Which attempt of the call this was, from 1.
+	pub attempt: u16,
 }
 
 impl Call {
@@ -201,6 +205,8 @@ impl Operation {
 pub struct Inbound {
 	pub body: Map<String, Value>,
 	pub model: String,
+	/// OpenRouter's `models`: more to try, in order, after `model`. Taken out of the body.
+	pub fallbacks: Vec<String>,
 	pub stream: bool,
 	/// Whether the caller asked for the usage chunk itself.
 	pub wants_usage: bool,
@@ -214,14 +220,41 @@ impl Inbound {
 				format!("The request is not valid JSON: {e}"),
 			)
 		})?;
-		let Value::Object(body) = value else {
+		let Value::Object(mut body) = value else {
 			return Err(ApiError::new(
 				Class::BadRequest,
 				"The request is a JSON object.",
 			));
 		};
+		// OpenRouter's fallback list, and its `route: "fallback"`, which says what a list already
+		// does; neither goes to a provider.
+		body.remove("route");
+		let mut fallbacks = match body.remove("models") {
+			None | Some(Value::Null) => Vec::new(),
+			Some(Value::Array(names))
+				if names.len() <= models::MOST_TARGETS
+					&& names
+						.iter()
+						.all(|n| n.as_str().is_some_and(|n| !n.is_empty())) =>
+			{
+				names
+					.iter()
+					.filter_map(|n| n.as_str().map(String::from))
+					.collect()
+			}
+			Some(_) => {
+				return Err(ApiError::new(
+					Class::BadRequest,
+					format!(
+						"models is a list of up to {} model names, tried in order after model.",
+						models::MOST_TARGETS
+					),
+				));
+			}
+		};
 		let model = match body.get("model") {
 			Some(Value::String(model)) if !model.is_empty() => model.clone(),
+			None | Some(Value::Null) if !fallbacks.is_empty() => fallbacks.remove(0),
 			_ => {
 				return Err(ApiError::new(
 					Class::BadRequest,
@@ -244,6 +277,7 @@ impl Inbound {
 		Ok(Self {
 			body,
 			model,
+			fallbacks,
 			stream,
 			wants_usage,
 		})
@@ -419,6 +453,8 @@ pub fn router(proxy: Arc<Proxy>) -> Router {
 		)
 		.route("/admin/models", get(list_models))
 		.route("/admin/models/{*name}", put(set_model).delete(delete_model))
+		.route("/admin/routes", get(list_routes))
+		.route("/admin/routes/{*name}", put(set_route).delete(delete_route))
 		.route("/admin/credentials", get(list_credentials))
 		.route("/admin/usage", get(usage))
 		.route("/admin/requests", get(requests))
@@ -474,9 +510,8 @@ async fn models(State(proxy): State<Arc<Proxy>>, headers: HeaderMap) -> Response
 		Err(error) => return error.into_response(),
 	};
 	let who = caller.who(proxy.keys.as_ref().map(|k| &k.members));
-	let data: Vec<Value> = proxy
-		.catalogue
-		.get()
+	let catalogue = proxy.catalogue.get();
+	let mut data: Vec<Value> = catalogue
 		.models()
 		.iter()
 		.filter(|m| caller.may_use(&m.name) && proxy.granted(&m.name, &who))
@@ -487,6 +522,19 @@ async fn models(State(proxy): State<Arc<Proxy>>, headers: HeaderMap) -> Response
 				"pricing": m.price.map(|p| p.to_json())})
 		})
 		.collect();
+	// A route, with the models it tries that this caller may use; one with none is not listed.
+	for route in catalogue.routes() {
+		let targets: Vec<String> = catalogue
+			.targets(route)
+			.iter()
+			.filter(|m| proxy.granted(&m.name, &who))
+			.map(|m| m.name.clone())
+			.collect();
+		if caller.may_use(&route.name) && !targets.is_empty() {
+			data.push(json!({"id": route.name, "object": "model", "created": 0,
+				"owned_by": "route", "targets": targets}));
+		}
+	}
 	axum::Json(json!({"object": "list", "data": data})).into_response()
 }
 
@@ -922,6 +970,67 @@ async fn delete_model(
 	.await;
 	match result {
 		Ok(done) => axum::Json(done).into_response(),
+		Err(error) => error.into_response(),
+	}
+}
+
+async fn list_routes(State(proxy): State<Arc<Proxy>>, headers: HeaderMap) -> Response {
+	let result = async {
+		let (_, client) = admin(&proxy, &headers).await?;
+		let held = held_tables(&proxy)?;
+		models::list_routes(&client, held).await.map_err(refused)
+	}
+	.await;
+	match result {
+		Ok(data) => axum::Json(json!({"object": "list", "data": data})).into_response(),
+		Err(error) => error.into_response(),
+	}
+}
+
+async fn set_route(
+	State(proxy): State<Arc<Proxy>>,
+	headers: HeaderMap,
+	Path(name): Path<String>,
+	body: Result<Bytes, BytesRejection>,
+) -> Response {
+	let result = async {
+		let (_, client) = admin(&proxy, &headers).await?;
+		let held = held_tables(&proxy)?;
+		let body = body.map_err(|r| ApiError::new(Class::BadRequest, r.body_text()))?;
+		let new: models::NewRoute = serde_json::from_slice(&body).map_err(|e| {
+			ApiError::new(
+				Class::BadRequest,
+				format!(
+					"A route is made from targets (the models, in order) and sort (order or price): {e}"
+				),
+			)
+		})?;
+		models::put_route(&client, held, &name, new)
+			.await
+			.map_err(refused)
+	}
+	.await;
+	match result {
+		Ok(made) => axum::Json(made).into_response(),
+		Err(error) => error.into_response(),
+	}
+}
+
+async fn delete_route(
+	State(proxy): State<Arc<Proxy>>,
+	headers: HeaderMap,
+	Path(name): Path<String>,
+) -> Response {
+	let result = async {
+		let (_, client) = admin(&proxy, &headers).await?;
+		let held = held_tables(&proxy)?;
+		models::delete_route(&client, held, &name)
+			.await
+			.map_err(refused)
+	}
+	.await;
+	match result {
+		Ok(()) => StatusCode::NO_CONTENT.into_response(),
 		Err(error) => error.into_response(),
 	}
 }
@@ -1660,7 +1769,7 @@ async fn requests(
 				"SELECT (extract(epoch FROM at) * 1000)::bigint, operation, model, provider, streamed, \
 				 outcome, prompt_tokens, completion_tokens, cached_tokens, reasoning_tokens, first_byte_ms, \
 				 total_ms, cost::text, key_id::text, user_id::text, group_id::text, credits, budget_warning, \
-				 (extract(epoch FROM at) * 1000000)::bigint \
+				 (extract(epoch FROM at) * 1000000)::bigint, route, attempt \
 				 FROM psyche.requests \
 				 WHERE ($1::bigint IS NULL OR at < timestamptz 'epoch' + $1::bigint * interval '1 microsecond') \
 				 AND ($2::text IS NULL OR model = $2) AND ($3::text IS NULL OR outcome = $3) \
@@ -1693,6 +1802,8 @@ async fn requests(
 					"group_id": row.get::<_, Option<String>>(15),
 					"credits": row.get::<_, bool>(16),
 					"budget_warning": row.get::<_, Option<String>>(17),
+					"route": row.get::<_, Option<String>>(19),
+					"attempt": row.get::<_, Option<i16>>(20),
 				})
 			})
 			.collect();
@@ -1894,6 +2005,11 @@ impl Proxy {
 		}
 	}
 
+	/// A call: the caller, what it named and what that stands for (a model, a route's models, and
+	/// OpenRouter's `models` after them), then each in turn until one answers. A target is tried
+	/// again once on a failure a moment may fix, and the next is tried on any failure that was not
+	/// the caller's (`Class::falls_over`); never once the reply has started. Each attempt is its own
+	/// row in the request log.
 	async fn forward(
 		&self,
 		headers: &HeaderMap,
@@ -1910,33 +2026,138 @@ impl Proxy {
 			error.status = Some(rejection.status());
 			error
 		})?;
-		let mut inbound = Inbound::parse(&body)?;
-		let model = self
-			.catalogue
-			.get()
-			.model(&inbound.model)
-			.cloned()
-			.ok_or_else(|| {
-				ApiError::new(
-					Class::ModelNotFound,
-					format!(
-						"There is no model named {} here. GET /ai/v1/models lists them.",
+		let inbound = Inbound::parse(&body)?;
+		let catalogue = self.catalogue.get();
+		let mut targets: Vec<Arc<Model>> = Vec::new();
+		let mut route = None;
+		for (i, named) in std::iter::once(&inbound.model)
+			.chain(&inbound.fallbacks)
+			.enumerate()
+		{
+			if !caller.may_use(named) {
+				return Err(ApiError::new(
+					Class::Forbidden,
+					format!("This key may not use {named}."),
+				));
+			}
+			let models = match (catalogue.route(named), catalogue.model(named)) {
+				(Some(r), _) => {
+					if i == 0 {
+						route = Some(r.name.clone());
+					}
+					catalogue.targets(r)
+				}
+				(None, Some(model)) => vec![model.clone()],
+				(None, None) => {
+					return Err(ApiError::new(
+						Class::ModelNotFound,
+						format!(
+							"There is no model named {named} here. GET /ai/v1/models lists them."
+						),
+					));
+				}
+			};
+			for model in models {
+				if !targets.iter().any(|t| t.name == model.name) {
+					targets.push(model);
+				}
+			}
+		}
+		if !inbound.fallbacks.is_empty() && route.is_none() {
+			route = Some("models".to_string());
+		}
+		let open: Vec<Arc<Model>> = targets
+			.into_iter()
+			.filter(|m| self.granted(&m.name, &who))
+			.collect();
+		if open.is_empty() {
+			return Err(ApiError::new(
+				Class::Forbidden,
+				match route {
+					None => format!("{} is not open to this account.", inbound.model),
+					Some(_) => format!(
+						"None of the models {} stands for is open to this account.",
 						inbound.model
 					),
-				)
-			})?;
-		if !self.granted(&model.name, &who) {
-			return Err(ApiError::new(
-				Class::Forbidden,
-				format!("{} is not open to this account.", model.name),
+				},
 			));
 		}
-		if !caller.may_use(&model.name) {
-			return Err(ApiError::new(
-				Class::Forbidden,
-				format!("This key may not use {}.", model.name),
-			));
+		// The prompt's upper bound, from what the caller sent, for a call a budget or a limit applies
+		// to.
+		let budgeted = self.budgets.as_ref().is_some_and(|b| b.applies(&who));
+		let limited = self.limits.as_ref().is_some_and(|l| l.applies(&who));
+		let shared = Shared {
+			budgeted,
+			limited,
+			prompt_bound: (budgeted || limited).then(|| budgets::prompt_bound(&body)),
+			route,
+			taken: Arc::default(),
+			rate: std::sync::Mutex::default(),
+		};
+		let mut number = 0u16;
+		let mut last = None;
+		for (i, model) in open.iter().enumerate() {
+			let mut tries = 0;
+			loop {
+				number += 1;
+				tries += 1;
+				let result = self
+					.attempt(
+						inbound.clone(),
+						operation,
+						model.clone(),
+						who,
+						&shared,
+						number,
+					)
+					.await;
+				let error = match result {
+					Ok(out) => return Ok(shared.finish(out)),
+					Err(error) => error,
+				};
+				if let Some(wait) = again(&error, tries) {
+					tokio::time::sleep(wait).await;
+					continue;
+				}
+				if error.class.falls_over() && i + 1 < open.len() {
+					tracing::info!(target: "psyche::route", model = %model.name, class = error.class.code(), "falling over to the next target");
+					last = Some(error);
+					break;
+				}
+				return Err(error);
+			}
 		}
+		Err(last.unwrap_or_else(|| ApiError::new(Class::Upstream, "No model answered.")))
+	}
+
+	/// The rate limits a call takes, once whichever attempt gets there first; refused, the call is.
+	fn take_once(
+		&self,
+		who: &Who,
+		prompt_bound: Option<u64>,
+		output: u64,
+		shared: &Shared,
+	) -> Result<(), ApiError> {
+		let mut rate = shared.rate.lock().unwrap_or_else(|p| p.into_inner());
+		if rate.is_some() {
+			return Ok(());
+		}
+		let (taken, headers) = self.take(who, prompt_bound, output)?;
+		*shared.taken.lock().unwrap_or_else(|p| p.into_inner()) = taken;
+		*rate = Some(headers);
+		Ok(())
+	}
+
+	/// One target, once.
+	async fn attempt(
+		&self,
+		mut inbound: Inbound,
+		operation: Operation,
+		model: Arc<Model>,
+		who: Who,
+		shared: &Shared,
+		number: u16,
+	) -> Result<Response, ApiError> {
 		if let Some(name) = &model.provider.credential
 			&& model.provider.api_key.is_none()
 			&& model.provider.aws.is_none()
@@ -1952,9 +2173,12 @@ impl Proxy {
 		}
 		// The prompt's upper bound, from what the caller sent, for a call a budget or a limit applies
 		// to.
-		let budgeted = self.budgets.as_ref().is_some_and(|b| b.applies(&who));
-		let limited = self.limits.as_ref().is_some_and(|l| l.applies(&who));
-		let prompt_bound = (budgeted || limited).then(|| budgets::prompt_bound(&body));
+		let Shared {
+			budgeted,
+			limited,
+			prompt_bound,
+			..
+		} = *shared;
 		let provider = &model.provider;
 		if operation == Operation::Embeddings {
 			if inbound.stream {
@@ -1974,12 +2198,12 @@ impl Proxy {
 				Kind::Bedrock => {
 					let reservation =
 						self.reserve(&who, &model, prompt_bound.filter(|_| budgeted), 0)?;
-					let (taken, rate) = self.take(&who, prompt_bound.filter(|_| limited), 0)?;
+					self.take_once(&who, prompt_bound.filter(|_| limited), 0, shared)?;
 					let warned = warned(&reservation);
 					let out = self
-						.embed(&inbound, &model, who, reservation, taken)
+						.embed(&inbound, &model, who, reservation, shared, number)
 						.await?;
-					return Ok(headed(warn(labelled(out, &model), warned), rate));
+					return Ok(warn(labelled(out, &model), warned));
 				}
 			}
 		}
@@ -1997,7 +2221,7 @@ impl Proxy {
 			_ => 0,
 		};
 		let reservation = self.reserve(&who, &model, prompt_bound.filter(|_| budgeted), output)?;
-		let (taken, rate) = self.take(&who, prompt_bound.filter(|_| limited), output)?;
+		self.take_once(&who, prompt_bound.filter(|_| limited), output, shared)?;
 		let warned = warned(&reservation);
 		let (path, accept) = match provider.kind {
 			Kind::Openai => (operation.path().to_string(), "text/event-stream"),
@@ -2053,10 +2277,12 @@ impl Proxy {
 				total: Duration::ZERO,
 				credits: false,
 				budget_warning: None,
+				route: shared.route.clone(),
+				attempt: number,
 			},
 			started,
 			reservation,
-			taken,
+			taken: shared.taken.clone(),
 			billable: false,
 		};
 		let response = match tokio::time::timeout(self.timeouts.first_byte, request.send()).await {
@@ -2090,7 +2316,7 @@ impl Proxy {
 		} else {
 			self.whole(response, &model, record).await?
 		};
-		Ok(headed(warn(labelled(out, &model), warned), rate))
+		Ok(warn(labelled(out, &model), warned))
 	}
 
 	/// Embeddings from a Bedrock model, in the InvokeModel body the catalogue names for it: every
@@ -2103,7 +2329,8 @@ impl Proxy {
 		model: &Model,
 		who: Who,
 		reservation: Option<Reservation>,
-		taken: Option<Taken>,
+		shared: &Shared,
+		number: u16,
 	) -> Result<Response, ApiError> {
 		let provider = &model.provider;
 		let family = model.embeddings.ok_or_else(|| {
@@ -2141,10 +2368,12 @@ impl Proxy {
 				total: Duration::ZERO,
 				credits: false,
 				budget_warning: None,
+				route: shared.route.clone(),
+				attempt: number,
 			},
 			started: Instant::now(),
 			reservation,
-			taken,
+			taken: shared.taken.clone(),
 			// Each text is its own call, and some may be billed before another fails.
 			billable: true,
 		};
@@ -2580,14 +2809,78 @@ async fn read(mut response: reqwest::Response, limit: usize) -> Result<Vec<u8>, 
 
 /// A call in flight. Whatever ends it (completion, failure, or the caller dropping the stream),
 /// it is recorded exactly once, when this is dropped.
+/// What the attempts of one call share.
+struct Shared {
+	budgeted: bool,
+	limited: bool,
+	prompt_bound: Option<u64>,
+	route: Option<String>,
+	taken: Arc<std::sync::Mutex<Option<Taken>>>,
+	/// The rate-limit headers, once a limit was taken.
+	rate: std::sync::Mutex<Option<limits::Headers>>,
+}
+
+impl Shared {
+	/// The answer, with the call's rate-limit headers and, for a route, which it was.
+	fn finish(&self, out: Response) -> Response {
+		let rate = self
+			.rate
+			.lock()
+			.unwrap_or_else(|p| p.into_inner())
+			.take()
+			.unwrap_or_default();
+		let mut out = headed(out, rate);
+		if let Some(route) = &self.route
+			&& let Ok(value) = HeaderValue::from_str(route)
+		{
+			out.headers_mut().insert("x-psyche-route", value);
+		}
+		out
+	}
+}
+
+/// The longest a provider's `retry-after` is waited out on the same target; a longer one moves to
+/// the next target, or comes back to the caller.
+const LONGEST_RETRY_WAIT: Duration = Duration::from_secs(2);
+
+/// Whether to try the same target again after `error`, on its `tries`-th try, and after how long:
+/// once, on a rate limit with a short or no `retry-after`, a 5xx or no connection. Never on a
+/// timeout, which already took its whole wait.
+fn again(error: &ApiError, tries: u32) -> Option<Duration> {
+	if tries > 1 {
+		return None;
+	}
+	match error.class {
+		Class::RateLimited => {
+			let wait = match error.retry_after.as_deref().map(str::parse::<f64>) {
+				None => jitter(),
+				Some(Ok(seconds)) if seconds >= 0.0 => Duration::from_secs_f64(seconds),
+				Some(_) => return None,
+			};
+			(wait <= LONGEST_RETRY_WAIT).then_some(wait)
+		}
+		Class::Upstream | Class::Transport => Some(jitter()),
+		_ => None,
+	}
+}
+
+/// 100 to 300 ms, so callers that failed together do not come back together.
+fn jitter() -> Duration {
+	let nanos = SystemTime::now()
+		.duration_since(UNIX_EPOCH)
+		.map_or(0, |d| d.subsec_nanos());
+	Duration::from_millis(100 + u64::from(nanos % 200))
+}
+
 struct Record {
 	sink: Option<tokio::sync::mpsc::UnboundedSender<Call>>,
 	call: Call,
 	started: Instant,
 	/// The room held in the call's budgets, settled when this is dropped.
 	reservation: Option<Reservation>,
-	/// What the call took from its rate limits; the tokens it did not use go back when it ends.
-	taken: Option<Taken>,
+	/// What the call took from its rate limits, shared by its attempts; the tokens it did not use go
+	/// back when the attempt that answered ends, and a failed attempt leaves it for the next.
+	taken: Arc<std::sync::Mutex<Option<Taken>>>,
 	/// Whether the provider may have produced anything it bills for: false until a successful
 	/// response starts, so a refused or failed request releases its reservation and is charged
 	/// nothing.
@@ -2625,7 +2918,9 @@ impl Drop for Record {
 			first_byte_ms = call.first_byte.as_millis() as u64,
 			total_ms = call.total.as_millis() as u64,
 		);
-		if let Some(taken) = self.taken.take() {
+		if self.billable
+			&& let Some(taken) = self.taken.lock().unwrap_or_else(|p| p.into_inner()).take()
+		{
 			taken.settle(self.call.usage.map(|u| u.total()));
 		}
 		if let Some(reservation) = self.reservation.take() {
@@ -2892,7 +3187,13 @@ mod tests {
 						{{"name": "embed", "provider": "fake", "upstream": "fake-embed"}},
 						{{"name": "titan", "provider": "bedrock", "upstream": "amazon.titan-embed-text-v2:0", "embeddings": "titan"}},
 						{{"name": "cohere", "provider": "bedrock-key", "upstream": "cohere.embed-english-v3", "embeddings": "cohere"}},
-						{{"name": "cohere-throttle", "provider": "bedrock", "upstream": "cohere.embed-fake-throttle", "embeddings": "cohere"}}
+						{{"name": "cohere-throttle", "provider": "bedrock", "upstream": "cohere.embed-fake-throttle", "embeddings": "cohere"}},
+						{{"name": "ok-cheap", "provider": "fake", "upstream": "fake-ok", "price": {{"input": 0.1, "output": 0.2}}}}
+					],
+					"routes": [
+						{{"name": "falls-over", "targets": ["fails", "ok"]}},
+						{{"name": "cheapest", "targets": ["ok-priced", "ok-cheap"], "sort": "price"}},
+						{{"name": "picky-first", "targets": ["picky", "ok"]}}
 					]}}"#,
 					fake.origin
 				),
@@ -4872,7 +5173,10 @@ mod tests {
 			.await
 			.unwrap();
 		assert_eq!(fails.status(), 502);
-		assert_eq!(s.call().await.outcome, Outcome::Failed(Class::Upstream));
+		// A 5xx is asked once more before it comes back, and each try is its own row.
+		let (first, second) = (s.call().await, s.call().await);
+		assert_eq!((first.attempt, second.attempt), (1, 2));
+		assert_eq!(second.outcome, Outcome::Failed(Class::Upstream));
 
 		// No credit left is the owner's billing, never a limit to wait out or the caller's request.
 		for model in ["no-credit", "no-credit-402", "claude-no-credit"] {
@@ -5102,6 +5406,251 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn a_route_falls_over_past_what_failed_and_never_past_the_callers_own_mistake() {
+		let mut s = Setup::new().await;
+		let label = |r: &reqwest::Response, h: &str| {
+			r.headers().get(h).map(|v| v.to_str().unwrap().to_string())
+		};
+
+		// The first fails twice (a 5xx is asked once more), and the second answers.
+		let reply = s
+			.post("/ai/v1/chat/completions", chat("falls-over", false))
+			.send()
+			.await
+			.unwrap();
+		assert_eq!(reply.status(), 200);
+		assert_eq!(label(&reply, "x-psyche-model").as_deref(), Some("ok"));
+		assert_eq!(
+			label(&reply, "x-psyche-route").as_deref(),
+			Some("falls-over")
+		);
+		let tried: Vec<(String, u16, Outcome, Option<String>)> =
+			[s.call().await, s.call().await, s.call().await]
+				.into_iter()
+				.map(|c| (c.model, c.attempt, c.outcome, c.route))
+				.collect();
+		let route = Some("falls-over".to_string());
+		assert_eq!(
+			tried,
+			vec![
+				(
+					"fails".into(),
+					1,
+					Outcome::Failed(Class::Upstream),
+					route.clone()
+				),
+				(
+					"fails".into(),
+					2,
+					Outcome::Failed(Class::Upstream),
+					route.clone()
+				),
+				("ok".into(), 3, Outcome::Completed, route),
+			],
+			"the log rows are the routing's explanation"
+		);
+
+		// Sorted by price, the cheaper model answers though it is written second.
+		let reply = s
+			.post("/ai/v1/chat/completions", chat("cheapest", true))
+			.send()
+			.await
+			.unwrap();
+		assert_eq!(label(&reply, "x-psyche-model").as_deref(), Some("ok-cheap"));
+		reply.text().await.unwrap();
+		assert_eq!(s.call().await.model, "ok-cheap");
+
+		// The caller's own bad request is not another model's to answer.
+		let sent = s.fake.count();
+		let reply = s
+			.post("/ai/v1/chat/completions", chat("picky-first", false))
+			.send()
+			.await
+			.unwrap();
+		assert_eq!(reply.status(), 400);
+		assert_eq!(s.fake.count(), sent + 1, "the next target was not asked");
+		assert_eq!(s.call().await.outcome, Outcome::Failed(Class::Rejected));
+
+		// OpenRouter's `models`: a long retry-after is not waited out here, the next is asked, and
+		// the list never reaches the provider.
+		let mut body = chat("limited", false);
+		body["models"] = json!(["ok"]);
+		body["route"] = json!("fallback");
+		let reply = s
+			.post("/ai/v1/chat/completions", body)
+			.send()
+			.await
+			.unwrap();
+		assert_eq!(reply.status(), 200);
+		assert_eq!(label(&reply, "x-psyche-route").as_deref(), Some("models"));
+		let (first, second) = (s.call().await, s.call().await);
+		assert_eq!(
+			(
+				first.model.as_str(),
+				first.outcome,
+				second.model.as_str(),
+				second.attempt
+			),
+			("limited", Outcome::Failed(Class::RateLimited), "ok", 2)
+		);
+		let sent = &s.fake.last().body;
+		assert!(
+			sent.get("models").is_none() && sent.get("route").is_none(),
+			"{sent}"
+		);
+
+		// `models` alone names the first to try.
+		let reply = s
+			.post(
+				"/ai/v1/chat/completions",
+				json!({"models": ["ok-cheap", "ok"], "messages": [{"role": "user", "content": "hi"}]}),
+			)
+			.send()
+			.await
+			.unwrap();
+		assert_eq!(label(&reply, "x-psyche-model").as_deref(), Some("ok-cheap"));
+		s.call().await;
+		let mut body = chat("ok", false);
+		body["models"] = json!(["no-such-model"]);
+		let reply = s
+			.post("/ai/v1/chat/completions", body)
+			.send()
+			.await
+			.unwrap();
+		assert_eq!(
+			reply.status(),
+			404,
+			"every name is checked before anything is sent"
+		);
+
+		// A route is listed beside the models, with what it tries.
+		let listed: Value = s
+			.client
+			.get(format!("{}/ai/v1/models", s.base))
+			.bearer_auth(jwt::sign(&json!({"role": "service_role"}), SECRET))
+			.send()
+			.await
+			.unwrap()
+			.json()
+			.await
+			.unwrap();
+		let cheapest = listed["data"]
+			.as_array()
+			.unwrap()
+			.iter()
+			.find(|m| m["id"] == "cheapest")
+			.cloned()
+			.unwrap();
+		assert_eq!(cheapest["owned_by"], "route");
+		assert_eq!(cheapest["targets"], json!(["ok-cheap", "ok-priced"]));
+	}
+
+	#[tokio::test]
+	async fn routes_are_rows_the_admin_api_edits_with_no_restart() {
+		let Some((s, _db, _key, _id)) = with_budgets("routes").await else {
+			return;
+		};
+		let service = || jwt::sign(&json!({"role": "service_role"}), SECRET);
+		let admin = |method: reqwest::Method, path: &str, body: Option<Value>| {
+			let request = s
+				.client
+				.request(method, format!("{}/ai/v1/admin/{path}", s.base))
+				.bearer_auth(service());
+			match body {
+				Some(body) => request.json(&body).send(),
+				None => request.send(),
+			}
+		};
+		let put = |name: &str, body: Value| {
+			admin(reqwest::Method::PUT, &format!("routes/{name}"), Some(body))
+		};
+		let call = |model: &str| s.post("/ai/v1/chat/completions", chat(model, false)).send();
+		let routes = || async {
+			let listed: Value = admin(reqwest::Method::GET, "routes", None)
+				.await
+				.unwrap()
+				.json()
+				.await
+				.unwrap();
+			listed["data"].as_array().unwrap().clone()
+		};
+
+		// The file's routes are seeded, and are the file's.
+		let seeded = routes().await;
+		let cheapest = seeded.iter().find(|r| r["name"] == "cheapest").unwrap();
+		assert_eq!(
+			(
+				cheapest["origin"].clone(),
+				cheapest["tried"].clone(),
+				cheapest["served"].clone()
+			),
+			(json!("file"), json!(["ok-cheap", "ok-priced"]), json!(true))
+		);
+		let (status, _, _) =
+			error_of(put("cheapest", json!({"targets": ["ok"]})).await.unwrap()).await;
+		assert_eq!(status, 409);
+
+		// A name is a model's or a route's, never both; every target is a model.
+		let (status, _, message) =
+			error_of(put("ok", json!({"targets": ["ok-cheap"]})).await.unwrap()).await;
+		assert_eq!(status, 409, "{message}");
+		let (status, _, message) = error_of(
+			put("mine", json!({"targets": ["no-such-model"]}))
+				.await
+				.unwrap(),
+		)
+		.await;
+		assert!(
+			status == 400 && message.contains("no-such-model"),
+			"{message}"
+		);
+		let (status, _, _) = error_of(put("mine", json!({"targets": []})).await.unwrap()).await;
+		assert_eq!(status, 400);
+
+		// Made, and served at once.
+		let made = put("mine", json!({"targets": ["fails", "ok-cheap"]}))
+			.await
+			.unwrap();
+		assert_eq!(made.status(), 200);
+		let reply = call("mine").await.unwrap();
+		assert_eq!(reply.status(), 200, "no restart");
+		assert_eq!(reply.headers()["x-psyche-model"], "ok-cheap");
+		let (status, _, _) = error_of(
+			admin(
+				reqwest::Method::PUT,
+				"models/mine",
+				Some(json!({"provider": "fake", "upstream": "fake-ok"})),
+			)
+			.await
+			.unwrap(),
+		)
+		.await;
+		assert_eq!(status, 409, "a model may not take a route's name");
+
+		// A target that is not served is skipped and named; the route keeps the rest.
+		let off = admin(reqwest::Method::DELETE, "models/ok-cheap", None)
+			.await
+			.unwrap();
+		assert_eq!(off.status(), 200);
+		let mine = routes()
+			.await
+			.into_iter()
+			.find(|r| r["name"] == "mine")
+			.unwrap();
+		assert_eq!(
+			(mine["skipped"].clone(), mine["tried"].clone()),
+			(json!(["ok-cheap"]), json!(["fails"]))
+		);
+		assert_eq!(call("mine").await.unwrap().status(), 502);
+
+		let gone = admin(reqwest::Method::DELETE, "routes/mine", None)
+			.await
+			.unwrap();
+		assert_eq!(gone.status(), 204);
+		assert_eq!(call("mine").await.unwrap().status(), 404);
+	}
+
+	#[tokio::test]
 	async fn anthropic_failures() {
 		let mut s = Setup::new().await;
 		let overloaded = s
@@ -5122,7 +5671,9 @@ mod tests {
 				.unwrap()
 				.contains("Overloaded")
 		);
+		// Asked once more first.
 		assert_eq!(s.call().await.outcome, Outcome::Failed(Class::Upstream));
+		assert_eq!(s.call().await.attempt, 2);
 
 		for model in ["claude-overloaded", "claude-truncated"] {
 			let body = s
@@ -5160,7 +5711,11 @@ mod tests {
 			.await
 			.unwrap();
 		assert_eq!(refused.status(), 400);
-		assert_eq!(s.fake.count(), 3, "nothing untranslatable was sent");
+		assert_eq!(
+			s.fake.count(),
+			4,
+			"nothing untranslatable was sent (the 529 was asked twice)"
+		);
 	}
 
 	#[tokio::test]
@@ -5313,7 +5868,10 @@ mod tests {
 			assert_eq!(response.status(), 429, "{model}: a limit to route around");
 			let body: Value = response.json().await.unwrap();
 			assert_eq!(body["error"]["code"], "rate_limited", "{model}");
-			assert_eq!(s.call().await.outcome, Outcome::Failed(Class::RateLimited));
+			// With no retry-after it is asked once more, a moment later.
+			let (first, second) = (s.call().await, s.call().await);
+			assert_eq!((first.attempt, second.attempt), (1, 2), "{model}");
+			assert_eq!(second.outcome, Outcome::Failed(Class::RateLimited));
 		}
 		for (model, code, class) in [
 			(

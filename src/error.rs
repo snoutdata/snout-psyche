@@ -94,12 +94,23 @@ impl Class {
 		}
 	}
 
-	/// Whether another target could succeed where this one failed (the router's question, Phase 4).
+	/// Whether the same target may succeed if asked again, in a moment.
 	pub fn retryable(self) -> bool {
 		matches!(
 			self,
 			Class::RateLimited | Class::Upstream | Class::Timeout | Class::Transport
 		)
+	}
+
+	/// Whether a route's next target may succeed where this one failed: any failure that was not
+	/// the caller's request or the caller's own limits. A budget too, since the next model may be
+	/// cheaper.
+	pub fn falls_over(self) -> bool {
+		self.retryable()
+			|| matches!(
+				self,
+				Class::ProviderAuth | Class::ProviderBilling | Class::EgressRefused | Class::Budget
+			)
 	}
 }
 

@@ -25,8 +25,8 @@ use crate::keys::KeyId;
 use crate::net::Egress;
 use crate::price::{self, PriceEntry};
 use crate::providers::{
-	Catalogue, Embeddings, Kind, Live, ModelSpec, Provider, Reasoning, Spec, build_model,
-	credential_name_ok, word,
+	Catalogue, Embeddings, Kind, Live, ModelSpec, Provider, Reasoning, RouteSpec, Sort, Spec,
+	build_model, credential_name_ok, word,
 };
 use crate::who::{GroupId, UserId, Who};
 
@@ -237,6 +237,28 @@ pub async fn seed(client: &mut Client, file: &Spec) -> Result<Vec<String>, tokio
 		&[&providers],
 	)
 	.await?;
+	for route in &file.routes {
+		let written = tx
+			.execute(
+				"INSERT INTO psyche.routes (name, targets, sort, origin) VALUES ($1, $2, $3, 'file') \
+				 ON CONFLICT (name) DO UPDATE SET targets = excluded.targets, sort = excluded.sort, \
+				 updated_at = clock_timestamp() WHERE psyche.routes.origin = 'file'",
+				&[&route.name, &route.targets, &route.sort.as_str()],
+			)
+			.await?;
+		if written == 0 {
+			kept.push(format!(
+				"the route {} made through the API is kept; the file's is not used",
+				route.name
+			));
+		}
+	}
+	let routes: Vec<&str> = file.routes.iter().map(|r| r.name.as_str()).collect();
+	tx.execute(
+		"DELETE FROM psyche.routes WHERE origin = 'file' AND NOT (name = ANY($1))",
+		&[&routes],
+	)
+	.await?;
 	tx.commit().await?;
 	Ok(kept)
 }
@@ -329,6 +351,22 @@ pub async fn load(
 			reasoning: row.get::<_, Option<&str>>(5).and_then(word),
 			embeddings: row.get::<_, Option<&str>>(6).and_then(word),
 			price,
+		});
+	}
+	for row in client
+		.query(
+			"SELECT name, targets, sort FROM psyche.routes ORDER BY created_at, name",
+			&[],
+		)
+		.await?
+	{
+		let Some(sort) = word::<Sort>(row.get(2)) else {
+			continue;
+		};
+		spec.routes.push(RouteSpec {
+			name: row.get(0),
+			targets: row.get(1),
+			sort,
 		});
 	}
 	Ok((spec, left_out))
@@ -482,8 +520,13 @@ async fn from_file_refused(client: &Client, table: &str, name: &str) -> Result<(
 		)
 		.await?;
 	if origin.is_some_and(|row| row.get::<_, &str>(0) == "file") {
+		let why = if table == "providers" {
+			": its key may be Psyche's own"
+		} else {
+			""
+		};
 		return Err(Refused::Conflict(format!(
-			"{name} is defined in Psyche's providers file, which is where it is changed: its key may be Psyche's own."
+			"{name} is defined in Psyche's providers file, which is where it is changed{why}."
 		)));
 	}
 	Ok(())
@@ -527,6 +570,15 @@ pub async fn put_model(
 	new: NewModel,
 ) -> Result<Value, Refused> {
 	let name = name_ok(name, 200)?;
+	if client
+		.query_opt("SELECT 1 FROM psyche.routes WHERE name = $1", &[&name])
+		.await?
+		.is_some()
+	{
+		return Err(Refused::Conflict(format!(
+			"{name} is a route. A model and a route never share a name."
+		)));
+	}
 	let access = new.access.as_deref().unwrap_or("everyone");
 	if !matches!(access, "everyone" | "granted") {
 		return Err(Refused::Invalid(
@@ -631,6 +683,124 @@ pub async fn delete_model(client: &Client, held: &Held, name: &str) -> Result<Va
 	}
 	held.reload(client).await?;
 	Ok(json!({"name": name, "deleted": !from_file, "disabled": from_file}))
+}
+
+/// What the admin API makes a route from.
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NewRoute {
+	pub targets: Vec<String>,
+	#[serde(default)]
+	pub sort: Sort,
+}
+
+/// The most models a route may name.
+pub const MOST_TARGETS: usize = 20;
+
+/// Makes or replaces a route. Its name is not a model's, and each model it names exists (enabled or
+/// not); a route from the file is the file's.
+pub async fn put_route(
+	client: &Client,
+	held: &Held,
+	name: &str,
+	new: NewRoute,
+) -> Result<Value, Refused> {
+	let name = name_ok(name, 200)?;
+	if new.targets.is_empty() || new.targets.len() > MOST_TARGETS {
+		return Err(Refused::Invalid(format!(
+			"A route names 1 to {MOST_TARGETS} models, in targets."
+		)));
+	}
+	let mut seen = HashSet::new();
+	if let Some(twice) = new.targets.iter().find(|t| !seen.insert(t.as_str())) {
+		return Err(Refused::Invalid(format!("The route names {twice} twice.")));
+	}
+	if client
+		.query_opt("SELECT 1 FROM psyche.models WHERE name = $1", &[&name])
+		.await?
+		.is_some()
+	{
+		return Err(Refused::Conflict(format!(
+			"{name} is a model. A route and a model never share a name."
+		)));
+	}
+	let known: Vec<String> = client
+		.query(
+			"SELECT name FROM psyche.models WHERE name = ANY($1)",
+			&[&new.targets],
+		)
+		.await?
+		.iter()
+		.map(|r| r.get(0))
+		.collect();
+	if let Some(missing) = new.targets.iter().find(|t| !known.contains(t)) {
+		return Err(Refused::Invalid(format!(
+			"There is no model named {missing}. GET /ai/v1/admin/models lists them."
+		)));
+	}
+	from_file_refused(client, "routes", name).await?;
+	client
+		.execute(
+			"INSERT INTO psyche.routes (name, targets, sort) VALUES ($1, $2, $3) \
+			 ON CONFLICT (name) DO UPDATE SET targets = excluded.targets, sort = excluded.sort, \
+			 updated_at = clock_timestamp()",
+			&[&name, &new.targets, &new.sort.as_str()],
+		)
+		.await?;
+	held.reload(client).await?;
+	Ok(json!({"name": name, "targets": new.targets, "sort": new.sort.as_str(), "origin": "api"}))
+}
+
+/// Removes a route made through the API.
+pub async fn delete_route(client: &Client, held: &Held, name: &str) -> Result<(), Refused> {
+	from_file_refused(client, "routes", name).await?;
+	let deleted = client
+		.execute("DELETE FROM psyche.routes WHERE name = $1", &[&name])
+		.await?;
+	if deleted == 0 {
+		return Err(Refused::NotFound("There is no route by that name.".into()));
+	}
+	held.reload(client).await?;
+	Ok(())
+}
+
+/// Every route, with the models it skips because they are not served (disabled, removed, or left
+/// out with a reason) and whether it is served at all.
+pub async fn list_routes(client: &Client, held: &Held) -> Result<Vec<Value>, Refused> {
+	let served = held.live.get();
+	let rows = client
+		.query(
+			"SELECT name, targets, sort, origin, created_at::text, updated_at::text \
+			 FROM psyche.routes ORDER BY created_at, name",
+			&[],
+		)
+		.await?;
+	Ok(rows
+		.iter()
+		.map(|row| {
+			let name: String = row.get(0);
+			let targets: Vec<String> = row.get(1);
+			let skipped: Vec<&String> = targets
+				.iter()
+				.filter(|t| served.model(t).is_none())
+				.collect();
+			let route = served.route(&name);
+			let tried: Vec<String> = route
+				.map(|r| served.targets(r).iter().map(|m| m.name.clone()).collect())
+				.unwrap_or_default();
+			json!({
+				"name": name,
+				"targets": targets,
+				"sort": row.get::<_, &str>(2),
+				"origin": row.get::<_, &str>(3),
+				"created_at": row.get::<_, String>(4),
+				"updated_at": row.get::<_, String>(5),
+				"tried": tried,
+				"skipped": skipped,
+				"served": route.is_some() && !tried.is_empty(),
+			})
+		})
+		.collect())
 }
 
 fn price_from(own: bool, priced: bool) -> Option<&'static str> {

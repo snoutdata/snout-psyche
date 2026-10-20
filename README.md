@@ -197,6 +197,47 @@ Two rules keep the file and the tables apart:
   marks it `edited`, and the file no longer writes over it. Removing one through the API disables
   it rather than deleting it, since the next start would put it back.
 
+### Routes and fallbacks
+
+A **route** is a name a caller asks for that stands for several models, tried in turn. The next is
+tried only when the one before failed for a reason that was not the caller's: a rate limit, a 5xx,
+no connection or no answer in time, a refused or out-of-credit provider account, or a budget too
+small for that model (the next may be cheaper). The caller's own bad request (a 400) comes back as
+it is. Before moving on, a target is asked once more after a 5xx, after no connection, or after a
+rate limit whose `retry-after` is 2 seconds or less (100-300 ms later when it sends none); never
+after a timeout, and never once the reply has started. Rate limits are taken once per call, however
+many models it tried.
+
+```json
+"routes": [
+  {"name": "chat", "targets": ["claude-sonnet", "gpt-4o"]},
+  {"name": "cheap", "targets": ["gpt-4o-mini", "haiku"], "sort": "price"}
+]
+```
+
+`sort` is `order` (as written, the default) or `price` (the cheapest first, by input plus output
+price; a model with no price last). With a database they are rows of `psyche.routes`, edited with
+no restart:
+
+```sh
+curl -X PUT $PSYCHE/ai/v1/admin/routes/chat -H "Authorization: Bearer $SERVICE_KEY" \
+  -d '{"targets": ["claude-sonnet", "gpt-4o"]}'
+# GET /ai/v1/admin/routes lists them, with what each tries and skips; DELETE removes one.
+```
+
+A route and a model never share a name, and each target must be a model when the route is written.
+A target disabled or removed later is skipped, and the list names it under `skipped`. A route from
+the file is the file's, as its providers are. `GET /ai/v1/models` lists each route beside the models
+(`owned_by: "route"`, with the `targets` the caller may use). A key limited to some models must name
+the route itself; each target is still held to its model's access, and one the caller may not use
+is skipped.
+
+A request may also carry OpenRouter's `models`, a list tried in order after `model` (or in place of
+it), with the same rules; `route: "fallback"` is accepted and changes nothing. Neither reaches the
+provider. The answer's `x-psyche-model` names the model that answered and `x-psyche-route` the route
+(`models` for a list). Each attempt is its own row in the request log, with `route` and `attempt`
+(from 1), so the rows of one call are its routing, explained.
+
 ### Stored credentials
 
 With a database, a provider can take its key from Psyche instead of the environment: name a
