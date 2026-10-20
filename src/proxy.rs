@@ -606,15 +606,19 @@ async fn create_key(
 				),
 			)
 		})?;
+		// A key may name a route as it names a model.
+		let catalogue = proxy.catalogue.get();
 		if let Some(unknown) = new
 			.models
 			.iter()
 			.flatten()
-			.find(|m| proxy.catalogue.get().model(m).is_none())
+			.find(|m| catalogue.model(m).is_none() && catalogue.route(m).is_none())
 		{
 			return Err(ApiError::new(
 				Class::BadRequest,
-				format!("There is no model named {unknown} here. GET /ai/v1/models lists them."),
+				format!(
+					"There is no model or route named {unknown} here. GET /ai/v1/models lists them."
+				),
 			));
 		}
 		keys::create(&client, &keys.store, new)
@@ -5615,6 +5619,32 @@ mod tests {
 		let reply = call("mine").await.unwrap();
 		assert_eq!(reply.status(), 200, "no restart");
 		assert_eq!(reply.headers()["x-psyche-model"], "ok-cheap");
+
+		// A key may be limited to a route, as to a model.
+		let scoped: Value = admin(
+			reqwest::Method::POST,
+			"keys",
+			Some(json!({"name": "route only", "models": ["mine"]})),
+		)
+		.await
+		.unwrap()
+		.json()
+		.await
+		.unwrap();
+		let scoped = scoped["key"].as_str().unwrap().to_string();
+		let as_key = |model: &str| {
+			s.client
+				.post(format!("{}/ai/v1/chat/completions", s.base))
+				.bearer_auth(&scoped)
+				.json(&chat(model, false))
+				.send()
+		};
+		assert_eq!(as_key("mine").await.unwrap().status(), 200);
+		assert_eq!(
+			as_key("ok-cheap").await.unwrap().status(),
+			403,
+			"only the route was named"
+		);
 		let (status, _, _) = error_of(
 			admin(
 				reqwest::Method::PUT,
