@@ -2438,8 +2438,9 @@ impl Proxy {
 			.unwrap_or_default();
 		let catalogue = self.catalogue.get();
 		let text = scrub(&String::from_utf8_lossy(&body), &catalogue.secrets());
-		let said = serde_json::from_str::<Value>(&text)
-			.ok()
+		let parsed = serde_json::from_str::<Value>(&text).ok();
+		let said = parsed
+			.as_ref()
 			.and_then(|v| {
 				v.pointer("/error/message")
 					.or_else(|| v.get("message"))
@@ -2449,7 +2450,31 @@ impl Proxy {
 					.map(String::from)
 			})
 			.unwrap_or_else(|| text.chars().take(500).collect());
+		// Out of credit or quota: OpenAI says so in a 429 (`insufficient_quota`), OpenRouter with a
+		// 402, Anthropic in a 400 about the credit balance. A retry cannot succeed, so none of it is
+		// `rate_limited` or the caller's `rejected_by_provider`.
+		let names = |name: &str| {
+			parsed.as_ref().is_some_and(|v| {
+				["/error/code", "/error/type"]
+					.iter()
+					.any(|at| v.pointer(at).and_then(Value::as_str) == Some(name))
+			})
+		};
+		let billing = match status.as_u16() {
+			402 => true,
+			429 => names("insufficient_quota"),
+			400 if model.provider.kind == Kind::Anthropic => {
+				said.contains("credit balance is too low")
+			}
+			_ => false,
+		};
 		let (class, message) = match status.as_u16() {
+			_ if billing => (
+				Class::ProviderBilling,
+				format!(
+					"{provider} refused the call because the account behind Psyche's credential has no credit or quota left ({status}): {said}"
+				),
+			),
 			// Bedrock's ServiceUnavailableException: the model has no capacity for this account just
 			// now, which is a limit to route around, not a failure.
 			503 if model.provider.kind == Kind::Bedrock => (
@@ -2480,7 +2505,10 @@ impl Proxy {
 			error.status =
 				Some(StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_REQUEST));
 		}
-		error.retry_after = retry_after;
+		// OpenAI sends `retry-after` with `insufficient_quota` too, which would invite a retry.
+		if class != Class::ProviderBilling {
+			error.retry_after = retry_after;
+		}
 		error
 	}
 }
@@ -2856,6 +2884,9 @@ mod tests {
 						{{"name": "fails", "provider": "fake", "upstream": "fake-500"}},
 						{{"name": "limited", "provider": "fake", "upstream": "fake-429"}},
 						{{"name": "picky", "provider": "fake", "upstream": "fake-400"}},
+						{{"name": "no-credit", "provider": "fake", "upstream": "fake-no-credit"}},
+						{{"name": "no-credit-402", "provider": "fake", "upstream": "fake-402"}},
+						{{"name": "claude-no-credit", "provider": "anthropic", "upstream": "fake-no-credit"}},
 						{{"name": "hangs", "provider": "fake", "upstream": "fake-hang"}},
 						{{"name": "cut", "provider": "fake", "upstream": "fake-cut"}},
 						{{"name": "embed", "provider": "fake", "upstream": "fake-embed"}},
@@ -4842,6 +4873,30 @@ mod tests {
 			.unwrap();
 		assert_eq!(fails.status(), 502);
 		assert_eq!(s.call().await.outcome, Outcome::Failed(Class::Upstream));
+
+		// No credit left is the owner's billing, never a limit to wait out or the caller's request.
+		for model in ["no-credit", "no-credit-402", "claude-no-credit"] {
+			let broke = s
+				.post("/ai/v1/chat/completions", chat(model, false))
+				.send()
+				.await
+				.unwrap();
+			assert_eq!(broke.status(), 502, "{model}");
+			assert!(broke.headers().get("retry-after").is_none(), "{model}");
+			let body: Value = broke.json().await.unwrap();
+			assert_eq!(body["error"]["code"], "provider_billing", "{model}: {body}");
+			assert!(
+				body["error"]["message"]
+					.as_str()
+					.unwrap()
+					.contains("no credit or quota left"),
+				"{body}"
+			);
+			assert_eq!(
+				s.call().await.outcome,
+				Outcome::Failed(Class::ProviderBilling)
+			);
+		}
 	}
 
 	#[tokio::test]

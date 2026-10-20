@@ -26,6 +26,10 @@ pub enum Class {
 	RateLimited,
 	/// The provider refused Psyche's credential: a configuration problem, never the caller's.
 	ProviderAuth,
+	/// The account behind Psyche's credential has no credit or quota left (OpenAI's
+	/// `insufficient_quota`, a 402, Anthropic's low credit balance): a billing problem for the
+	/// project's owner, never the caller's, and nothing a retry fixes.
+	ProviderBilling,
 	/// The provider failed (5xx), or answered with something that is not its API.
 	Upstream,
 	/// The provider did not answer in time.
@@ -51,6 +55,7 @@ impl Class {
 			Class::Rejected => "rejected_by_provider",
 			Class::RateLimited => "rate_limited",
 			Class::ProviderAuth => "provider_auth",
+			Class::ProviderBilling => "provider_billing",
 			Class::Upstream => "upstream_error",
 			Class::Timeout => "timeout",
 			Class::Transport => "transport",
@@ -81,9 +86,11 @@ impl Class {
 			Class::ModelNotFound => StatusCode::NOT_FOUND,
 			Class::RateLimited | Class::Budget | Class::Limited => StatusCode::TOO_MANY_REQUESTS,
 			Class::Timeout => StatusCode::GATEWAY_TIMEOUT,
-			Class::ProviderAuth | Class::Upstream | Class::Transport | Class::EgressRefused => {
-				StatusCode::BAD_GATEWAY
-			}
+			Class::ProviderAuth
+			| Class::ProviderBilling
+			| Class::Upstream
+			| Class::Transport
+			| Class::EgressRefused => StatusCode::BAD_GATEWAY,
 		}
 	}
 

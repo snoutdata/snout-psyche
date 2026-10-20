@@ -163,10 +163,10 @@ pub async fn prove(
 			"its base_url, which usually ends in /v1"
 		};
 		return Err(format!(
-			"{} answered 404 at {}, so nothing there serves these calls and the credential could not be checked; check {check}: {}",
+			"{} answered 404 at {}, so nothing there serves these calls and the credential could not be checked; check {check}.{}",
 			provider.name,
 			crate::error::scrub(url.as_str(), &[secret_of(stored)]),
-			said.chars().take(300).collect::<String>()
+			quoted(&said)
 		));
 	}
 	if status >= 500 {
@@ -176,6 +176,17 @@ pub async fn prove(
 		));
 	}
 	Ok(())
+}
+
+/// What a provider said, as the end of a sentence: nothing when it said nothing (Anthropic's 404
+/// has an empty body), else its first 300 characters after a space.
+fn quoted(said: &str) -> String {
+	let said = said.trim();
+	if said.is_empty() {
+		String::new()
+	} else {
+		format!(" It said: {}", said.chars().take(300).collect::<String>())
+	}
 }
 
 /// Stores `stored` as `name`, replacing what was there, and returns its row as lists show it.
@@ -368,5 +379,7 @@ mod tests {
 			"{refused}"
 		);
 		assert!(!refused.contains(crate::fake::Fake::KEY), "{refused}");
+		assert!(refused.contains("ends in /v1. It said: "), "{refused}");
+		assert_eq!(quoted("  "), "", "an empty body ends the sentence");
 	}
 }

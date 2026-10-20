@@ -63,7 +63,10 @@ Keys and budgets, more providers and automatic routing are being built.
 - A failure after the stream started ends it with an error event, OpenAI's way. Before that it is
   a status: the provider's own status when your request was at fault (a 400), 429 with
   `retry-after` when the provider is rate-limiting, 502 when the provider refused **Psyche's**
-  credential (never passed on as if your key were wrong), 504 when it did not answer in time.
+  credential (`provider_auth`, never passed on as if your key were wrong), 502 with no
+  `retry-after` when the account behind that credential has no credit or quota left
+  (`provider_billing`: OpenAI's `insufficient_quota`, a 402, Anthropic's low credit balance, none
+  of which a retry fixes), 504 when it did not answer in time.
 - A provider error that echoes the key Psyche sent never reaches the caller or the log.
 - Every address is checked before a connection is made: no private ranges, no metadata service,
   no redirects, https only, unless you run it with `PSYCHE_EGRESS=private` beside your own model

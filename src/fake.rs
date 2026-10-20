@@ -10,6 +10,8 @@
 //! | `fake-500` | 500, an OpenAI-shaped error |
 //! | `fake-429` | 429 with `retry-after: 7` and OpenAI's rate-limit headers |
 //! | `fake-400` | 400, the caller's request at fault |
+//! | `fake-no-credit` | 429 `insufficient_quota` with `retry-after`, as OpenAI answers an account with no credit |
+//! | `fake-402` | 402, as OpenRouter answers an account with no credit |
 //! | `fake-hang` | nothing, ever |
 //! | `fake-cut` | two streamed chunks, 20 ms apart, then the connection drops |
 //!
@@ -24,6 +26,7 @@
 //! | `fake-ok` | "Hello from the fake.", whole or streamed, with cache reads and writes in the usage |
 //! | `fake-tool` | "Let me look." and a `run_sql` tool call, its arguments streamed in two pieces |
 //! | `fake-529` | 529, `overloaded_error` |
+//! | `fake-no-credit` | 400 `invalid_request_error` saying the credit balance is too low, as Anthropic answers |
 //! | `fake-overloaded` | a stream that starts, then sends Anthropic's `error` event |
 //! | `fake-truncated` | a stream that closes cleanly before `message_stop` |
 //!
@@ -261,6 +264,25 @@ async fn answer(
 			"Invalid value for temperature: must be between 0 and 2.",
 			"invalid_request_error",
 		),
+		"fake-no-credit" => {
+			let mut response = (
+				StatusCode::TOO_MANY_REQUESTS,
+				axum::Json(json!({"error": {
+					"message": "You exceeded your current quota, please check your plan and billing details.",
+					"type": "insufficient_quota", "param": null, "code": "insufficient_quota",
+				}})),
+			)
+				.into_response();
+			response
+				.headers_mut()
+				.insert(header::RETRY_AFTER, "20".parse().expect("a header"));
+			response
+		}
+		"fake-402" => (
+			StatusCode::PAYMENT_REQUIRED,
+			axum::Json(json!({"error": {"message": "Insufficient credits.", "code": 402}})),
+		)
+			.into_response(),
 		"fake-hang" => {
 			std::future::pending::<()>().await;
 			StatusCode::OK.into_response()
@@ -498,6 +520,13 @@ fn anthropic(shared: Shared, headers: &HeaderMap, body: &Value) -> Response {
 	}
 	let model = body["model"].as_str().unwrap_or("").to_string();
 	let stream = body["stream"].as_bool() == Some(true);
+	if model == "fake-no-credit" {
+		return anthropic_error(
+			StatusCode::BAD_REQUEST,
+			"invalid_request_error",
+			"Your credit balance is too low to access the Anthropic API.",
+		);
+	}
 	if model == "fake-529" {
 		return anthropic_error(
 			StatusCode::from_u16(529).expect("a status"),
