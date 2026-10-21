@@ -45,6 +45,7 @@ async fn main() {
 	// The request log: the schema migrated before the first call, then a task of its own that the
 	// calls are handed to. A database that cannot be migrated stops the start, since a log that
 	// silently is not kept is worse than none.
+	let health = snout_psyche::health::Health::default();
 	let (calls, log, keys, budgets, limits) = match &config.log {
 		None => (None, None, None, None, None),
 		Some(settings) => {
@@ -66,6 +67,16 @@ async fn main() {
 			snout_psyche::budgets::load_spent(&client, &budgets, std::time::SystemTime::now())
 				.await
 				.unwrap_or_else(|error| fail(1, &format!("cannot read what was spent: {error}")));
+			// What each target did before this start (`health.rs`), so routing does not start blind.
+			snout_psyche::health::load(&client, &health)
+				.await
+				.unwrap_or_else(|error| {
+					fail(1, &format!("cannot read the provider statistics: {error}"))
+				});
+			tokio::spawn(snout_psyche::health::keep(
+				settings.database_url.clone(),
+				health.clone(),
+			));
 			drop(client);
 			let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 			let task = tokio::spawn(snout_psyche::log::run(settings.clone(), rx));
@@ -121,6 +132,7 @@ async fn main() {
 		keys,
 		budgets,
 		limits,
+		health,
 	});
 	let models = live.get().models().len();
 	for model in live.get().unpriced() {

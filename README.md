@@ -7,8 +7,9 @@ written in Rust. On SnoutData Cloud one runs beside each project's database, in 
 pod, and keeps its keys, budgets and request log in the project's own Postgres.
 
 **Status: early, not production-ready.** What works today is the OpenAI-compatible API over
-OpenAI-style providers, Anthropic and Amazon Bedrock, and the request log in Postgres (below).
-Keys and budgets, more providers and automatic routing are being built.
+OpenAI-style providers, Anthropic and Amazon Bedrock, the request log in Postgres, keys, budgets and
+rate limits, and routes that fall over and steer around a model that keeps failing (below). More
+providers and `auto` routing are being built.
 
 ## What works today
 
@@ -215,9 +216,11 @@ many models it tried.
 ]
 ```
 
-`sort` is `order` (as written, the default) or `price` (the cheapest first, by input plus output
-price; a model with no price last). With a database they are rows of `psyche.routes`, edited with
-no restart:
+`sort` is `order` (as written, the default), `price` (the cheapest first, by input plus output
+price; a model with no price last), `latency` (the quickest to its first byte first) or `throughput`
+(the most tokens a second first), the last two as measured (below); a model not yet measured goes
+ahead of the measured ones, so it gets measured. With a database they are rows of `psyche.routes`,
+edited with no restart:
 
 ```sh
 curl -X PUT $PSYCHE/ai/v1/admin/routes/chat -H "Authorization: Bearer $SERVICE_KEY" \
@@ -237,6 +240,34 @@ it), with the same rules; `route: "fallback"` is accepted and changes nothing. N
 provider. The answer's `x-psyche-model` names the model that answered and `x-psyche-route` the route
 (`models` for a list). Each attempt is its own row in the request log, with `route` and `attempt`
 (from 1), so the rows of one call are its routing, explained.
+
+### Health
+
+Each model is measured from its own calls: the time to the provider's first byte and tokens a
+second on a streamed reply (moving averages), and its requests, failures and provider rate limits
+over the last five minutes. A failure counts against a model only when it was the model's: the
+provider down, slow, unreachable, rate-limiting, refusing the credential or out of credit; a
+caller's own bad request does not.
+
+Three such failures in a row **cool a model down**: a route tries it after every model that is not
+cooling, so the calls go to one that answers. A call that names it alone still gets it, so a
+cooldown never fails a call by itself. After 10 seconds the next call to reach it is its probe; the
+others keep going elsewhere until the probe ends. A probe that fails cools it again for twice as
+long, up to five minutes; one that answers brings it back. A provider's 429 with a `retry-after`
+cools the model for exactly that long and is not counted as a failure in a row.
+
+```sh
+curl $PSYCHE/ai/v1/admin/health -H "Authorization: Bearer $SERVICE_KEY"
+# {"data": [{"provider": "openai", "model": "fast", "state": "ok", "requests": 120, "failed": 2,
+#  "rate_limited": 0, "error_rate": 0.0167, "first_byte_ms": 412, "tokens_per_second": 88.4,
+#  "failures_in_a_row": 0, "cooling_until": null, "last_failure": "timeout",
+#  "remaining_requests": 4980, "remaining_tokens": 1990000, "updated_at": 1792389374}]}
+```
+
+`state` is `ok`, `cooling` or `probing`. `remaining_requests` and `remaining_tokens` are the
+provider's own reading of what is left on the credential, from its rate-limit headers, when it sends
+them. With a database the statistics are written to `psyche.provider_stats` every 10 seconds, and
+read back at start (the averages, and a cooldown still running), so a restart does not start blind.
 
 ### Stored credentials
 

@@ -18,6 +18,7 @@ pub mod credentials;
 pub mod embeddings;
 pub mod error;
 pub mod eventstream;
+pub mod health;
 pub mod jwt;
 pub mod keys;
 pub mod layout;

@@ -316,6 +316,11 @@ pub enum Sort {
 	/// The cheapest first, by input plus output price per token; a model with no price last, and
 	/// a tie kept in written order.
 	Price,
+	/// The quickest to its first byte first, as measured (`health.rs`); a model not yet measured
+	/// ahead of them, so it gets measured.
+	Latency,
+	/// The most tokens a second first, as measured, likewise.
+	Throughput,
 }
 
 impl Sort {
@@ -323,6 +328,8 @@ impl Sort {
 		match self {
 			Sort::Order => "order",
 			Sort::Price => "price",
+			Sort::Latency => "latency",
+			Sort::Throughput => "throughput",
 		}
 	}
 }

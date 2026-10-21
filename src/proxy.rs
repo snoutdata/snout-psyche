@@ -44,6 +44,7 @@ use crate::budgets::{self, Budgets, Reservation};
 use crate::config::Timeouts;
 use crate::credentials;
 use crate::error::{ApiError, Class, scrub};
+use crate::health::{self, Health, Remaining};
 use crate::jwt::{self, Role};
 use crate::keys::{self, Key, KeyId, Refusal};
 use crate::limits::{self, Limits, Taken};
@@ -84,6 +85,8 @@ pub struct Proxy {
 	pub budgets: Option<Budgets>,
 	/// Rate limits (`limits.rs`), likewise.
 	pub limits: Option<Limits>,
+	/// Each target's health (`health.rs`), which orders a route's targets.
+	pub health: Health,
 }
 
 /// The keys and memberships in memory, and the database they are kept in, which the admin API
@@ -457,6 +460,7 @@ pub fn router(proxy: Arc<Proxy>) -> Router {
 		.route("/admin/routes/{*name}", put(set_route).delete(delete_route))
 		.route("/admin/credentials", get(list_credentials))
 		.route("/admin/usage", get(usage))
+		.route("/admin/health", get(health_report))
 		.route("/admin/requests", get(requests))
 		.route(
 			"/admin/credentials/{name}",
@@ -978,6 +982,24 @@ async fn delete_model(
 	}
 }
 
+/// Each target's health (`health.rs`), as Psyche holds it now; the service key only, and no
+/// database needed.
+async fn health_report(State(proxy): State<Arc<Proxy>>, headers: HeaderMap) -> Response {
+	match proxy.authorize(&headers) {
+		Ok(Caller::Service) => axum::Json(json!({
+			"object": "list",
+			"data": proxy.health.report(SystemTime::now()),
+		}))
+		.into_response(),
+		Ok(_) => ApiError::new(
+			Class::Forbidden,
+			"Only the project's service key may use the admin API.",
+		)
+		.into_response(),
+		Err(error) => error.into_response(),
+	}
+}
+
 async fn list_routes(State(proxy): State<Arc<Proxy>>, headers: HeaderMap) -> Response {
 	let result = async {
 		let (_, client) = admin(&proxy, &headers).await?;
@@ -1005,7 +1027,7 @@ async fn set_route(
 			ApiError::new(
 				Class::BadRequest,
 				format!(
-					"A route is made from targets (the models, in order) and sort (order or price): {e}"
+					"A route is made from targets (the models, in order) and sort (order, price, latency or throughput): {e}"
 				),
 			)
 		})?;
@@ -2035,6 +2057,7 @@ impl Proxy {
 		let catalogue = self.catalogue.get();
 		let mut targets: Vec<Arc<Model>> = Vec::new();
 		let mut route = None;
+		let mut sort = None;
 		for (i, named) in std::iter::once(&inbound.model)
 			.chain(&inbound.fallbacks)
 			.enumerate()
@@ -2049,6 +2072,7 @@ impl Proxy {
 				(Some(r), _) => {
 					if i == 0 {
 						route = Some(r.name.clone());
+						sort = Some(r.sort);
 					}
 					catalogue.targets(r)
 				}
@@ -2075,6 +2099,8 @@ impl Proxy {
 			.into_iter()
 			.filter(|m| self.granted(&m.name, &who))
 			.collect();
+		// A target cooling down goes after the others, and a route sorted by speed is sorted here.
+		let open = self.health.order(open, sort, SystemTime::now());
 		if open.is_empty() {
 			return Err(ApiError::new(
 				Class::Forbidden,
@@ -2289,7 +2315,11 @@ impl Proxy {
 			reservation,
 			taken: shared.taken.clone(),
 			billable: false,
+			health: self.health.clone(),
+			retry_after: None,
+			remaining: Remaining::default(),
 		};
+		self.health.begin(&model, SystemTime::now());
 		let response = match tokio::time::timeout(self.timeouts.first_byte, request.send()).await {
 			Err(_) => {
 				let error = ApiError::new(
@@ -2308,6 +2338,7 @@ impl Proxy {
 		};
 		let mut record = record;
 		record.call.first_byte = started.elapsed();
+		record.remaining = Remaining::read(response.headers());
 
 		if !response.status().is_success() {
 			let error = self.provider_error(response, &model).await;
@@ -2381,7 +2412,11 @@ impl Proxy {
 			taken: shared.taken.clone(),
 			// Each text is its own call, and some may be billed before another fails.
 			billable: true,
+			health: self.health.clone(),
+			retry_after: None,
+			remaining: Remaining::default(),
 		};
+		self.health.begin(model, SystemTime::now());
 		let calls = request
 			.bodies(family)
 			.into_iter()
@@ -2890,6 +2925,12 @@ struct Record {
 	/// response starts, so a refused or failed request releases its reservation and is charged
 	/// nothing.
 	billable: bool,
+	/// Told how the attempt went when this is dropped.
+	health: Health,
+	/// A provider's `retry-after` on a 429, for the target's cooldown.
+	retry_after: Option<Duration>,
+	/// What the provider said is left on Psyche's credential.
+	remaining: Remaining,
 }
 
 impl Record {
@@ -2899,6 +2940,12 @@ impl Record {
 
 	fn fail(mut self, error: ApiError) -> ApiError {
 		self.finish(Outcome::Failed(error.class));
+		self.retry_after = error
+			.retry_after
+			.as_deref()
+			.and_then(|s| s.trim().parse::<f64>().ok())
+			.filter(|s| s.is_finite() && *s >= 0.0)
+			.map(Duration::from_secs_f64);
 		error
 	}
 }
@@ -2939,6 +2986,12 @@ impl Drop for Record {
 			};
 			reservation.settle(charge, SystemTime::now());
 		}
+		self.health.seen(
+			&self.call.provider,
+			&self.call.model,
+			health::Seen::of(&self.call, self.retry_after, self.remaining),
+			SystemTime::now(),
+		);
 		if let Some(sink) = &self.sink {
 			let _ = sink.send(self.call.clone());
 		}
@@ -3228,6 +3281,7 @@ mod tests {
 				keys,
 				budgets,
 				limits,
+				health: Health::default(),
 			});
 			let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
 			let base = format!("http://{}", listener.local_addr().unwrap());
@@ -5411,6 +5465,88 @@ mod tests {
 			.unwrap();
 		assert!(!body.contains("\"usage\""), "{body}");
 		assert_eq!(s.call().await.usage.unwrap().completion_tokens, 4);
+	}
+
+	#[tokio::test]
+	async fn a_target_that_keeps_failing_cools_down_and_a_route_asks_the_healthy_one_first() {
+		let mut s = Setup::new().await;
+		// Two calls: `fails` fails four times (each 5xx is asked once more), and `ok` answers both.
+		for _ in 0..2 {
+			let reply = s
+				.post("/ai/v1/chat/completions", chat("falls-over", false))
+				.send()
+				.await
+				.unwrap();
+			assert_eq!(reply.status(), 200);
+			for _ in 0..3 {
+				s.call().await;
+			}
+		}
+		// Now cooling: the route asks `ok` first, and `fails` is not asked at all.
+		let sent = s.fake.count();
+		let reply = s
+			.post("/ai/v1/chat/completions", chat("falls-over", false))
+			.send()
+			.await
+			.unwrap();
+		assert_eq!(reply.status(), 200);
+		assert_eq!(s.fake.count(), sent + 1);
+		let call = s.call().await;
+		assert_eq!((call.model.as_str(), call.attempt), ("ok", 1));
+
+		// Named alone, a cooling target is still asked: a cooldown never fails a call by itself.
+		let alone = s
+			.post("/ai/v1/chat/completions", chat("fails", false))
+			.send()
+			.await
+			.unwrap();
+		assert_eq!(alone.status(), 502);
+		s.call().await;
+		s.call().await;
+
+		// The service key reads it; nobody else does.
+		let health: Value = s
+			.client
+			.get(format!("{}/ai/v1/admin/health", s.base))
+			.bearer_auth(jwt::sign(&json!({"role": "service_role"}), SECRET))
+			.send()
+			.await
+			.unwrap()
+			.json()
+			.await
+			.unwrap();
+		let target = |name: &str| {
+			health["data"]
+				.as_array()
+				.unwrap()
+				.iter()
+				.find(|t| t["model"] == name)
+				.cloned()
+				.unwrap()
+		};
+		let fails = target("fails");
+		assert_eq!(fails["state"], "cooling", "{health}");
+		assert_eq!(fails["provider"], "fake");
+		assert_eq!(fails["failed"], 6);
+		assert_eq!(fails["last_failure"], "upstream_error");
+		assert!(fails["cooling_until"].as_u64().is_some());
+		let ok = target("ok");
+		assert_eq!(
+			(ok["state"].as_str(), ok["requests"].as_u64()),
+			(Some("ok"), Some(3))
+		);
+		assert!(ok["first_byte_ms"].as_f64().is_some());
+		let user = s
+			.client
+			.get(format!("{}/ai/v1/admin/health", s.base))
+			.bearer_auth(jwt::sign(
+				&json!({"role": "authenticated", "sub": "u"}),
+				SECRET,
+			))
+			.send()
+			.await
+			.unwrap();
+		assert!(user.status().is_client_error(), "{}", user.status());
 	}
 
 	#[tokio::test]
