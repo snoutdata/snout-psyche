@@ -21,6 +21,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use serde_json::{Value, json};
 use tokio_postgres::Client;
 
+use crate::fits::Fits;
 use crate::keys::KeyId;
 use crate::net::Egress;
 use crate::price::{self, PriceEntry};
@@ -189,12 +190,12 @@ pub async fn seed(client: &mut Client, file: &Spec) -> Result<Vec<String>, tokio
 		let written = tx
 			.execute(
 				"INSERT INTO psyche.models (name, provider, upstream, prompt_caching, \
-				 max_output_tokens, reasoning, embeddings, price, origin) \
-				 VALUES ($1, $2, $3, $4, $5, $6, $7, $8::text::jsonb, 'file') \
+				 max_output_tokens, reasoning, embeddings, price, fits, origin) \
+				 VALUES ($1, $2, $3, $4, $5, $6, $7, $8::text::jsonb, $9::text::jsonb, 'file') \
 				 ON CONFLICT (name) DO UPDATE SET provider = excluded.provider, \
 				 upstream = excluded.upstream, prompt_caching = excluded.prompt_caching, \
 				 max_output_tokens = excluded.max_output_tokens, reasoning = excluded.reasoning, \
-				 embeddings = excluded.embeddings, price = excluded.price, \
+				 embeddings = excluded.embeddings, price = excluded.price, fits = excluded.fits, \
 				 updated_at = clock_timestamp() \
 				 WHERE psyche.models.origin = 'file' AND NOT psyche.models.edited",
 				&[
@@ -206,6 +207,7 @@ pub async fn seed(client: &mut Client, file: &Spec) -> Result<Vec<String>, tokio
 					&model.reasoning.map(Reasoning::as_str),
 					&model.embeddings.map(Embeddings::as_str),
 					&model.price.as_ref().map(Value::to_string),
+					&model.fits.map(|f| f.to_json().to_string()),
 				],
 			)
 			.await?;
@@ -327,7 +329,7 @@ pub async fn load(
 	for row in client
 		.query(
 			"SELECT name, provider, upstream, prompt_caching, max_output_tokens, reasoning, \
-			 embeddings, price::text FROM psyche.models WHERE enabled ORDER BY created_at, name",
+			 embeddings, price::text, fits::text FROM psyche.models WHERE enabled ORDER BY created_at, name",
 			&[],
 		)
 		.await?
@@ -351,6 +353,10 @@ pub async fn load(
 			reasoning: row.get::<_, Option<&str>>(5).and_then(word),
 			embeddings: row.get::<_, Option<&str>>(6).and_then(word),
 			price,
+			// A row the check let in always reads; one that does not is served without facts.
+			fits: row
+				.get::<_, Option<String>>(8)
+				.and_then(|text| serde_json::from_str(&text).ok()),
 		});
 	}
 	for row in client
@@ -549,6 +555,10 @@ pub struct NewModel {
 	pub embeddings: Option<Embeddings>,
 	#[serde(default)]
 	pub price: Option<Value>,
+	/// What the model can take (`fits.rs`). Left out, a model keeps what it had, so a screen that
+	/// does not know the field never clears it; `{}` clears it.
+	#[serde(default)]
+	pub fits: Option<Fits>,
 	#[serde(default = "yes")]
 	pub enabled: bool,
 	/// `everyone` (the default), or `granted`: only the users and groups in `psyche.model_grants`.
@@ -570,6 +580,11 @@ pub async fn put_model(
 	new: NewModel,
 ) -> Result<Value, Refused> {
 	let name = name_ok(name, 200)?;
+	if crate::fits::is_auto(name) {
+		return Err(Refused::Invalid(format!(
+			"{name} is the name a caller sends for automatic choice, so no model may take it."
+		)));
+	}
 	if client
 		.query_opt("SELECT 1 FROM psyche.routes WHERE name = $1", &[&name])
 		.await?
@@ -609,6 +624,7 @@ pub async fn put_model(
 		reasoning: new.reasoning,
 		embeddings: new.embeddings,
 		price: new.price.clone(),
+		fits: new.fits,
 	};
 	let (rows, left_out) = load(client, &held.file, held.egress).await?;
 	let provider = rows.provider(&spec.provider).ok_or_else(|| {
@@ -628,13 +644,14 @@ pub async fn put_model(
 	client
 		.execute(
 			"INSERT INTO psyche.models (name, provider, upstream, prompt_caching, max_output_tokens, \
-			 reasoning, embeddings, price, enabled, access) \
-			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8::text::jsonb, $9, $10) \
+			 reasoning, embeddings, price, enabled, access, fits) \
+			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8::text::jsonb, $9, $10, NULLIF($11::text, '{}')::jsonb) \
 			 ON CONFLICT (name) DO UPDATE SET provider = excluded.provider, \
 			 upstream = excluded.upstream, prompt_caching = excluded.prompt_caching, \
 			 max_output_tokens = excluded.max_output_tokens, reasoning = excluded.reasoning, \
 			 embeddings = excluded.embeddings, price = excluded.price, enabled = excluded.enabled, \
-			 access = excluded.access",
+			 access = excluded.access, \
+			 fits = CASE WHEN $11::text IS NULL THEN psyche.models.fits ELSE excluded.fits END",
 			&[
 				&name,
 				&spec.provider,
@@ -646,6 +663,13 @@ pub async fn put_model(
 				&spec.price.as_ref().map(Value::to_string),
 				&new.enabled,
 				&access,
+				&new.fits.map(|f| {
+					if f == Fits::default() {
+						"{}".to_string()
+					} else {
+						f.to_json().to_string()
+					}
+				}),
 			],
 		)
 		.await?;
@@ -714,6 +738,17 @@ pub async fn put_route(
 	let mut seen = HashSet::new();
 	if let Some(twice) = new.targets.iter().find(|t| !seen.insert(t.as_str())) {
 		return Err(Refused::Invalid(format!("The route names {twice} twice.")));
+	}
+	// `auto` may be a route (the project's own policy for it); its two variants are fixed.
+	if crate::fits::is_auto(name) && name != crate::fits::AUTO {
+		return Err(Refused::Invalid(format!(
+			"{name} always means {}, so no route may take it.",
+			if name == crate::fits::AUTO_FLOOR {
+				"the cheapest first"
+			} else {
+				"the fastest first"
+			}
+		)));
 	}
 	if client
 		.query_opt("SELECT 1 FROM psyche.models WHERE name = $1", &[&name])
@@ -871,7 +906,7 @@ pub async fn list_models(client: &Client, held: &Held) -> Result<Vec<Value>, Ref
 		.query(
 			"SELECT name, provider, upstream, prompt_caching, max_output_tokens, reasoning, \
 			 embeddings, price::text, enabled, origin, edited, access, \
-			 (SELECT count(*) FROM psyche.model_grants g WHERE g.model = m.name) \
+			 (SELECT count(*) FROM psyche.model_grants g WHERE g.model = m.name), fits::text \
 			 FROM psyche.models m ORDER BY created_at, name",
 			&[],
 		)
@@ -909,6 +944,7 @@ pub async fn list_models(client: &Client, held: &Held) -> Result<Vec<Value>, Ref
 				"edited": row.get::<_, bool>(10),
 				"access": row.get::<_, String>(11),
 				"grants": row.get::<_, i64>(12),
+				"fits": row.get::<_, Option<String>>(13).and_then(|t| serde_json::from_str::<Value>(&t).ok()),
 				"problem": if enabled { problem } else { None },
 			})
 		})

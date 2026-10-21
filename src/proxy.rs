@@ -44,6 +44,7 @@ use crate::budgets::{self, Budgets, Reservation};
 use crate::config::Timeouts;
 use crate::credentials;
 use crate::error::{ApiError, Class, scrub};
+use crate::fits::{self, Needs};
 use crate::health::{self, Health, Remaining};
 use crate::jwt::{self, Role};
 use crate::keys::{self, Key, KeyId, Refusal};
@@ -51,7 +52,7 @@ use crate::limits::{self, Limits, Taken};
 use crate::models;
 use crate::net;
 use crate::price::{Dollars, Price};
-use crate::providers::{Kind, Live, Model, Provider};
+use crate::providers::{self, Kind, Live, Model, Provider, Sort};
 use crate::sse::{Event, Parser};
 use crate::translate::{Out, Translator};
 use crate::usage::Usage;
@@ -161,6 +162,9 @@ pub struct Call {
 	pub route: Option<String>,
 	/// Which attempt of the call this was, from 1.
 	pub attempt: u16,
+	/// For a call made for `auto`, a route or a fallback list: how its models were ordered and which
+	/// were left out, and why (`fits.rs`).
+	pub routing: Option<String>,
 }
 
 impl Call {
@@ -537,6 +541,22 @@ async fn models(State(proxy): State<Arc<Proxy>>, headers: HeaderMap) -> Response
 		if caller.may_use(&route.name) && !targets.is_empty() {
 			data.push(json!({"id": route.name, "object": "model", "created": 0,
 				"owned_by": "route", "targets": targets}));
+		}
+	}
+	// Automatic choice, once a model this caller may use says what it can take; a project's own
+	// `auto` route is listed above as the route it is.
+	let pool: Vec<&str> = catalogue
+		.models()
+		.iter()
+		.filter(|m| m.fits.is_some() && m.embeddings.is_none() && proxy.granted(&m.name, &who))
+		.map(|m| m.name.as_str())
+		.collect();
+	if !pool.is_empty() {
+		for name in [fits::AUTO, fits::AUTO_FLOOR, fits::AUTO_NITRO] {
+			if caller.may_use(name) && (name != fits::AUTO || catalogue.route(name).is_none()) {
+				data.push(json!({"id": name, "object": "model", "created": 0,
+					"owned_by": "auto", "targets": pool}));
+			}
 		}
 	}
 	axum::Json(json!({"object": "list", "data": data})).into_response()
@@ -1795,7 +1815,7 @@ async fn requests(
 				"SELECT (extract(epoch FROM at) * 1000)::bigint, operation, model, provider, streamed, \
 				 outcome, prompt_tokens, completion_tokens, cached_tokens, reasoning_tokens, first_byte_ms, \
 				 total_ms, cost::text, key_id::text, user_id::text, group_id::text, credits, budget_warning, \
-				 (extract(epoch FROM at) * 1000000)::bigint, route, attempt \
+				 (extract(epoch FROM at) * 1000000)::bigint, route, attempt, routing \
 				 FROM psyche.requests \
 				 WHERE ($1::bigint IS NULL OR at < timestamptz 'epoch' + $1::bigint * interval '1 microsecond') \
 				 AND ($2::text IS NULL OR model = $2) AND ($3::text IS NULL OR outcome = $3) \
@@ -1830,6 +1850,7 @@ async fn requests(
 					"budget_warning": row.get::<_, Option<String>>(17),
 					"route": row.get::<_, Option<String>>(19),
 					"attempt": row.get::<_, Option<i16>>(20),
+					"routing": row.get::<_, Option<String>>(21),
 				})
 			})
 			.collect();
@@ -2069,6 +2090,47 @@ impl Proxy {
 				));
 			}
 			let models = match (catalogue.route(named), catalogue.model(named)) {
+				// Automatic choice (PS3): among the models that say what they can take, those in the
+				// project's own `auto` route when it has one, in the order its name asks for.
+				(own, None) if fits::is_auto(named) => {
+					let own = own.filter(|_| named == fits::AUTO);
+					let mut pool: Vec<Arc<Model>> = match own {
+						Some(r) => r
+							.targets
+							.iter()
+							.filter_map(|t| catalogue.model(t))
+							.filter(|m| m.fits.is_some())
+							.cloned()
+							.collect(),
+						None => catalogue
+							.models()
+							.iter()
+							.filter(|m| m.fits.is_some() && m.embeddings.is_none())
+							.cloned()
+							.collect(),
+					};
+					let order = match named.as_str() {
+						fits::AUTO_FLOOR => Sort::Price,
+						fits::AUTO_NITRO => Sort::Throughput,
+						_ => own.map_or(Sort::Price, |r| r.sort),
+					};
+					if order == Sort::Price {
+						providers::by_price(&mut pool);
+					}
+					if pool.is_empty() {
+						return Err(ApiError::new(
+							Class::ModelNotFound,
+							format!(
+								"{named} chooses among the models that say what they can take (their fits), and none here does yet. GET /ai/v1/admin/models lists them."
+							),
+						));
+					}
+					if i == 0 {
+						route = Some(named.clone());
+						sort = Some(order);
+					}
+					pool
+				}
 				(Some(r), _) => {
 					if i == 0 {
 						route = Some(r.name.clone());
@@ -2099,8 +2161,66 @@ impl Proxy {
 			.into_iter()
 			.filter(|m| self.granted(&m.name, &who))
 			.collect();
+		// A route, `auto` or a fallback list leaves out every model whose own facts say it cannot take
+		// this request, before anything is sent (`fits.rs`); a model named alone is the caller's
+		// choice and goes as it is.
+		let mut left_out: Vec<(String, String)> = Vec::new();
+		let open: Vec<Arc<Model>> = if route.is_some() && !open.is_empty() {
+			let needs = Needs::of(&inbound.body, budgets::prompt_bound(&body));
+			let mut fit = Vec::new();
+			for model in open {
+				match needs.rules_out(&model) {
+					Some(why) => left_out.push((model.name.clone(), why)),
+					None => fit.push(model),
+				}
+			}
+			if fit.is_empty() {
+				return Err(ApiError::new(
+					Class::BadRequest,
+					format!(
+						"None of the models {} stands for can take this request: {}.",
+						inbound.model,
+						left_out
+							.iter()
+							.map(|(name, why)| format!("{name} {why}"))
+							.collect::<Vec<_>>()
+							.join("; ")
+					),
+				));
+			}
+			fit
+		} else {
+			open
+		};
 		// A target cooling down goes after the others, and a route sorted by speed is sorted here.
 		let open = self.health.order(open, sort, SystemTime::now());
+		// What the log says about the order, for anything but a model named alone.
+		let routing = route.as_ref().map(|_| {
+			let mut text = format!(
+				"{}: {}",
+				match sort {
+					Some(Sort::Price) => "cheapest first",
+					Some(Sort::Latency) => "fastest first byte first",
+					Some(Sort::Throughput) => "most tokens a second first",
+					Some(Sort::Order) | None => "in the order written",
+				},
+				open.iter()
+					.map(|m| m.name.as_str())
+					.collect::<Vec<_>>()
+					.join(", ")
+			);
+			if !left_out.is_empty() {
+				text.push_str("; left out ");
+				text.push_str(
+					&left_out
+						.iter()
+						.map(|(name, why)| format!("{name} ({why})"))
+						.collect::<Vec<_>>()
+						.join(", "),
+				);
+			}
+			text
+		});
 		if open.is_empty() {
 			return Err(ApiError::new(
 				Class::Forbidden,
@@ -2122,6 +2242,7 @@ impl Proxy {
 			limited,
 			prompt_bound: (budgeted || limited).then(|| budgets::prompt_bound(&body)),
 			route,
+			routing,
 			taken: Arc::default(),
 			rate: std::sync::Mutex::default(),
 		};
@@ -2310,6 +2431,7 @@ impl Proxy {
 				budget_warning: None,
 				route: shared.route.clone(),
 				attempt: number,
+				routing: shared.routing.clone(),
 			},
 			started,
 			reservation,
@@ -2406,6 +2528,7 @@ impl Proxy {
 				budget_warning: None,
 				route: shared.route.clone(),
 				attempt: number,
+				routing: shared.routing.clone(),
 			},
 			started: Instant::now(),
 			reservation,
@@ -2855,6 +2978,7 @@ struct Shared {
 	limited: bool,
 	prompt_bound: Option<u64>,
 	route: Option<String>,
+	routing: Option<String>,
 	taken: Arc<std::sync::Mutex<Option<Taken>>>,
 	/// The rate-limit headers, once a limit was taken.
 	rate: std::sync::Mutex<Option<limits::Headers>>,
@@ -3246,12 +3370,19 @@ mod tests {
 						{{"name": "titan", "provider": "bedrock", "upstream": "amazon.titan-embed-text-v2:0", "embeddings": "titan"}},
 						{{"name": "cohere", "provider": "bedrock-key", "upstream": "cohere.embed-english-v3", "embeddings": "cohere"}},
 						{{"name": "cohere-throttle", "provider": "bedrock", "upstream": "cohere.embed-fake-throttle", "embeddings": "cohere"}},
-						{{"name": "ok-cheap", "provider": "fake", "upstream": "fake-ok", "price": {{"input": 0.1, "output": 0.2}}}}
+						{{"name": "ok-cheap", "provider": "fake", "upstream": "fake-ok", "price": {{"input": 0.1, "output": 0.2}}}},
+						{{"name": "small-text", "provider": "fake", "upstream": "fake-ok", "price": {{"input": 0.05, "output": 0.1}},
+							"fits": {{"context": 1000}}}},
+						{{"name": "mid-images", "provider": "fake", "upstream": "fake-ok", "price": {{"input": 0.5, "output": 1}},
+							"fits": {{"context": 100000, "images": true}}}},
+						{{"name": "big-tools", "provider": "fake", "upstream": "fake-ok", "price": {{"input": 1, "output": 2}},
+							"fits": {{"context": 200000, "tools": true, "images": true, "json_schema": true}}}}
 					],
 					"routes": [
 						{{"name": "falls-over", "targets": ["fails", "ok"]}},
 						{{"name": "cheapest", "targets": ["ok-priced", "ok-cheap"], "sort": "price"}},
-						{{"name": "picky-first", "targets": ["picky", "ok"]}}
+						{{"name": "picky-first", "targets": ["picky", "ok"]}},
+						{{"name": "small-then-big", "targets": ["small-text", "big-tools"]}}
 					]}}"#,
 					fake.origin
 				),
@@ -5097,6 +5228,22 @@ mod tests {
 			.collect();
 		assert_eq!(ids[0], "ok");
 		assert_eq!(body["data"][0]["owned_by"], "fake");
+		// Automatic choice, over the models that wrote their facts.
+		let auto = body["data"]
+			.as_array()
+			.unwrap()
+			.iter()
+			.find(|m| m["id"] == "auto")
+			.unwrap();
+		assert_eq!(auto["owned_by"], "auto");
+		assert_eq!(
+			auto["targets"],
+			json!(["small-text", "mid-images", "big-tools"])
+		);
+		assert!(
+			ids.contains(&"auto:floor") && ids.contains(&"auto:nitro"),
+			"{ids:?}"
+		);
 	}
 
 	#[tokio::test]
@@ -5547,6 +5694,242 @@ mod tests {
 			.await
 			.unwrap();
 		assert!(user.status().is_client_error(), "{}", user.status());
+	}
+
+	#[tokio::test]
+	async fn auto_chooses_the_cheapest_model_whose_facts_fit_and_says_why_in_the_log() {
+		let mut s = Setup::new().await;
+		let label = |r: &reqwest::Response, h: &str| {
+			r.headers().get(h).map(|v| v.to_str().unwrap().to_string())
+		};
+		// The calls borrow these rather than `s`, which the call log needs mutably.
+		let (client, base) = (s.client.clone(), s.base.clone());
+		let ask = async |body: Value| {
+			let reply = client
+				.post(format!("{base}/ai/v1/chat/completions"))
+				.bearer_auth(jwt::sign(&json!({"role": "service_role"}), SECRET))
+				.json(&body)
+				.send()
+				.await
+				.unwrap();
+			let status = reply.status();
+			let model = label(&reply, "x-psyche-model");
+			let route = label(&reply, "x-psyche-route");
+			(status, model, route, reply.text().await.unwrap())
+		};
+
+		// A plain question: the cheapest of the three that wrote their facts. Models without facts
+		// (`ok`, `ok-cheap`) are never chosen, however cheap.
+		let (status, model, route, _) = ask(chat("auto", false)).await;
+		assert_eq!(status, 200);
+		assert_eq!(model.as_deref(), Some("small-text"));
+		assert_eq!(route.as_deref(), Some("auto"));
+		let call = s.call().await;
+		assert_eq!(call.route.as_deref(), Some("auto"));
+		assert_eq!(
+			call.routing.as_deref(),
+			Some("cheapest first: small-text, mid-images, big-tools")
+		);
+
+		// Tools: only the model that takes them, and the log names the two left out and why.
+		let mut tools = chat("auto", false);
+		tools["tools"] =
+			json!([{"type": "function", "function": {"name": "run_sql", "parameters": {}}}]);
+		let (status, model, _, _) = ask(tools).await;
+		assert_eq!(
+			(status.as_u16(), model.as_deref()),
+			(200, Some("big-tools"))
+		);
+		assert_eq!(
+			s.call().await.routing.as_deref(),
+			Some(
+				"cheapest first: big-tools; left out small-text (takes no tools), mid-images (takes no tools)"
+			)
+		);
+
+		// An image: the cheapest that takes images.
+		let image = json!({"model": "auto", "messages": [{"role": "user", "content": [
+			{"type": "text", "text": "what is this"},
+			{"type": "image_url", "image_url": {"url": "https://example.com/a.png"}}
+		]}]});
+		let (status, model, _, _) = ask(image).await;
+		assert_eq!(
+			(status.as_u16(), model.as_deref()),
+			(200, Some("mid-images"))
+		);
+		s.call().await;
+
+		// A reply longer than the small window leaves the small model out.
+		let mut long = chat("auto", false);
+		long["max_tokens"] = json!(5000);
+		let (status, model, _, _) = ask(long).await;
+		assert_eq!(
+			(status.as_u16(), model.as_deref()),
+			(200, Some("mid-images"))
+		);
+		let routing = s.call().await.routing.unwrap();
+		assert!(routing.contains("small-text (needs about"), "{routing}");
+
+		// The two variants: the cheapest, and the fastest (none measured yet, so the order given).
+		let (status, model, route, _) = ask(chat("auto:floor", false)).await;
+		assert_eq!(
+			(status.as_u16(), model.as_deref(), route.as_deref()),
+			(200, Some("small-text"), Some("auto:floor"))
+		);
+		s.call().await;
+		let (status, _, route, _) = ask(chat("auto:nitro", true)).await;
+		assert_eq!(
+			(status.as_u16(), route.as_deref()),
+			(200, Some("auto:nitro"))
+		);
+		s.call().await;
+
+		// Nothing can take it: refused as the caller's request, with every model's reason, and
+		// nothing is sent.
+		let sent = s.fake.count();
+		let mut impossible = chat("auto", false);
+		impossible["max_tokens"] = json!(300_000);
+		let (status, _, _, text) = ask(impossible).await;
+		assert_eq!(status, 400, "{text}");
+		assert!(
+			text.contains("None of the models auto stands for can take this request")
+				&& text.contains("big-tools needs about"),
+			"{text}"
+		);
+		assert_eq!(s.fake.count(), sent);
+
+		// A plain route checks the same facts: the small model takes no tools, so it is skipped
+		// rather than tried and failed.
+		let mut routed = chat("small-then-big", false);
+		routed["tools"] =
+			json!([{"type": "function", "function": {"name": "run_sql", "parameters": {}}}]);
+		let (status, model, _, _) = ask(routed).await;
+		assert_eq!(
+			(status.as_u16(), model.as_deref()),
+			(200, Some("big-tools"))
+		);
+		let call = s.call().await;
+		assert_eq!(call.attempt, 1);
+		assert_eq!(
+			call.routing.as_deref(),
+			Some("in the order written: big-tools; left out small-text (takes no tools)")
+		);
+
+		// Named alone, a model goes as the caller asked, whatever its facts say.
+		let mut alone = chat("small-text", false);
+		alone["tools"] =
+			json!([{"type": "function", "function": {"name": "run_sql", "parameters": {}}}]);
+		let (status, model, route, _) = ask(alone).await;
+		assert_eq!(
+			(status.as_u16(), model.as_deref(), route),
+			(200, Some("small-text"), None)
+		);
+		assert_eq!(s.call().await.routing, None);
+	}
+
+	#[tokio::test]
+	async fn a_models_fits_are_kept_and_auto_is_never_a_models_name() {
+		let Some((s, _db, _key, _id)) = with_budgets("fits").await else {
+			return;
+		};
+		let service = jwt::sign(&json!({"role": "service_role"}), SECRET);
+		let put = async |path: &str, body: Value| {
+			let reply = s
+				.client
+				.put(format!("{}/ai/v1/admin/{path}", s.base))
+				.bearer_auth(&service)
+				.json(&body)
+				.send()
+				.await
+				.unwrap();
+			(reply.status().as_u16(), reply.text().await.unwrap())
+		};
+		let fits_of = async |name: &str| -> Value {
+			let listed: Value = s
+				.client
+				.get(format!("{}/ai/v1/admin/models", s.base))
+				.bearer_auth(&service)
+				.send()
+				.await
+				.unwrap()
+				.json()
+				.await
+				.unwrap();
+			listed["data"]
+				.as_array()
+				.unwrap()
+				.iter()
+				.find(|m| m["name"] == name)
+				.unwrap()["fits"]
+				.clone()
+		};
+
+		// Written, read back as written; the file's own are in the table too.
+		let (status, text) = put(
+			"models/api-fit",
+			json!({"provider": "fake", "upstream": "fake-ok", "fits": {"context": 8000, "tools": true}}),
+		)
+		.await;
+		assert_eq!(status, 200, "{text}");
+		assert_eq!(
+			fits_of("api-fit").await,
+			json!({"context": 8000, "tools": true, "images": false, "json_schema": false})
+		);
+		assert_eq!(fits_of("small-text").await["context"], 1000);
+		// Left out of a later write, kept; `{}` clears it.
+		assert_eq!(
+			put(
+				"models/api-fit",
+				json!({"provider": "fake", "upstream": "fake-ok", "enabled": true})
+			)
+			.await
+			.0,
+			200
+		);
+		assert_eq!(fits_of("api-fit").await["tools"], true);
+		assert_eq!(
+			put(
+				"models/api-fit",
+				json!({"provider": "fake", "upstream": "fake-ok", "fits": {}})
+			)
+			.await
+			.0,
+			200
+		);
+		assert_eq!(fits_of("api-fit").await, Value::Null);
+		// A fact the API does not know is refused, not ignored.
+		assert_eq!(
+			put(
+				"models/api-fit",
+				json!({"provider": "fake", "fits": {"vision": true}})
+			)
+			.await
+			.0,
+			400
+		);
+
+		// `auto` and its variants are never a model's name; `auto` may be a route, its variants not.
+		let (status, text) = put(
+			"models/auto",
+			json!({"provider": "fake", "upstream": "fake-ok"}),
+		)
+		.await;
+		assert_eq!(status, 400, "{text}");
+		assert_eq!(
+			put("routes/auto:floor", json!({"targets": ["big-tools"]}))
+				.await
+				.0,
+			400
+		);
+		assert_eq!(
+			put(
+				"routes/auto",
+				json!({"targets": ["big-tools", "small-text"], "sort": "order"})
+			)
+			.await
+			.0,
+			200
+		);
 	}
 
 	#[tokio::test]

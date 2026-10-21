@@ -18,6 +18,7 @@ pub mod credentials;
 pub mod embeddings;
 pub mod error;
 pub mod eventstream;
+pub mod fits;
 pub mod health;
 pub mod jwt;
 pub mod keys;
@@ -86,6 +87,7 @@ pub mod fuzz {
 			reasoning: Some(crate::providers::Reasoning::Adaptive),
 			embeddings: None,
 			price: None,
+			fits: None,
 		};
 		let _ = crate::anthropic::request(&inbound.body, &model, inbound.stream);
 		let _ = crate::bedrock::request(&inbound.body, &model);

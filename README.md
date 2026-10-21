@@ -8,8 +8,8 @@ pod, and keeps its keys, budgets and request log in the project's own Postgres.
 
 **Status: early, not production-ready.** What works today is the OpenAI-compatible API over
 OpenAI-style providers, Anthropic and Amazon Bedrock, the request log in Postgres, keys, budgets and
-rate limits, and routes that fall over and steer around a model that keeps failing (below). More
-providers and `auto` routing are being built.
+rate limits, routes that fall over and steer around a model that keeps failing, and `auto`, which
+chooses the model by what the request needs (below). More providers are being built.
 
 ## What works today
 
@@ -240,6 +240,39 @@ it), with the same rules; `route: "fallback"` is accepted and changes nothing. N
 provider. The answer's `x-psyche-model` names the model that answered and `x-psyche-route` the route
 (`models` for a list). Each attempt is its own row in the request log, with `route` and `attempt`
 (from 1), so the rows of one call are its routing, explained.
+
+### What a model can take, and `auto`
+
+A model may say what it can take, in `fits`: its whole window in tokens, and whether it takes
+tools, images and a reply held to a JSON schema (each off unless written). In the providers file, or
+through the admin API:
+
+```sh
+curl -X PUT $PSYCHE/ai/v1/admin/models/sonnet -H "Authorization: Bearer $SERVICE_KEY" \
+  -d '{"provider": "anthropic", "upstream": "claude-sonnet-4-5",
+       "fits": {"context": 200000, "tools": true, "images": true, "json_schema": true}}'
+# Left out of a later PUT, a model keeps its fits; "fits": {} clears them.
+```
+
+Before a route, a fallback list or `auto` sends anything, it leaves out every model whose own facts
+say it cannot take the request: tools it does not take, an image, a JSON schema, or a request longer
+than its window (a third of the prompt's bytes, plus the reply asked for or the model's
+`max_output_tokens`; an estimate that errs toward leaving a model out). A model that wrote no `fits`
+is never left out, and a model named alone goes as the caller asked. When every model is left out
+the call is refused as the caller's (400), with each model's reason, and nothing is sent.
+
+**`auto`** is a name a caller sends instead of a model. It chooses among the models that wrote their
+`fits` (embedding models aside), leaves out those that cannot take the request, and tries the rest
+cheapest first. A project sets its own policy with a route named `auto`: its targets are the models
+`auto` may choose (still only those with `fits`), and its `sort` the order (`order` is the project's
+own ranking, `price`, `latency` or `throughput`). `auto:floor` is always the cheapest first and
+`auto:nitro` always the fastest, as OpenRouter's suffixes mean; neither may be a route, and no model
+may take any of the three names. No model is asked to choose (PS3): the same request under the same
+measurements goes the same way. `GET /ai/v1/models` lists the three (`owned_by: "auto"`, with their
+`targets`) once a model the caller may use has `fits`.
+
+Each attempt's log row has `routing`, the order its models were tried in and every one left out
+with its reason, for instance `cheapest first: big-tools; left out small-text (takes no tools)`.
 
 ### Health
 

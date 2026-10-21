@@ -798,6 +798,7 @@ mod tests {
 			reasoning: Some(Reasoning::Budget),
 			embeddings: None,
 			price: None,
+			fits: None,
 		}
 	}
 

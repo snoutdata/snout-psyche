@@ -476,6 +476,7 @@ mod tests {
 			reasoning: Some(crate::providers::Reasoning::Budget),
 			embeddings: None,
 			price: None,
+			fits: None,
 		}
 	}
 

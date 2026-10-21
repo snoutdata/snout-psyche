@@ -44,7 +44,8 @@
 //! And, for a Bedrock embedding model, `embeddings` (`titan` or `cohere`), the body its InvokeModel
 //! takes (`embeddings.rs`); a Bedrock model without it is not called for embeddings.
 //! And `price` (`price.rs`), which overrides the price catalogue shipped in the binary; a model
-//! that has neither is served and logged with no cost.
+//! that has neither is served and logged with no cost. And `fits` (`fits.rs`), what it can take
+//! (its window, tools, images, a JSON schema), which `auto` chooses by and every route checks.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
@@ -52,6 +53,7 @@ use std::sync::{Arc, RwLock};
 use serde::Deserialize;
 
 use crate::config::ConfigError;
+use crate::fits::Fits;
 use crate::net::{Egress, check_base_url};
 use crate::price::{self, Place, Price, PriceEntry};
 use crate::sigv4::{self, Credentials};
@@ -287,6 +289,8 @@ pub struct Model {
 	pub embeddings: Option<Embeddings>,
 	/// What it costs; `None` when neither the file nor the shipped catalogue prices it.
 	pub price: Option<Price>,
+	/// What it can take, when its owner wrote it (`fits.rs`).
+	pub fits: Option<Fits>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -413,6 +417,8 @@ pub struct ModelSpec {
 	/// As written, in dollars per million tokens (`price.rs`); checked when the model is built.
 	#[serde(default)]
 	pub price: Option<serde_json::Value>,
+	#[serde(default)]
+	pub fits: Option<Fits>,
 }
 
 impl Provider {
@@ -625,7 +631,17 @@ pub fn build_model(
 		reasoning: spec.reasoning,
 		embeddings: spec.embeddings,
 		price,
+		fits: spec.fits,
 	})
+}
+
+/// The cheapest first, by a million tokens in and a million out; a model nothing prices goes last.
+/// A stable sort, so equal prices keep the order given.
+pub fn by_price(models: &mut [Arc<Model>]) {
+	models.sort_by_key(|m| {
+		m.price
+			.map_or(u64::MAX, |p| p.rates.input.saturating_add(p.rates.output))
+	});
 }
 
 impl Catalogue {
@@ -735,11 +751,7 @@ impl Catalogue {
 			.filter_map(|t| self.by_name.get(t).cloned())
 			.collect();
 		if route.sort == Sort::Price {
-			// A stable sort, so equal prices keep the written order.
-			models.sort_by_key(|m| {
-				m.price
-					.map_or(u64::MAX, |p| p.rates.input.saturating_add(p.rates.output))
-			});
+			by_price(&mut models);
 		}
 		models
 	}
