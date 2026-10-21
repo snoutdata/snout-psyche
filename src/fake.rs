@@ -14,6 +14,7 @@
 //! | `fake-402` | 402, as OpenRouter answers an account with no credit |
 //! | `fake-hang` | nothing, ever |
 //! | `fake-cut` | two streamed chunks, 20 ms apart, then the connection drops |
+//! | `chaos-…` | whatever [`Fake::set_chaos`] last set for that name ([`Chaos`]), answering until then |
 //!
 //! `/embeddings` answers any other model with one vector per input, its first number the input's
 //! length, so a test can tell the vectors apart and see their order.
@@ -61,6 +62,7 @@
 //! Everything received is kept ([`Fake::last`]), and a stream the client dropped before its end is
 //! counted ([`Fake::cancelled`]).
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -91,6 +93,44 @@ struct Shared {
 	cancelled: Arc<AtomicUsize>,
 	/// Off for the bench, which sends millions of requests and reads none of them back.
 	quiet: bool,
+	/// What each `chaos-…` model does now, and how many requests each answered in each way.
+	chaos: Arc<Mutex<HashMap<String, Chaos>>>,
+	served: Arc<Mutex<HashMap<(String, &'static str), u64>>>,
+}
+
+/// What a `chaos-…` model does, set by the chaos run (`psyche-bench chaos`) while it runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Chaos {
+	/// Answers at once.
+	Ok,
+	/// Answers, 250 ms late (a stream: its words 60 ms apart).
+	Slow,
+	/// 500.
+	Fail,
+	/// 503.
+	Unavailable,
+	/// 429 with `retry-after` of this many seconds.
+	RateLimited(u64),
+	/// Never answers.
+	Hang,
+}
+
+impl Chaos {
+	/// Whether a request sent now gets an answer.
+	pub fn healthy(self) -> bool {
+		matches!(self, Chaos::Ok | Chaos::Slow)
+	}
+
+	pub fn name(self) -> &'static str {
+		match self {
+			Chaos::Ok => "ok",
+			Chaos::Slow => "slow",
+			Chaos::Fail => "500",
+			Chaos::Unavailable => "503",
+			Chaos::RateLimited(_) => "429",
+			Chaos::Hang => "hang",
+		}
+	}
 }
 
 pub struct Fake {
@@ -164,6 +204,22 @@ impl Fake {
 	pub fn cancelled(&self) -> usize {
 		self.shared.cancelled.load(Ordering::SeqCst)
 	}
+
+	/// Sets what the `chaos-…` models named do from the next request on, all at once, and returns
+	/// the moment it did: read while the change is held, so every request answered the new way read
+	/// it after that moment and every one answered the old way before it.
+	pub fn set_chaos(&self, modes: &[(String, Chaos)]) -> std::time::Instant {
+		let mut chaos = self.shared.chaos.lock().expect("the fake's chaos");
+		for (model, mode) in modes {
+			chaos.insert(model.clone(), *mode);
+		}
+		std::time::Instant::now()
+	}
+
+	/// How many requests each `chaos-…` model answered in each way, by [`Chaos::name`].
+	pub fn served(&self) -> HashMap<(String, &'static str), u64> {
+		self.shared.served.lock().expect("the fake's tally").clone()
+	}
 }
 
 fn error(status: StatusCode, message: &str, kind: &str) -> Response {
@@ -235,6 +291,62 @@ async fn answer(
 		.and_then(Value::as_bool)
 		== Some(true);
 	let chat = uri.path().ends_with("/chat/completions");
+	if model.starts_with("chaos-") {
+		let mode = *shared
+			.chaos
+			.lock()
+			.expect("the fake's chaos")
+			.get(&model)
+			.unwrap_or(&Chaos::Ok);
+		*shared
+			.served
+			.lock()
+			.expect("the fake's tally")
+			.entry((model.clone(), mode.name()))
+			.or_default() += 1;
+		return match mode {
+			Chaos::Ok if !stream => whole(&model, chat),
+			Chaos::Slow if !stream => {
+				tokio::time::sleep(Duration::from_millis(250)).await;
+				whole(&model, chat)
+			}
+			Chaos::Ok | Chaos::Slow => streamed(
+				shared,
+				model,
+				chat,
+				REPLY.iter().map(|w| w.to_string()).collect(),
+				usage,
+				Duration::from_millis(if mode == Chaos::Slow { 60 } else { 0 }),
+				false,
+			),
+			Chaos::Fail => error(
+				StatusCode::INTERNAL_SERVER_ERROR,
+				"The fake fell over.",
+				"server_error",
+			),
+			Chaos::Unavailable => error(
+				StatusCode::SERVICE_UNAVAILABLE,
+				"The fake is overloaded.",
+				"server_error",
+			),
+			Chaos::RateLimited(seconds) => {
+				let mut response = error(
+					StatusCode::TOO_MANY_REQUESTS,
+					"Rate limit reached for requests.",
+					"requests",
+				);
+				response.headers_mut().insert(
+					header::RETRY_AFTER,
+					seconds.to_string().parse().expect("a header"),
+				);
+				response
+			}
+			Chaos::Hang => {
+				std::future::pending::<()>().await;
+				StatusCode::OK.into_response()
+			}
+		};
+	}
 	match model.as_str() {
 		"fake-500" => error(
 			StatusCode::INTERNAL_SERVER_ERROR,
