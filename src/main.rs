@@ -61,6 +61,18 @@ async fn main() {
 			if !ran.is_empty() {
 				tracing::info!(?ran, "migrated the psyche schema");
 			}
+			// The file written into the tables, which are then what is served (`models.rs`). Only
+			// when there is a file: with none, the tables are the admin API's alone.
+			if config.providers_file.is_some() {
+				let kept = snout_psyche::models::seed(&mut client, &tables.file)
+					.await
+					.unwrap_or_else(|error| {
+						fail(1, &format!("cannot seed the catalogue: {error}"))
+					});
+				for note in kept {
+					tracing::warn!("{note}");
+				}
+			}
 			// What was spent before this start, which every budget counts from.
 			let budgets = snout_psyche::budgets::Budgets::default();
 			let limits = snout_psyche::limits::Limits::default();

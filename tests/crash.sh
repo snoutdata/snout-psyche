@@ -3,7 +3,7 @@
 #
 #   bash tests/crash.sh
 #
-# A throwaway Postgres 17 on its own network, and the stack's dev container joined to it, running
+# A throwaway Postgres 18 on its own network, and the stack's dev container joined to it, running
 # tests/crash-run.sh: a release Psyche in front of the fake provider, held under load by
 # `psyche-bench load`, and then stopped. Each run has a database of its own, and once they are done
 # the rows each one wrote are counted here and set against the calls the load saw answered.
@@ -30,7 +30,7 @@ cleanup() {
 	rm -f "$out"
 }
 trap cleanup EXIT
-"$engine" run -d --rm --name "$pg" --network "$net" -e POSTGRES_PASSWORD=test postgres:17-alpine >/dev/null
+"$engine" run -d --rm --name "$pg" --network "$net" -e POSTGRES_PASSWORD=test postgres:18-alpine >/dev/null
 until "$engine" exec "$pg" psql -h 127.0.0.1 -U postgres -tAc 'select 1' >/dev/null 2>&1; do sleep 0.5; done
 sql() { "$engine" exec "$pg" psql -h 127.0.0.1 -U postgres -tAq "$@"; }
 for run in clean kill_64 kill_4; do
@@ -51,7 +51,9 @@ while read -r run in_flight answered; do
 	*) allowed=$((2 * flush_rows + in_flight)) ;;
 	esac
 	verdict=ok
-	if [ "$lost" -gt "$allowed" ] || [ "$((rows - answered))" -gt "$in_flight" ]; then
+	# A run with nothing answered loses nothing and proves nothing (a model the file named and
+	# Psyche did not serve passed this way for days).
+	if [ "${answered:-0}" -eq 0 ] || [ "$lost" -gt "$allowed" ] || [ "$((rows - answered))" -gt "$in_flight" ]; then
 		verdict=FAILED
 		failed=1
 	fi

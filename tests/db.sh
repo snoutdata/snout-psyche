@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# The request log against a real Postgres: a throwaway Postgres 17 on its own network, and the stack's
+# The request log against a real Postgres: a throwaway Postgres 18 on its own network, and the stack's
 # dev container joined to it with PSYCHE_TEST_DATABASE_URL set, running the crate's whole suite,
 # database tests included (they skip without it).
 #
@@ -16,7 +16,7 @@ cleanup() {
 	"$engine" network rm "$net" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
-"$engine" run -d --rm --name "$pg" --network "$net" -e POSTGRES_PASSWORD=test postgres:17-alpine >/dev/null
+"$engine" run -d --rm --name "$pg" --network "$net" -e POSTGRES_PASSWORD=test postgres:18-alpine >/dev/null
 # Over TCP: while it initialises, the image runs a temporary server on its socket alone.
 until "$engine" exec "$pg" psql -h 127.0.0.1 -U postgres -tAc 'select 1' >/dev/null 2>&1; do sleep 0.5; done
 
