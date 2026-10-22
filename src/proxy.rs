@@ -24,7 +24,7 @@
 //!    event holding an `error` object), and the stream ends. Before it, the caller gets a status.
 //!  - **A provider's error never carries Psyche's credential back out** (`error::scrub`).
 //!  - **A refused credential is Psyche's problem, not the caller's**: a provider's 401 or 403 is
-//!    answered 502, never passed on as if the caller's own key were wrong.
+//!    answered 503 `provider_auth`, never passed on as if the caller's own key were wrong.
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -4572,7 +4572,7 @@ mod tests {
 		// Not set yet: refused with what to do, and nothing is sent.
 		let sent = s.fake.count();
 		let (status, code, message) = error_of(call("via-store").await.unwrap()).await;
-		assert_eq!((status, code.as_str()), (502, "provider_auth"));
+		assert_eq!((status, code.as_str()), (503, "provider_auth"));
 		assert!(
 			message.contains("PUT /ai/v1/admin/credentials/stored"),
 			"{message}"
@@ -4661,7 +4661,7 @@ mod tests {
 			.unwrap();
 		let mut stopped = false;
 		for _ in 0..250 {
-			if call("via-store").await.unwrap().status() == 502 {
+			if call("via-store").await.unwrap().status() == 503 {
 				stopped = true;
 				break;
 			}
@@ -4676,7 +4676,7 @@ mod tests {
 			.await
 			.unwrap();
 		assert_eq!(gone.status(), 204);
-		assert_eq!(call("via-store-aws").await.unwrap().status(), 502);
+		assert_eq!(call("via-store-aws").await.unwrap().status(), 503);
 	}
 
 	#[tokio::test]
@@ -4798,7 +4798,7 @@ mod tests {
 		.unwrap();
 		assert_eq!(made["price_from"], "model", "{made}");
 		let (status, code, _) = error_of(call("mine-ok").await.unwrap()).await;
-		assert_eq!((status, code.as_str()), (502, "provider_auth"));
+		assert_eq!((status, code.as_str()), (503, "provider_auth"));
 		let proven = admin(
 			reqwest::Method::PUT,
 			"credentials/mine",
@@ -5338,7 +5338,7 @@ mod tests {
 			.unwrap();
 		assert_eq!(
 			response.status(),
-			502,
+			503,
 			"a refused credential is not the caller's fault"
 		);
 		let body = response.text().await.unwrap();
@@ -5381,7 +5381,7 @@ mod tests {
 			.send()
 			.await
 			.unwrap();
-		assert_eq!(fails.status(), 502);
+		assert_eq!(fails.status(), 503);
 		// A 5xx is asked once more before it comes back, and each try is its own row.
 		let (first, second) = (s.call().await, s.call().await);
 		assert_eq!((first.attempt, second.attempt), (1, 2));
@@ -5394,7 +5394,7 @@ mod tests {
 				.send()
 				.await
 				.unwrap();
-			assert_eq!(broke.status(), 502, "{model}");
+			assert_eq!(broke.status(), 503, "{model}");
 			assert!(broke.headers().get("retry-after").is_none(), "{model}");
 			let body: Value = broke.json().await.unwrap();
 			assert_eq!(body["error"]["code"], "provider_billing", "{model}: {body}");
@@ -5424,7 +5424,7 @@ mod tests {
 			.send()
 			.await
 			.unwrap();
-		assert_eq!(response.status(), 504);
+		assert_eq!(response.status(), 503);
 		assert_eq!(s.call().await.outcome, Outcome::Failed(Class::Timeout));
 	}
 
@@ -5647,7 +5647,7 @@ mod tests {
 			.send()
 			.await
 			.unwrap();
-		assert_eq!(alone.status(), 502);
+		assert_eq!(alone.status(), 503);
 		s.call().await;
 		s.call().await;
 
@@ -6194,7 +6194,7 @@ mod tests {
 			(mine["skipped"].clone(), mine["tried"].clone()),
 			(json!(["ok-cheap"]), json!(["fails"]))
 		);
-		assert_eq!(call("mine").await.unwrap().status(), 502);
+		assert_eq!(call("mine").await.unwrap().status(), 503);
 
 		let gone = admin(reqwest::Method::DELETE, "routes/mine", None)
 			.await
@@ -6213,7 +6213,7 @@ mod tests {
 			.unwrap();
 		assert_eq!(
 			overloaded.status(),
-			502,
+			503,
 			"Anthropic's 529 is the provider failing"
 		);
 		let body: Value = overloaded.json().await.unwrap();
@@ -6315,7 +6315,7 @@ mod tests {
 			.send()
 			.await
 			.unwrap();
-		assert_eq!(wrong.status(), 502);
+		assert_eq!(wrong.status(), 503);
 		let body: Value = wrong.json().await.unwrap();
 		assert_eq!(body["error"]["code"], "provider_auth");
 		assert!(!body.to_string().contains("a-secret-the-fake"));

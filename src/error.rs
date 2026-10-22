@@ -85,12 +85,15 @@ impl Class {
 			Class::Forbidden => StatusCode::FORBIDDEN,
 			Class::ModelNotFound => StatusCode::NOT_FOUND,
 			Class::RateLimited | Class::Budget | Class::Limited => StatusCode::TOO_MANY_REQUESTS,
-			Class::Timeout => StatusCode::GATEWAY_TIMEOUT,
-			Class::ProviderAuth
+			// 503, never 502 or 504: Cloudflare's edge, in front of every hosted Psyche, replaces
+			// an origin's 502 and 504 with its own "error code: 502" page, and this body is the
+			// only place a caller learns which of these it was. The `code` tells them apart.
+			Class::Timeout
+			| Class::ProviderAuth
 			| Class::ProviderBilling
 			| Class::Upstream
 			| Class::Transport
-			| Class::EgressRefused => StatusCode::BAD_GATEWAY,
+			| Class::EgressRefused => StatusCode::SERVICE_UNAVAILABLE,
 		}
 	}
 

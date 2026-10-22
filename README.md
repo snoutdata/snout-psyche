@@ -63,11 +63,13 @@ chooses the model by what the request needs (below). More providers are being bu
   call is cancelled, so nobody pays for tokens no one reads.
 - A failure after the stream started ends it with an error event, OpenAI's way. Before that it is
   a status: the provider's own status when your request was at fault (a 400), 429 with
-  `retry-after` when the provider is rate-limiting, 502 when the provider refused **Psyche's**
-  credential (`provider_auth`, never passed on as if your key were wrong), 502 with no
-  `retry-after` when the account behind that credential has no credit or quota left
-  (`provider_billing`: OpenAI's `insufficient_quota`, a 402, Anthropic's low credit balance, none
-  of which a retry fixes), 504 when it did not answer in time.
+  `retry-after` when the provider is rate-limiting, and otherwise 503 with a `code` saying which:
+  `provider_auth` when the provider refused **Psyche's** credential (never passed on as if your
+  key were wrong), `provider_billing` with no `retry-after` when the account behind that
+  credential has no credit or quota left (OpenAI's `insufficient_quota`, a 402, Anthropic's low
+  credit balance, none of which a retry fixes), `upstream_error` when it failed, `timeout` when it
+  did not answer in time. Never 502 or 504: a CDN in front (Cloudflare's edge does this) replaces
+  an origin's 502 and 504 with its own page, and the `code` is then lost.
 - A provider error that echoes the key Psyche sent never reaches the caller or the log.
 - Every address is checked before a connection is made: no private ranges, no metadata service,
   no redirects, https only, unless you run it with `PSYCHE_EGRESS=private` beside your own model
@@ -330,7 +332,7 @@ reaches Psyche through the same trigger as keys.
 A credential is **written once and never read back**: `GET /ai/v1/admin/credentials` shows each
 one's kind, a fingerprint, its last four characters, the providers that use it, and any name a
 provider asks for that is not stored yet; `DELETE /ai/v1/admin/credentials/<name>` removes one. A
-call to a provider whose credential is not set is refused (502, `provider_auth`) with the command
+call to a provider whose credential is not set is refused (503, `provider_auth`) with the command
 that sets it, and nothing is sent. In the database, only Psyche's own role reads
 `psyche.credentials`: no grant to the signed-in or anon roles, nor to the project's service role,
 which bypasses row-level security but still needs a grant. A superuser can read any table, so that
