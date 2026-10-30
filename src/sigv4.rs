@@ -87,6 +87,9 @@ pub struct Request<'a> {
 	pub method: &'a str,
 	pub host: &'a str,
 	pub path: &'a str,
+	/// The query string as it is sent, already in AWS's canonical form (keys sorted, values
+	/// encoded with [`encode`]); empty for none.
+	pub query: &'a str,
 	pub content_type: &'a str,
 	pub body: &'a [u8],
 }
@@ -128,8 +131,9 @@ pub fn sign(
 		.collect::<Vec<_>>()
 		.join(";");
 	let canonical = format!(
-		"{}\n{canonical_path}\n\n{canonical_headers}\n{signed_headers}\n{}",
+		"{}\n{canonical_path}\n{}\n{canonical_headers}\n{signed_headers}\n{}",
 		request.method,
+		request.query,
 		hex(digest::digest(&digest::SHA256, request.body).as_ref())
 	);
 	let scope = format!("{day}/{region}/{service}/aws4_request");
@@ -205,6 +209,7 @@ mod tests {
 					method: "POST",
 					host: "bedrock-runtime.us-west-2.amazonaws.com",
 					path: &path,
+					query: "",
 					content_type: "application/json",
 					body: BODY,
 				},

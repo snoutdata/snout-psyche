@@ -74,6 +74,8 @@ pub struct Proxy {
 	/// The tables behind it (`models.rs`), when there is a database.
 	pub tables: Option<models::Held>,
 	pub http: reqwest::Client,
+	/// The egress rules `http` was built with, for an address the admin API is handed.
+	pub egress: net::Egress,
 	pub jwt_secret: String,
 	pub timeouts: Timeouts,
 	pub max_request_bytes: usize,
@@ -458,6 +460,11 @@ pub fn router(proxy: Arc<Proxy>) -> Router {
 			"/admin/providers/{name}",
 			put(set_provider).delete(delete_provider),
 		)
+		.route(
+			"/admin/providers/{name}/upstream-models",
+			get(upstream_models_of),
+		)
+		.route("/admin/upstream-models", post(upstream_models_for))
 		.route("/admin/models", get(list_models))
 		.route("/admin/models/{*name}", put(set_model).delete(delete_model))
 		.route("/admin/routes", get(list_routes))
@@ -998,6 +1005,140 @@ async fn delete_model(
 	.await;
 	match result {
 		Ok(done) => axum::Json(done).into_response(),
+		Err(error) => error.into_response(),
+	}
+}
+
+/// The models a saved provider offers, asked of the provider with the credential its calls use
+/// (`upstream.rs`): the stored one, or the providers file's environment key.
+async fn upstream_models_of(
+	State(proxy): State<Arc<Proxy>>,
+	headers: HeaderMap,
+	Path(name): Path<String>,
+) -> Response {
+	let result = async {
+		let provider = match &proxy.tables {
+			Some(held) => {
+				let (_, client) = admin(&proxy, &headers).await?;
+				let (spec, left_out) = models::load(&client, &held.file, held.egress)
+					.await
+					.map_err(|e| database_error(&e))?;
+				let Some(provider) = spec.provider(&name) else {
+					return Err(match left_out.iter().find(|(n, _)| *n == name) {
+						Some((_, why)) => ApiError::new(Class::BadRequest, format!("{name} is not served: {why}")),
+						None => not_found(&format!("There is no provider {name}.")),
+					});
+				};
+				let stored = credentials::load(&client)
+					.await
+					.map_err(|e| database_error(&e))?;
+				if let Some(credential) = &provider.credential
+					&& !stored.contains_key(credential)
+				{
+					return Err(ApiError::new(
+						Class::ProviderAuth,
+						format!("{name} takes the stored credential {credential}, which is not set, so it cannot be asked for its models."),
+					));
+				}
+				provider.with_stored(&stored)
+			}
+			None => {
+				if !matches!(proxy.authorize(&headers)?, Caller::Service) {
+					return Err(ApiError::new(
+						Class::Forbidden,
+						"Only the project's service key may use the admin API.",
+					));
+				}
+				let catalogue = proxy.catalogue.get();
+				let model = catalogue
+					.models()
+					.iter()
+					.find(|m| m.provider.name == name)
+					.ok_or_else(|| not_found(&format!("There is no provider {name}.")))?;
+				(*model.provider).clone()
+			}
+		};
+		crate::upstream::list(&proxy.http, &provider).await
+	}
+	.await;
+	match result {
+		Ok(data) => axum::Json(json!({"object": "list", "data": data})).into_response(),
+		Err(error) => error.into_response(),
+	}
+}
+
+/// What `POST /admin/upstream-models` takes: a provider as `PUT /admin/providers/<name>` would
+/// make it, and the credential `PUT /admin/credentials/<name>` would store, neither of them kept.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UnsavedProvider {
+	provider: models::NewProvider,
+	#[serde(default)]
+	credential: Option<credentials::NewCredential>,
+}
+
+/// The models a provider not saved yet offers, for a screen that adds a provider and its first
+/// model together: nothing is written, and the credential is used for this one list only.
+async fn upstream_models_for(
+	State(proxy): State<Arc<Proxy>>,
+	headers: HeaderMap,
+	body: Result<Bytes, BytesRejection>,
+) -> Response {
+	let result = async {
+		if !matches!(proxy.authorize(&headers)?, Caller::Service) {
+			return Err(ApiError::new(
+				Class::Forbidden,
+				"Only the project's service key may use the admin API.",
+			));
+		}
+		let body = body.map_err(|r| ApiError::new(Class::BadRequest, r.body_text()))?;
+		let unsaved: UnsavedProvider = serde_json::from_slice(&body).map_err(|e| {
+			ApiError::new(
+				Class::BadRequest,
+				format!("This takes {{\"provider\": {{kind, base_url, region, credential, auth_header}}, \"credential\": {{api_key}} or AWS credentials}}: {e}"),
+			)
+		})?;
+		let stored = unsaved
+			.credential
+			.map(credentials::NewCredential::stored)
+			.transpose()
+			.map_err(|m| ApiError::new(Class::BadRequest, m))?;
+		let egress = proxy.egress;
+		let new = unsaved.provider;
+		// The credential given is used under a name of its own, so a stored one by the provider's
+		// name is never picked up in its place.
+		let credential = match (&stored, &new.credential) {
+			(Some(_), _) => Some("unsaved"),
+			(None, named) => named.as_deref(),
+		};
+		let provider = Provider::from_row(
+			"The provider",
+			new.kind,
+			new.base_url.as_deref(),
+			new.region.as_deref(),
+			credential,
+			new.auth_header.as_deref(),
+			egress,
+		)
+		.map_err(|m| ApiError::new(Class::BadRequest, m))?;
+		let mut held = std::collections::HashMap::new();
+		match (stored, credential, &proxy.tables) {
+			(Some(stored), _, _) => {
+				held.insert("unsaved".to_string(), stored);
+			}
+			(None, Some(_), Some(_)) => {
+				let (_, client) = admin(&proxy, &headers).await?;
+				held = credentials::load(&client)
+					.await
+					.map_err(|e| database_error(&e))?;
+			}
+			_ => {}
+		}
+		crate::upstream::list(&proxy.http, &provider.with_stored(&held)).await
+	}
+	.await;
+	match result {
+		Ok(data) => axum::Json(json!({"object": "list", "data": data})).into_response(),
 		Err(error) => error.into_response(),
 	}
 }
@@ -3405,6 +3546,7 @@ mod tests {
 				catalogue: live,
 				tables: keys.as_ref().map(|_| held.clone()),
 				http: net::client(Egress::Private).unwrap(),
+				egress: Egress::Private,
 				jwt_secret: SECRET.into(),
 				timeouts,
 				max_request_bytes: 1024 * 1024,
@@ -3433,6 +3575,12 @@ mod tests {
 				.json(&body)
 		}
 
+		fn get(&self, path: &str) -> reqwest::RequestBuilder {
+			self.client
+				.get(format!("{}{path}", self.base))
+				.bearer_auth(jwt::sign(&json!({"role": "service_role"}), SECRET))
+		}
+
 		async fn call(&mut self) -> Call {
 			tokio::time::timeout(Duration::from_secs(5), self.calls.recv())
 				.await
@@ -3451,6 +3599,78 @@ mod tests {
 			.filter_map(|e| e.strip_prefix("data: "))
 			.map(String::from)
 			.collect()
+	}
+
+	#[tokio::test]
+	async fn a_provider_lists_its_own_models_and_never_the_key() {
+		let s = Setup::new().await;
+		let listed: Value = s
+			.get("/ai/v1/admin/providers/fake/upstream-models")
+			.send()
+			.await
+			.unwrap()
+			.json()
+			.await
+			.unwrap();
+		assert_eq!(listed["data"][0]["id"], "fake-new", "{listed}");
+		assert_eq!(listed["data"][0]["kind"], "chat");
+		let anthropic: Value = s
+			.get("/ai/v1/admin/providers/anthropic/upstream-models")
+			.send()
+			.await
+			.unwrap()
+			.json()
+			.await
+			.unwrap();
+		assert_eq!(anthropic["data"][0]["id"], "claude-fake-5", "{anthropic}");
+		let none = s
+			.get("/ai/v1/admin/providers/nobody/upstream-models")
+			.send()
+			.await
+			.unwrap();
+		assert_eq!(none.status(), 404);
+		let user = s
+			.client
+			.get(format!(
+				"{}/ai/v1/admin/providers/fake/upstream-models",
+				s.base
+			))
+			.bearer_auth(jwt::sign(&json!({"role": "anon"}), SECRET))
+			.send()
+			.await
+			.unwrap();
+		assert_eq!(user.status(), 403, "the service key only");
+
+		// A provider not saved yet, with the key it would be saved with.
+		let base = format!("{}/v1", s.fake.origin);
+		let unsaved = s
+			.post(
+				"/ai/v1/admin/upstream-models",
+				json!({"provider": {"kind": "openai", "base_url": base}, "credential": {"api_key": Fake::KEY}}),
+			)
+			.send()
+			.await
+			.unwrap();
+		assert_eq!(unsaved.status(), 200);
+		let text = unsaved.text().await.unwrap();
+		assert!(
+			text.contains("fake-new") && !text.contains(Fake::KEY),
+			"{text}"
+		);
+		let wrong = s
+			.post(
+				"/ai/v1/admin/upstream-models",
+				json!({"provider": {"kind": "openai", "base_url": base}, "credential": {"api_key": "sk-not-the-fake-key-42"}}),
+			)
+			.send()
+			.await
+			.unwrap();
+		assert_eq!(wrong.status(), 503);
+		let text = wrong.text().await.unwrap();
+		assert!(
+			text.contains("provider_auth") && !text.contains("sk-not-the-fake-key-42"),
+			"{text}"
+		);
 	}
 
 	#[tokio::test]
@@ -4578,6 +4798,18 @@ mod tests {
 			"{message}"
 		);
 		assert_eq!(s.fake.count(), sent);
+		let models_of = |provider: &str| {
+			s.client
+				.get(format!(
+					"{}/ai/v1/admin/providers/{provider}/upstream-models",
+					s.base
+				))
+				.bearer_auth(service())
+				.send()
+		};
+		let (status, code, message) = error_of(models_of("stored").await.unwrap()).await;
+		assert_eq!((status, code.as_str()), (503, "provider_auth"));
+		assert!(message.contains("not set"), "{message}");
 		let listed: Value = s
 			.client
 			.get(format!("{}/ai/v1/admin/credentials", s.base))
@@ -4643,6 +4875,12 @@ mod tests {
 		);
 		assert_eq!(made.await.unwrap().status(), 200);
 		assert_eq!(call("via-store-aws").await.unwrap().status(), 200);
+		// Each lists its provider's own models with the credential it now holds.
+		let listed = models_of("stored").await.unwrap().text().await.unwrap();
+		assert!(listed.contains("\"fake-new\""), "{listed}");
+		let listed = models_of("stored-aws").await.unwrap().text().await.unwrap();
+		assert!(listed.contains("us.openai.fake-luna"), "{listed}");
+		assert!(!listed.contains(Fake::AWS_SECRET));
 		let listed = s
 			.client
 			.get(format!("{}/ai/v1/admin/credentials", s.base))

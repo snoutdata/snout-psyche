@@ -34,6 +34,7 @@ pub mod proxy;
 pub mod sigv4;
 pub mod sse;
 pub mod translate;
+pub mod upstream;
 pub mod usage;
 pub mod who;
 

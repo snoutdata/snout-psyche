@@ -70,7 +70,7 @@ use std::time::Duration;
 use axum::Router;
 use axum::body::{Body, Bytes};
 use axum::extract::State;
-use axum::http::{HeaderMap, StatusCode, Uri, header};
+use axum::http::{HeaderMap, Method, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use serde_json::{Value, json};
 
@@ -234,6 +234,7 @@ fn error(status: StatusCode, message: &str, kind: &str) -> Response {
 
 async fn answer(
 	State(shared): State<Shared>,
+	method: Method,
 	uri: Uri,
 	headers: HeaderMap,
 	body: Bytes,
@@ -263,6 +264,9 @@ async fn answer(
 			&format!("Invalid URL (POST {})", uri.path()),
 			"invalid_request_error",
 		);
+	}
+	if method == Method::GET {
+		return list_models(&uri, &headers);
 	}
 	if uri.path().starts_with("/model/") {
 		return bedrock(shared, &uri, &headers, &raw, &body);
@@ -802,8 +806,98 @@ fn bedrock_embed(id: &str, body: &Value) -> Response {
 	response
 }
 
+/// A provider's list of its models (`upstream.rs`), by the path asked: Bedrock's foundation models
+/// and inference profiles (two pages, the second asked with `nextToken`), Anthropic's models (two
+/// pages, by `after_id`) when `anthropic-version` is sent, and otherwise OpenAI's `/models`.
+fn list_models(uri: &Uri, headers: &HeaderMap) -> Response {
+	let path = uri.path();
+	let query = uri.query().unwrap_or("");
+	let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+	if path.ends_with("/foundation-models") || path.ends_with("/inference-profiles") {
+		if !bedrock_authorized(&Method::GET, uri, headers, b"") {
+			return bedrock_error(
+				403,
+				"UnrecognizedClientException",
+				"The security token included in the request is invalid.",
+			);
+		}
+		if path.ends_with("/foundation-models") {
+			let model = |id: &str, maker: &str, output: &str, inference: &str| {
+				json!({"modelId": id, "modelName": id, "providerName": maker,
+					"outputModalities": [output], "inferenceTypesSupported": [inference],
+					"modelLifecycle": {"status": "ACTIVE"}})
+			};
+			return axum::Json(json!({"modelSummaries": [
+				model("anthropic.fake-sonnet-v1:0", "Anthropic", "TEXT", "INFERENCE_PROFILE"),
+				model("openai.fake-luna-v1:0", "OpenAI", "TEXT", "INFERENCE_PROFILE"),
+				model("qwen.fake-coder-v1:0", "Qwen", "TEXT", "ON_DEMAND"),
+				model("amazon.fake-embed-v2:0", "Amazon", "EMBEDDING", "ON_DEMAND"),
+				model("stability.fake-image-v1:0", "Stability AI", "IMAGE", "ON_DEMAND"),
+			]}))
+			.into_response();
+		}
+		let profile = |id: &str, model: &str, at: &str| {
+			json!({"inferenceProfileId": id, "inferenceProfileName": id, "status": "ACTIVE",
+				"type": "SYSTEM_DEFINED", "createdAt": at,
+				"models": [{"modelArn": format!("arn:aws:bedrock:us-west-2::foundation-model/{model}")}]})
+		};
+		return if query.contains("nextToken=page%20two") {
+			axum::Json(json!({"inferenceProfileSummaries": [
+				profile("us.openai.fake-luna", "openai.fake-luna-v1:0", "2026-01-01T00:00:00Z"),
+			]}))
+			.into_response()
+		} else {
+			axum::Json(json!({"inferenceProfileSummaries": [
+				profile("us.anthropic.fake-sonnet", "anthropic.fake-sonnet-v1:0", "2025-01-01T00:00:00Z"),
+			], "nextToken": "page two"}))
+			.into_response()
+		};
+	}
+	if header("anthropic-version").is_some() {
+		if header("x-api-key") != Some(Fake::KEY) {
+			return anthropic_error(
+				StatusCode::UNAUTHORIZED,
+				"authentication_error",
+				"invalid x-api-key",
+			);
+		}
+		let model = |id: &str, name: &str, at: &str| json!({"type": "model", "id": id, "display_name": name, "created_at": at});
+		return if query.contains("after_id=claude-fake-4") {
+			axum::Json(
+				json!({"data": [model("claude-fake-3", "Claude Fake 3", "2024-01-01T00:00:00Z")],
+				"has_more": false, "last_id": "claude-fake-3"}),
+			)
+			.into_response()
+		} else {
+			axum::Json(json!({"data": [
+				model("claude-fake-5", "Claude Fake 5", "2026-01-01T00:00:00Z"),
+				model("claude-fake-4", "Claude Fake 4", "2025-01-01T00:00:00Z"),
+			], "has_more": true, "last_id": "claude-fake-4"}))
+			.into_response()
+		};
+	}
+	let presented = header("authorization")
+		.and_then(|a| a.strip_prefix("Bearer "))
+		.or(header(Fake::GATE_HEADER))
+		.unwrap_or("");
+	if presented != Fake::KEY {
+		return error(
+			StatusCode::UNAUTHORIZED,
+			&format!("Incorrect API key provided: {presented}."),
+			"invalid_request_error",
+		);
+	}
+	axum::Json(json!({"object": "list", "data": [
+		{"id": "fake-ok", "object": "model", "created": 1000, "owned_by": "fake"},
+		{"id": "whisper-fake", "object": "model", "created": 3000, "owned_by": "fake"},
+		{"id": "fake-embed", "object": "model", "created": 1500, "owned_by": "fake"},
+		{"id": "fake-new", "object": "model", "created": 2000, "owned_by": "fake", "context_window": 128000},
+	]}))
+	.into_response()
+}
+
 /// Whether the request carries Bedrock's API key or a SigV4 signature that checks out.
-fn bedrock_authorized(uri: &Uri, headers: &HeaderMap, raw: &[u8]) -> bool {
+fn bedrock_authorized(method: &Method, uri: &Uri, headers: &HeaderMap, raw: &[u8]) -> bool {
 	let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
 	let Some(authorization) = header("authorization") else {
 		return false;
@@ -831,9 +925,10 @@ fn bedrock_authorized(uri: &Uri, headers: &HeaderMap, raw: &[u8]) -> bool {
 		region,
 		"bedrock",
 		&crate::sigv4::Request {
-			method: "POST",
+			method: method.as_str(),
 			host,
 			path: uri.path(),
+			query: uri.query().unwrap_or(""),
 			content_type: header("content-type").unwrap_or(""),
 			body: raw,
 		},
@@ -844,7 +939,7 @@ fn bedrock_authorized(uri: &Uri, headers: &HeaderMap, raw: &[u8]) -> bool {
 
 /// Bedrock's half: Converse and ConverseStream.
 fn bedrock(shared: Shared, uri: &Uri, headers: &HeaderMap, raw: &[u8], body: &Value) -> Response {
-	if !bedrock_authorized(uri, headers, raw) {
+	if !bedrock_authorized(&Method::POST, uri, headers, raw) {
 		return bedrock_error(
 			403,
 			"InvalidSignatureException",

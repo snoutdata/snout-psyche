@@ -137,6 +137,7 @@ async fn main() {
 		catalogue: live.clone(),
 		tables: held_tables,
 		http,
+		egress: config.egress,
 		jwt_secret: config.jwt_secret.clone(),
 		timeouts: config.timeouts,
 		max_request_bytes: config.max_request_bytes,

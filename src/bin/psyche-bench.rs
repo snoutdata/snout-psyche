@@ -364,6 +364,7 @@ async fn chaos(args: &[String]) -> i32 {
 		catalogue: Live::new(spec),
 		tables: None,
 		http: snout_psyche::net::client(Egress::Private).expect("a client"),
+		egress: Egress::Private,
 		jwt_secret: secret.into(),
 		timeouts: Timeouts {
 			first_byte,

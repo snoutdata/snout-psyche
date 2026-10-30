@@ -218,6 +218,40 @@ pub struct Aws {
 }
 
 impl Provider {
+	/// This provider with its named credential filled in from `stored`; none when it is not
+	/// there. AWS credentials go only to a Bedrock provider.
+	pub fn with_stored(&self, stored: &HashMap<String, Stored>) -> Provider {
+		let mut provider = self.clone();
+		if let Some(name) = &provider.credential {
+			provider.api_key = None;
+			provider.aws = None;
+			match (stored.get(name), &provider.region) {
+				(Some(Stored::ApiKey(key)), _) => provider.api_key = Some(key.clone()),
+				(Some(Stored::Aws(credentials)), Some(region))
+					if provider.kind == Kind::Bedrock =>
+				{
+					provider.aws = Some(Aws {
+						region: region.clone(),
+						credentials: credentials.clone(),
+					});
+				}
+				_ => {}
+			}
+		}
+		provider
+	}
+
+	/// Every secret this provider holds, for scrubbing what a provider says back.
+	pub fn secrets(&self) -> Vec<&str> {
+		let mut secrets: Vec<&str> = Vec::new();
+		secrets.extend(self.api_key.as_ref().map(Secret::expose));
+		if let Some(aws) = &self.aws {
+			secrets.push(aws.credentials.secret_access_key.expose());
+			secrets.extend(aws.credentials.session_token.as_ref().map(Secret::expose));
+		}
+		secrets
+	}
+
 	/// The URL of one operation, such as `chat/completions`.
 	pub fn endpoint(&self, operation: &str) -> String {
 		format!(
@@ -235,6 +269,18 @@ impl Provider {
 		body: &[u8],
 		unix: u64,
 	) -> reqwest::RequestBuilder {
+		self.authorize_as("POST", request, url, body, unix)
+	}
+
+	/// [`Provider::authorize`] for a request of another method (a GET that lists models).
+	pub fn authorize_as(
+		&self,
+		method: &str,
+		request: reqwest::RequestBuilder,
+		url: &url::Url,
+		body: &[u8],
+		unix: u64,
+	) -> reqwest::RequestBuilder {
 		if let Some(aws) = &self.aws {
 			let host = match url.port() {
 				Some(port) => format!("{}:{port}", url.host_str().unwrap_or("")),
@@ -245,9 +291,10 @@ impl Provider {
 				&aws.region,
 				"bedrock",
 				&sigv4::Request {
-					method: "POST",
+					method,
 					host: &host,
 					path: url.path(),
+					query: url.query().unwrap_or(""),
 					content_type: "application/json",
 					body,
 				},
@@ -782,26 +829,7 @@ impl Catalogue {
 		for model in &self.models {
 			let provider = providers
 				.entry(model.provider.name.clone())
-				.or_insert_with(|| {
-					let mut provider = (*model.provider).clone();
-					if let Some(name) = &provider.credential {
-						provider.api_key = None;
-						provider.aws = None;
-						match (stored.get(name), &provider.region) {
-							(Some(Stored::ApiKey(key)), _) => provider.api_key = Some(key.clone()),
-							(Some(Stored::Aws(credentials)), Some(region))
-								if provider.kind == Kind::Bedrock =>
-							{
-								provider.aws = Some(Aws {
-									region: region.clone(),
-									credentials: credentials.clone(),
-								});
-							}
-							_ => {}
-						}
-					}
-					Arc::new(provider)
-				})
+				.or_insert_with(|| Arc::new(model.provider.with_stored(stored)))
 				.clone();
 			let model = Arc::new(Model {
 				provider,

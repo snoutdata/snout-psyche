@@ -190,6 +190,27 @@ so one that could not be served is refused with the reason and nothing is stored
 shows the price each model is charged at and where it comes from (`model`, its own; `catalogue`,
 the one Psyche ships; none), and a row that is not served says why.
 
+**A provider's own list of models**, for a screen where someone picks one instead of typing its id:
+
+```sh
+curl $PSYCHE/ai/v1/admin/providers/openai/upstream-models -H "Authorization: Bearer $SERVICE_KEY"
+# {"object": "list", "data": [{"id": "gpt-5-mini", "owned_by": "system", "created": 1754425777,
+#  "kind": "chat"}, {"id": "text-embedding-3-small", "kind": "embedding", …}, …]}
+curl -X POST $PSYCHE/ai/v1/admin/upstream-models -H "Authorization: Bearer $SERVICE_KEY" \
+  -d '{"provider": {"kind": "anthropic", "base_url": "https://api.anthropic.com/v1"}, "credential": {"api_key": "sk-ant-…"}}'
+```
+
+The provider is asked with the credential its calls use (the stored one, or the file's environment
+key); the `POST` form takes a provider and credential that are not saved yet, uses them for this one
+list and keeps nothing. OpenAI's API (and OpenRouter, Groq, Together, an Ollama's `/v1`) is asked
+`GET {base}/models`; Anthropic `GET {base}/models`; Bedrock its control plane beside the runtime
+(`bedrock.<region>.amazonaws.com`): the inference profiles (`us.openai.gpt-5.6-luna`) and the
+foundation models that take on-demand calls by their own id. Each entry is `id` with, when known,
+`name`, `owned_by`, `created` (seconds), `kind` (`chat`, `embedding` or `completion`, the provider's
+word or a guess from the id) and `context_window`; chat models first, newest first. Each page has 10
+seconds. A provider that refuses or has no list answers an error with a sentence (503
+`provider_auth`, `upstream_error` or `timeout`), and its echo of the credential is scrubbed.
+
 Two rules keep the file and the tables apart:
 
 - **A provider from the file stays the file's.** Its key may come from Psyche's environment, so the
