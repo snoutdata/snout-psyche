@@ -6,7 +6,7 @@ keys**, streams the answer back as it arrives, and counts what every call used. 
 written in Rust. On SnoutData Cloud one runs beside each project's database, in that project's own
 pod, and keeps its keys, budgets and request log in the project's own Postgres.
 
-**Status: early, not production-ready.** What works today is the OpenAI-compatible API over
+It serves the OpenAI-compatible API over
 OpenAI-style providers, Anthropic and Amazon Bedrock, the request log in Postgres, keys, budgets and
 rate limits, routes that fall over and steer around a model that keeps failing, and `auto`, which
 chooses the model by what the request needs (below). More providers are being built.
