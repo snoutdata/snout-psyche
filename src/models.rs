@@ -21,13 +21,13 @@ use std::sync::{Arc, Mutex, RwLock};
 use serde_json::{Value, json};
 use tokio_postgres::Client;
 
-use crate::fits::Fits;
+use crate::fits::{Constraints, Fits, Quota};
 use crate::keys::KeyId;
 use crate::net::Egress;
 use crate::price::{self, PriceEntry};
 use crate::providers::{
-	Catalogue, Embeddings, Kind, Live, ModelSpec, Provider, Reasoning, RouteSpec, Sort, Spec,
-	build_model, credential_name_ok, word,
+	Catalogue, Embeddings, Internet, Kind, Live, ModelSpec, Provider, Reasoning, RouteSpec, Sort,
+	Spec, build_model, credential_name_ok, weights_problem, word,
 };
 use crate::who::{GroupId, UserId, Who};
 
@@ -190,12 +190,13 @@ pub async fn seed(client: &mut Client, file: &Spec) -> Result<Vec<String>, tokio
 		let written = tx
 			.execute(
 				"INSERT INTO psyche.models (name, provider, upstream, prompt_caching, \
-				 max_output_tokens, reasoning, embeddings, price, fits, origin) \
-				 VALUES ($1, $2, $3, $4, $5, $6, $7, $8::text::jsonb, $9::text::jsonb, 'file') \
+				 max_output_tokens, reasoning, embeddings, price, fits, internet, quota, origin) \
+				 VALUES ($1, $2, $3, $4, $5, $6, $7, $8::text::jsonb, $9::text::jsonb, $10, $11::text::jsonb, 'file') \
 				 ON CONFLICT (name) DO UPDATE SET provider = excluded.provider, \
 				 upstream = excluded.upstream, prompt_caching = excluded.prompt_caching, \
 				 max_output_tokens = excluded.max_output_tokens, reasoning = excluded.reasoning, \
 				 embeddings = excluded.embeddings, price = excluded.price, fits = excluded.fits, \
+				 internet = excluded.internet, quota = excluded.quota, \
 				 updated_at = clock_timestamp() \
 				 WHERE psyche.models.origin = 'file' AND NOT psyche.models.edited",
 				&[
@@ -208,6 +209,8 @@ pub async fn seed(client: &mut Client, file: &Spec) -> Result<Vec<String>, tokio
 					&model.embeddings.map(Embeddings::as_str),
 					&model.price.as_ref().map(Value::to_string),
 					&model.fits.map(|f| f.to_json().to_string()),
+					&model.internet.as_str(),
+					&model.quota.map(|q| q.to_json().to_string()),
 				],
 			)
 			.await?;
@@ -242,10 +245,18 @@ pub async fn seed(client: &mut Client, file: &Spec) -> Result<Vec<String>, tokio
 	for route in &file.routes {
 		let written = tx
 			.execute(
-				"INSERT INTO psyche.routes (name, targets, sort, origin) VALUES ($1, $2, $3, 'file') \
+				"INSERT INTO psyche.routes (name, targets, sort, weights, constraints, origin) \
+				 VALUES ($1, $2, $3, $4::text::jsonb, $5::text::jsonb, 'file') \
 				 ON CONFLICT (name) DO UPDATE SET targets = excluded.targets, sort = excluded.sort, \
+				 weights = excluded.weights, constraints = excluded.constraints, \
 				 updated_at = clock_timestamp() WHERE psyche.routes.origin = 'file'",
-				&[&route.name, &route.targets, &route.sort.as_str()],
+				&[
+					&route.name,
+					&route.targets,
+					&route.sort.as_str(),
+					&weights_text(&route.weights),
+					&route.constraints.as_ref().and_then(constraints_text),
+				],
 			)
 			.await?;
 		if written == 0 {
@@ -263,6 +274,18 @@ pub async fn seed(client: &mut Client, file: &Spec) -> Result<Vec<String>, tokio
 	.await?;
 	tx.commit().await?;
 	Ok(kept)
+}
+
+/// A route's weights as a row holds them; none is no row value at all.
+fn weights_text(weights: &HashMap<String, u32>) -> Option<String> {
+	(!weights.is_empty()).then(|| json!(weights).to_string())
+}
+
+/// A route's constraints as a row holds them; none is no row value at all.
+fn constraints_text(constraints: &Constraints) -> Option<String> {
+	(*constraints != Constraints::default())
+		.then(|| serde_json::to_string(constraints).ok())
+		.flatten()
 }
 
 /// The rows, as a [`Spec`], and the providers left out with the reason. A provider from the file
@@ -329,7 +352,8 @@ pub async fn load(
 	for row in client
 		.query(
 			"SELECT name, provider, upstream, prompt_caching, max_output_tokens, reasoning, \
-			 embeddings, price::text, fits::text FROM psyche.models WHERE enabled ORDER BY created_at, name",
+			 embeddings, price::text, fits::text, internet, quota::text \
+			 FROM psyche.models WHERE enabled ORDER BY created_at, name",
 			&[],
 		)
 		.await?
@@ -357,11 +381,16 @@ pub async fn load(
 			fits: row
 				.get::<_, Option<String>>(8)
 				.and_then(|text| serde_json::from_str(&text).ok()),
+			internet: word(row.get(9)).unwrap_or_default(),
+			quota: row
+				.get::<_, Option<String>>(10)
+				.and_then(|text| serde_json::from_str(&text).ok()),
 		});
 	}
 	for row in client
 		.query(
-			"SELECT name, targets, sort FROM psyche.routes ORDER BY created_at, name",
+			"SELECT name, targets, sort, weights::text, constraints::text \
+			 FROM psyche.routes ORDER BY created_at, name",
 			&[],
 		)
 		.await?
@@ -373,6 +402,13 @@ pub async fn load(
 			name: row.get(0),
 			targets: row.get(1),
 			sort,
+			weights: row
+				.get::<_, Option<String>>(3)
+				.and_then(|text| serde_json::from_str(&text).ok())
+				.unwrap_or_default(),
+			constraints: row
+				.get::<_, Option<String>>(4)
+				.and_then(|text| serde_json::from_str(&text).ok()),
 		});
 	}
 	Ok((spec, left_out))
@@ -559,6 +595,13 @@ pub struct NewModel {
 	/// does not know the field never clears it; `{}` clears it.
 	#[serde(default)]
 	pub fits: Option<Fits>,
+	/// How far its calls may reach: `none`, `provider` or `web`. Left out, a model keeps what it had
+	/// (a new one is `provider`), as `fits`.
+	#[serde(default)]
+	pub internet: Option<Internet>,
+	/// What it may be sent in a minute. Left out, a model keeps what it had; `{}` clears it.
+	#[serde(default)]
+	pub quota: Option<Quota>,
 	#[serde(default = "yes")]
 	pub enabled: bool,
 	/// `everyone` (the default), or `granted`: only the users and groups in `psyche.model_grants`.
@@ -625,6 +668,8 @@ pub async fn put_model(
 		embeddings: new.embeddings,
 		price: new.price.clone(),
 		fits: new.fits,
+		internet: new.internet.unwrap_or_default(),
+		quota: new.quota,
 	};
 	let (rows, left_out) = load(client, &held.file, held.egress).await?;
 	let provider = rows.provider(&spec.provider).ok_or_else(|| {
@@ -641,17 +686,21 @@ pub async fn put_model(
 	})?;
 	let prices = price::Catalogue::shipped().map_err(|e| Refused::Invalid(e.0))?;
 	let model = build_model(&spec, provider, &prices).map_err(Refused::Invalid)?;
-	client
-		.execute(
+	let row = client
+		.query_one(
 			"INSERT INTO psyche.models (name, provider, upstream, prompt_caching, max_output_tokens, \
-			 reasoning, embeddings, price, enabled, access, fits) \
-			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8::text::jsonb, $9, $10, NULLIF($11::text, '{}')::jsonb) \
+			 reasoning, embeddings, price, enabled, access, fits, internet, quota) \
+			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8::text::jsonb, $9, $10, NULLIF($11::text, '{}')::jsonb, \
+			 COALESCE($12::text, 'provider'), NULLIF($13::text, '{}')::jsonb) \
 			 ON CONFLICT (name) DO UPDATE SET provider = excluded.provider, \
 			 upstream = excluded.upstream, prompt_caching = excluded.prompt_caching, \
 			 max_output_tokens = excluded.max_output_tokens, reasoning = excluded.reasoning, \
 			 embeddings = excluded.embeddings, price = excluded.price, enabled = excluded.enabled, \
 			 access = excluded.access, \
-			 fits = CASE WHEN $11::text IS NULL THEN psyche.models.fits ELSE excluded.fits END",
+			 fits = CASE WHEN $11::text IS NULL THEN psyche.models.fits ELSE excluded.fits END, \
+			 internet = COALESCE($12::text, psyche.models.internet), \
+			 quota = CASE WHEN $13::text IS NULL THEN psyche.models.quota ELSE excluded.quota END \
+			 RETURNING internet",
 			&[
 				&name,
 				&spec.provider,
@@ -670,9 +719,12 @@ pub async fn put_model(
 						f.to_json().to_string()
 					}
 				}),
+				&new.internet.map(Internet::as_str),
+				&new.quota.map(|q| q.to_json().to_string()),
 			],
 		)
 		.await?;
+	let internet: String = row.get(0);
 	held.reload(client).await?;
 	Ok(json!({
 		"name": name,
@@ -682,6 +734,7 @@ pub async fn put_model(
 		"access": access,
 		"price": model.price.map(|p| p.to_json()),
 		"price_from": price_from(spec.price.is_some(), model.price.is_some()),
+		"internet": internet,
 	}))
 }
 
@@ -716,6 +769,13 @@ pub struct NewRoute {
 	pub targets: Vec<String>,
 	#[serde(default)]
 	pub sort: Sort,
+	/// A target's share of a `weighted` or `balanced` route, by model name. Left out, a route keeps
+	/// what it had; `{}` clears them.
+	#[serde(default)]
+	pub weights: Option<HashMap<String, u32>>,
+	/// What every target must meet. Left out, a route keeps what it had; `{}` clears them.
+	#[serde(default)]
+	pub constraints: Option<Constraints>,
 }
 
 /// The most models a route may name.
@@ -738,6 +798,16 @@ pub async fn put_route(
 	let mut seen = HashSet::new();
 	if let Some(twice) = new.targets.iter().find(|t| !seen.insert(t.as_str())) {
 		return Err(Refused::Invalid(format!("The route names {twice} twice.")));
+	}
+	if let Some(problem) = new
+		.weights
+		.as_ref()
+		.and_then(|w| weights_problem(&new.targets, w))
+	{
+		return Err(Refused::Invalid(format!("{problem}.")));
+	}
+	if let Some(problem) = new.constraints.as_ref().and_then(Constraints::problem) {
+		return Err(Refused::Invalid(problem.to_string()));
 	}
 	// `auto` may be a route (the project's own policy for it); its two variants are fixed.
 	if crate::fits::is_auto(name) && name != crate::fits::AUTO {
@@ -774,16 +844,33 @@ pub async fn put_route(
 		)));
 	}
 	from_file_refused(client, "routes", name).await?;
-	client
-		.execute(
-			"INSERT INTO psyche.routes (name, targets, sort) VALUES ($1, $2, $3) \
+	// Left out of the request, each keeps what it had; written empty, it is cleared.
+	let weights = new.weights.as_ref().map(|w| json!(w).to_string());
+	let constraints = new
+		.constraints
+		.as_ref()
+		.map(|c| serde_json::to_string(c).unwrap_or_else(|_| "{}".to_string()));
+	let row = client
+		.query_one(
+			"INSERT INTO psyche.routes (name, targets, sort, weights, constraints) \
+			 VALUES ($1, $2, $3, NULLIF($4::text, '{}')::jsonb, NULLIF($5::text, '{}')::jsonb) \
 			 ON CONFLICT (name) DO UPDATE SET targets = excluded.targets, sort = excluded.sort, \
-			 updated_at = clock_timestamp()",
-			&[&name, &new.targets, &new.sort.as_str()],
+			 weights = CASE WHEN $4::text IS NULL THEN psyche.routes.weights ELSE excluded.weights END, \
+			 constraints = CASE WHEN $5::text IS NULL THEN psyche.routes.constraints ELSE excluded.constraints END, \
+			 updated_at = clock_timestamp() RETURNING weights::text, constraints::text",
+			&[&name, &new.targets, &new.sort.as_str(), &weights, &constraints],
 		)
 		.await?;
+	let parsed = |at: usize| {
+		row.get::<_, Option<String>>(at)
+			.and_then(|t| serde_json::from_str::<Value>(&t).ok())
+	};
+	let (weights, constraints) = (parsed(0), parsed(1));
 	held.reload(client).await?;
-	Ok(json!({"name": name, "targets": new.targets, "sort": new.sort.as_str(), "origin": "api"}))
+	Ok(
+		json!({"name": name, "targets": new.targets, "sort": new.sort.as_str(), "origin": "api",
+		"weights": weights, "constraints": constraints}),
+	)
 }
 
 /// Removes a route made through the API.
@@ -805,8 +892,8 @@ pub async fn list_routes(client: &Client, held: &Held) -> Result<Vec<Value>, Ref
 	let served = held.live.get();
 	let rows = client
 		.query(
-			"SELECT name, targets, sort, origin, created_at::text, updated_at::text \
-			 FROM psyche.routes ORDER BY created_at, name",
+			"SELECT name, targets, sort, origin, created_at::text, updated_at::text, \
+			 weights::text, constraints::text FROM psyche.routes ORDER BY created_at, name",
 			&[],
 		)
 		.await?;
@@ -819,6 +906,10 @@ pub async fn list_routes(client: &Client, held: &Held) -> Result<Vec<Value>, Ref
 				.iter()
 				.filter(|t| served.model(t).is_none())
 				.collect();
+			let parsed = |at: usize| {
+				row.get::<_, Option<String>>(at)
+					.and_then(|t| serde_json::from_str::<Value>(&t).ok())
+			};
 			let route = served.route(&name);
 			let tried: Vec<String> = route
 				.map(|r| served.targets(r).iter().map(|m| m.name.clone()).collect())
@@ -830,6 +921,8 @@ pub async fn list_routes(client: &Client, held: &Held) -> Result<Vec<Value>, Ref
 				"origin": row.get::<_, &str>(3),
 				"created_at": row.get::<_, String>(4),
 				"updated_at": row.get::<_, String>(5),
+				"weights": parsed(6),
+				"constraints": parsed(7),
 				"tried": tried,
 				"skipped": skipped,
 				"served": route.is_some() && !tried.is_empty(),
@@ -906,8 +999,8 @@ pub async fn list_models(client: &Client, held: &Held) -> Result<Vec<Value>, Ref
 		.query(
 			"SELECT name, provider, upstream, prompt_caching, max_output_tokens, reasoning, \
 			 embeddings, price::text, enabled, origin, edited, access, \
-			 (SELECT count(*) FROM psyche.model_grants g WHERE g.model = m.name), fits::text \
-			 FROM psyche.models m ORDER BY created_at, name",
+			 (SELECT count(*) FROM psyche.model_grants g WHERE g.model = m.name), fits::text, \
+			 internet, quota::text FROM psyche.models m ORDER BY created_at, name",
 			&[],
 		)
 		.await?;
@@ -945,6 +1038,8 @@ pub async fn list_models(client: &Client, held: &Held) -> Result<Vec<Value>, Ref
 				"access": row.get::<_, String>(11),
 				"grants": row.get::<_, i64>(12),
 				"fits": row.get::<_, Option<String>>(13).and_then(|t| serde_json::from_str::<Value>(&t).ok()),
+				"internet": row.get::<_, String>(14),
+				"quota": row.get::<_, Option<String>>(15).and_then(|t| serde_json::from_str::<Value>(&t).ok()),
 				"problem": if enabled { problem } else { None },
 			})
 		})

@@ -21,6 +21,9 @@ pub struct Usage {
 	pub cache_write_tokens: Option<u64>,
 	/// Completion tokens spent reasoning, a subset of `completion_tokens`.
 	pub reasoning_tokens: Option<u64>,
+	/// Anthropic's web searches (`server_tool_use.web_search_requests`), billed per search on top
+	/// of the tokens. A search that failed is not in the count, as it is not billed.
+	pub web_searches: Option<u64>,
 }
 
 impl Usage {
@@ -35,6 +38,7 @@ impl Usage {
 			cached_tokens: count(usage.pointer("/prompt_tokens_details/cached_tokens")),
 			cache_write_tokens: None,
 			reasoning_tokens: count(usage.pointer("/completion_tokens_details/reasoning_tokens")),
+			web_searches: None,
 		})
 	}
 
@@ -53,6 +57,10 @@ impl Usage {
 			cached_tokens: read,
 			cache_write_tokens: write,
 			reasoning_tokens: None,
+			web_searches: usage
+				.get("server_tool_use")
+				.and_then(|tools| tools.get("web_search_requests"))
+				.and_then(Value::as_u64),
 		})
 	}
 
@@ -71,6 +79,7 @@ impl Usage {
 			cached_tokens: read,
 			cache_write_tokens: write,
 			reasoning_tokens: None,
+			web_searches: None,
 		})
 	}
 
@@ -92,6 +101,9 @@ impl Usage {
 		}
 		if let Some(reasoning) = self.reasoning_tokens {
 			usage["completion_tokens_details"] = json!({"reasoning_tokens": reasoning});
+		}
+		if let Some(searches) = self.web_searches {
+			usage["server_tool_use"] = json!({"web_search_requests": searches});
 		}
 		usage
 	}
@@ -140,5 +152,21 @@ mod tests {
 		assert_eq!(out["cache_read_input_tokens"], 100);
 		assert_eq!(out["cache_creation_input_tokens"], 20);
 		assert_eq!(Usage::from_anthropic(&json!(null)), None);
+	}
+
+	#[test]
+	fn web_searches_are_read_from_anthropic_and_shown_under_its_name() {
+		let usage = Usage::from_anthropic(&json!({
+			"input_tokens": 1, "output_tokens": 2, "server_tool_use": {"web_search_requests": 3}
+		}))
+		.unwrap();
+		assert_eq!(usage.web_searches, Some(3));
+		assert_eq!(
+			usage.to_openai()["server_tool_use"]["web_search_requests"],
+			3
+		);
+		let none = Usage::from_anthropic(&json!({"input_tokens": 1})).unwrap();
+		assert_eq!(none.web_searches, None);
+		assert!(none.to_openai().get("server_tool_use").is_none());
 	}
 }

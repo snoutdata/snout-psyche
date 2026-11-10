@@ -92,6 +92,11 @@ pub const MIGRATIONS: &[Migration] = &[
 		name: "auto",
 		sql: include_str!("../migrations/0014-auto.sql"),
 	},
+	Migration {
+		id: 15,
+		name: "balance-and-internet",
+		sql: include_str!("../migrations/0015-balance-and-internet.sql"),
+	},
 ];
 
 /// "snout-ps", so it collides with no other advisory lock by accident.

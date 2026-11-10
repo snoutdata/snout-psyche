@@ -636,6 +636,7 @@ pub(crate) mod tests {
 			cached_tokens: Some(80),
 			cache_write_tokens: None,
 			reasoning_tokens: Some(5),
+			web_searches: None,
 		};
 		let batch = vec![
 			call(today, "a", Outcome::Completed, Some(used)),
@@ -776,6 +777,7 @@ pub(crate) mod tests {
 			cached_tokens: Some(4),
 			cache_write_tokens: None,
 			reasoning_tokens: None,
+			web_searches: None,
 		};
 		let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 		let task = tokio::spawn(run(

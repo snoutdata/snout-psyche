@@ -16,7 +16,8 @@
 //!  - **`maxTokens` is optional**, so it is sent only when the caller or the catalogue names one.
 //!  - **Images go inline only**: an image URL is refused, since Converse takes bytes (or S3).
 //!  - **`tool_choice: none` and `parallel_tool_calls: false` have no Converse equivalent** and are
-//!    refused by name rather than ignored.
+//!    refused by name rather than ignored. So is a provider-hosted web tool: Converse runs none, and
+//!    the proxy leaves a Bedrock model out of a request that carries one (`fits.rs`).
 //!  - **The stream is AWS's event-stream framing** (`eventstream.rs`), and a failure inside it is an
 //!    `exception` message: throttling and service-unavailable become `rate_limited`, so the router
 //!    can take another target instead of passing them on as a normal close.
@@ -112,6 +113,13 @@ pub fn request(body: &Map<String, Value>, model: &Model) -> Result<Value, ApiErr
 	if let Some(tools) = shaped.get("tools").and_then(Value::as_array) {
 		let mut specs = Vec::new();
 		for tool in tools {
+			if tool.get("input_schema").is_none() {
+				return Err(bad(format!(
+					"{} is on Bedrock, whose Converse API cannot take {}.",
+					model.name,
+					tool["type"].as_str().unwrap_or("a server tool")
+				)));
+			}
 			let mut spec =
 				json!({"name": tool["name"], "inputSchema": {"json": tool["input_schema"]}});
 			if let Some(description) = tool.get("description") {
@@ -456,6 +464,18 @@ mod tests {
 	use crate::eventstream::{Decoder, encode};
 	use crate::providers::{Kind, Provider};
 
+	#[test]
+	fn a_server_tool_is_refused_by_name_and_never_dropped() {
+		let body = json!({"model": "m", "messages": [{"role": "user", "content": "hi"}],
+			"tools": [{"type": "web_search_20250305", "name": "web_search"}]});
+		let refused = request(body.as_object().unwrap(), &model(false)).unwrap_err();
+		assert!(
+			refused.message.contains("web_search_20250305"),
+			"{}",
+			refused.message
+		);
+	}
+
 	fn model(caching: bool) -> Model {
 		Model {
 			name: "claude".into(),
@@ -477,6 +497,8 @@ mod tests {
 			embeddings: None,
 			price: None,
 			fits: None,
+			internet: crate::providers::Internet::Provider,
+			quota: None,
 		}
 	}
 

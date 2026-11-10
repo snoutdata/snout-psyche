@@ -14,6 +14,12 @@
 //! [`Egress::Private`] relaxes all three, for a self-hosted Psyche whose models are on its own
 //! network (Ollama on a LAN, vLLM beside it). It is a setting a self-hoster chooses
 //! (`PSYCHE_EGRESS=private`); the Cloud never sets it.
+//!
+//! A model at the internet level `none` is held the other way round: its calls may reach only
+//! private addresses. They go through their own client ([`sandbox_client`]), which exists only under
+//! [`Egress::Private`] and whose resolver drops every public address, so the address connected to
+//! is a private one whatever a name says, and there is no second lookup for DNS to change.
+//! An address written in the URL skips any resolver, so [`sandbox_refused`] reads that first.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
@@ -102,7 +108,25 @@ fn is_public_v6(ip: Ipv6Addr) -> bool {
 /// Resolves a host name to the addresses that pass [`is_public`], or refuses.
 #[derive(Debug, Clone, Copy)]
 pub struct SafeResolver {
-	allow_private: bool,
+	reach: Reach,
+}
+
+/// Which addresses a resolver hands on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reach {
+	PublicOnly,
+	Any,
+	PrivateOnly,
+}
+
+impl Reach {
+	fn allows(self, ip: IpAddr) -> bool {
+		match self {
+			Reach::PublicOnly => is_public(ip),
+			Reach::Any => true,
+			Reach::PrivateOnly => !is_public(ip),
+		}
+	}
 }
 
 /// What the resolver says when a name resolves only to addresses it will not send to; the proxy
@@ -111,7 +135,7 @@ pub const REFUSED: &str = "resolves only to addresses Psyche does not send to";
 
 impl reqwest::dns::Resolve for SafeResolver {
 	fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
-		let allow_private = self.allow_private;
+		let reach = self.reach;
 		let host = name.as_str().to_string();
 		Box::pin(async move {
 			let found: Vec<SocketAddr> =
@@ -119,7 +143,7 @@ impl reqwest::dns::Resolve for SafeResolver {
 			let kept: Vec<SocketAddr> = found
 				.iter()
 				.copied()
-				.filter(|addr| allow_private || is_public(addr.ip()))
+				.filter(|addr| reach.allows(addr.ip()))
 				.collect();
 			if kept.is_empty() {
 				let error: Box<dyn std::error::Error + Send + Sync> = if found.is_empty() {
@@ -161,19 +185,65 @@ pub fn check_base_url(url: &url::Url, egress: Egress) -> Result<(), String> {
 /// minutes, so the proxy times the first byte and the gaps between chunks itself.
 pub fn client(egress: Egress) -> Result<reqwest::Client, String> {
 	let private = egress == Egress::Private;
+	build(
+		if private {
+			Reach::Any
+		} else {
+			Reach::PublicOnly
+		},
+		!private,
+	)
+}
+
+/// The client for a model at the internet level `none`: it connects only to private addresses.
+/// There is none under [`Egress::Public`], so such a model has nothing to be sent with.
+pub fn sandbox_client(egress: Egress) -> Result<Option<reqwest::Client>, String> {
+	match egress {
+		Egress::Public => Ok(None),
+		Egress::Private => build(Reach::PrivateOnly, false).map(Some),
+	}
+}
+
+fn build(reach: Reach, https_only: bool) -> Result<reqwest::Client, String> {
 	reqwest::Client::builder()
-		.dns_resolver(Arc::new(SafeResolver {
-			allow_private: private,
-		}))
+		.dns_resolver(Arc::new(SafeResolver { reach }))
 		.redirect(reqwest::redirect::Policy::none())
 		.no_proxy()
-		.https_only(!private)
+		.https_only(https_only)
 		.connect_timeout(CONNECT_TIMEOUT)
 		.pool_idle_timeout(Duration::from_secs(90))
 		.tcp_keepalive(Duration::from_secs(60))
 		.user_agent(concat!("snout-psyche/", env!("CARGO_PKG_VERSION")))
 		.build()
 		.map_err(|e| format!("could not build an HTTP client: {e}"))
+}
+
+/// Why a call at the internet level `none` may not go to `url` under `egress`; `None` when it may.
+/// A name is looked up here so the caller hears before anything is sent; the connection is what
+/// holds it ([`sandbox_client`]), so a lookup that fails or answers differently later cannot let
+/// one through.
+pub async fn sandbox_refused(url: &url::Url, egress: Egress) -> Option<String> {
+	if egress == Egress::Public {
+		return Some(
+			"this Psyche sends only to public addresses (PSYCHE_EGRESS is public)".to_string(),
+		);
+	}
+	let public = |host: &str| format!("{host} is a public address");
+	match url.host()? {
+		url::Host::Ipv4(ip) => is_public(ip.into()).then(|| public(&ip.to_string())),
+		url::Host::Ipv6(ip) => is_public(ip.into()).then(|| public(&ip.to_string())),
+		url::Host::Domain(name) => {
+			let port = url.port_or_known_default().unwrap_or(443);
+			let found =
+				tokio::time::timeout(CONNECT_TIMEOUT, tokio::net::lookup_host((name, port)))
+					.await
+					.ok()?
+					.ok()?
+					.collect::<Vec<SocketAddr>>();
+			(!found.is_empty() && found.iter().all(|addr| is_public(addr.ip())))
+				.then(|| public(name))
+		}
+	}
 }
 
 #[cfg(test)]
@@ -246,6 +316,70 @@ mod tests {
 		}
 		assert!(check_base_url(&url("http://192.168.1.20:11434"), Egress::Private).is_ok());
 		assert!(check_base_url(&url("ftp://example.com"), Egress::Private).is_err());
+	}
+
+	#[test]
+	fn the_sandbox_resolver_hands_on_only_private_addresses() {
+		for private in [
+			"127.0.0.1",
+			"10.92.0.5",
+			"192.168.1.1",
+			"::1",
+			"fd12:3456::1",
+		] {
+			assert!(
+				Reach::PrivateOnly.allows(private.parse().unwrap()),
+				"{private}"
+			);
+		}
+		// An IPv4 public address dressed as IPv6 is still public.
+		for public in [
+			"1.1.1.1",
+			"2620:149:a44::1",
+			"::ffff:8.8.8.8",
+			"64:ff9b::808:808",
+		] {
+			assert!(
+				!Reach::PrivateOnly.allows(public.parse().unwrap()),
+				"{public}"
+			);
+		}
+	}
+
+	#[tokio::test]
+	async fn a_sandboxed_call_is_held_to_private_addresses() {
+		let url = |s: &str| url::Url::parse(s).unwrap();
+		// Never under public egress, and there is no client to send with.
+		assert!(
+			sandbox_refused(&url("http://192.168.1.20:11434/v1"), Egress::Public)
+				.await
+				.unwrap()
+				.contains("PSYCHE_EGRESS")
+		);
+		assert!(sandbox_client(Egress::Public).unwrap().is_none());
+		assert!(sandbox_client(Egress::Private).unwrap().is_some());
+
+		// Under private egress, by the address written or the address a name resolves to.
+		for fine in [
+			"http://192.168.1.20:11434/v1",
+			"http://[::1]:8000/v1",
+			"http://localhost:11434/v1",
+		] {
+			assert_eq!(
+				sandbox_refused(&url(fine), Egress::Private).await,
+				None,
+				"{fine}"
+			);
+		}
+		for public in ["http://8.8.8.8/v1", "https://[2620:149:a44::1]/v1"] {
+			assert!(
+				sandbox_refused(&url(public), Egress::Private)
+					.await
+					.unwrap()
+					.contains("public address"),
+				"{public}"
+			);
+		}
 	}
 
 	#[tokio::test]

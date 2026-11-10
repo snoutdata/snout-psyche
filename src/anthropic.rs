@@ -16,8 +16,17 @@
 //!    content, where Anthropic refuses it.
 //!  - **Consecutive messages of one role are merged**, since Anthropic wants turns that alternate:
 //!    the results of parallel tool calls become one user turn, results first.
+//!  - **Anthropic's own web tools go as the caller wrote them** (`web_search_*`, `web_fetch_*`; the
+//!    proxy has checked the model may use them, `fits.rs`). Anthropic runs them itself, so the reply
+//!    holds no call for the caller to answer: its `server_tool_use` and result blocks are not
+//!    translated, and the text that follows them is the answer.
+//!  - **A turn Anthropic paused (`pause_turn`) stays paused.** The finish reason says `pause_turn`
+//!    rather than `stop`, and the message carries `anthropic_content`, every block as Anthropic wrote
+//!    it; sent back on an assistant message, that turn goes out as those blocks and Anthropic carries
+//!    on. Nothing else can continue it, since a search's results are encrypted blocks a chat
+//!    completion has no place for.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use serde_json::{Map, Value, json};
 
@@ -34,6 +43,13 @@ pub const VERSION: &str = "2023-06-01";
 /// requires one on every request; 4096 is the usual default of OpenAI-compatible gateways, so a
 /// caller moving over sees no change.
 pub const DEFAULT_MAX_TOKENS: u64 = 4096;
+
+/// Anthropic's web search tool, sent for `:online` and a plain `web` plugin.
+pub const WEB_SEARCH: &str = "web_search_20250305";
+
+/// The `max_uses` a search tool that names none is given when a budget applies to the call, so what
+/// is reserved is what can be spent: at Anthropic's $10 per 1,000 searches, ten cents a call.
+pub const SEARCHES_BOUND: u64 = 10;
 
 /// OpenAI fields with no Anthropic equivalent that only tune OpenAI's own service, so dropping them
 /// changes nothing about the answer a caller is owed.
@@ -271,6 +287,18 @@ fn messages(messages: Option<&Value>, caching: bool) -> Result<(Vec<Value>, Vec<
 				continue;
 			}
 			"user" => ("user", content(message.get("content"), caching, &at)?),
+			// A paused turn, sent back whole: its blocks go as Anthropic wrote them.
+			"assistant"
+				if message
+					.get("anthropic_content")
+					.is_some_and(|c| !c.is_null()) =>
+			{
+				let blocks = message["anthropic_content"]
+					.as_array()
+					.filter(|blocks| !blocks.is_empty())
+					.ok_or_else(|| at("anthropic_content is a list of blocks."))?;
+				("assistant", blocks.clone())
+			}
 			"assistant" => {
 				// Thinking goes first in a turn, as Anthropic wrote it.
 				let mut blocks = match message.get("thinking_blocks").filter(|b| !b.is_null()) {
@@ -439,7 +467,15 @@ fn tools(tools: &Value, caching: bool) -> Result<Value, ApiError> {
 		.iter()
 		.enumerate()
 		.map(|(i, tool)| {
-			if tool.get("type").and_then(Value::as_str) != Some("function") {
+			let kind = tool.get("type").and_then(Value::as_str);
+			if kind.is_some_and(crate::fits::is_anthropic_web_tool) {
+				let mut server = tool.clone();
+				if !caching && let Some(server) = server.as_object_mut() {
+					server.remove("cache_control");
+				}
+				return Ok(server);
+			}
+			if kind != Some("function") {
 				return Err(bad(format!("tools[{i}] is not a function tool.")));
 			}
 			let function = tool
@@ -495,10 +531,51 @@ fn tool_choice(choice: Option<&Value>, parallel: Option<bool>) -> Result<Option<
 	Ok(out)
 }
 
+/// The most web searches `body`'s tools can make. A search tool that names no `max_uses` is given
+/// [`SEARCHES_BOUND`], which is what makes the answer a bound and not a hope.
+pub fn bound_searches(body: &mut Map<String, Value>) -> u64 {
+	let Some(Value::Array(tools)) = body.get_mut("tools") else {
+		return 0;
+	};
+	let mut bound = 0u64;
+	for tool in tools.iter_mut() {
+		let searches = tool
+			.get("type")
+			.and_then(Value::as_str)
+			.is_some_and(|kind| {
+				crate::fits::is_anthropic_web_tool(kind) && kind.starts_with("web_search_")
+			});
+		if !searches {
+			continue;
+		}
+		let uses = match tool.get("max_uses").and_then(Value::as_u64) {
+			Some(uses) => uses,
+			None => {
+				tool["max_uses"] = json!(SEARCHES_BOUND);
+				SEARCHES_BOUND
+			}
+		};
+		bound = bound.saturating_add(uses);
+	}
+	bound
+}
+
+/// The class of a failure Anthropic reports in a stream, by its `error.type`.
+pub(crate) fn error_class(kind: Option<&str>) -> Class {
+	match kind {
+		Some("rate_limit_error") => Class::RateLimited,
+		Some("invalid_request_error") => Class::Rejected,
+		_ => Class::Upstream,
+	}
+}
+
 /// OpenAI's `finish_reason` for Anthropic's `stop_reason`, or Bedrock's `stopReason`, which uses
-/// the same names and two of its own for a guardrail or a content filter.
+/// the same names and two of its own for a guardrail or a content filter. `pause_turn` keeps its
+/// name: mapped to `stop` a paused turn looks finished, and a caller that knows no such reason
+/// treats it as `stop` anyway.
 pub(crate) fn finish_reason(stop: Option<&str>) -> Value {
 	json!(match stop {
+		Some("pause_turn") => "pause_turn",
 		Some("max_tokens") => "length",
 		Some("tool_use") => "tool_calls",
 		Some("refusal" | "guardrail_intervened" | "content_filtered") => "content_filter",
@@ -557,6 +634,9 @@ pub fn reply(value: &Value, model: &str, created: u64) -> Result<Value, String> 
 		message["tool_calls"] = Value::Array(calls);
 	}
 	with_reasoning(&mut message, thinking);
+	if value.get("stop_reason").and_then(Value::as_str) == Some("pause_turn") {
+		message["anthropic_content"] = Value::Array(blocks.clone());
+	}
 	let usage = value
 		.get("usage")
 		.and_then(Usage::from_anthropic)
@@ -575,36 +655,14 @@ pub fn reply(value: &Value, model: &str, created: u64) -> Result<Value, String> 
 	}))
 }
 
-/// One streamed reply being translated.
-#[derive(Debug)]
-pub struct Stream {
-	wants_usage: bool,
-	created: u64,
-	id: Value,
-	model: Value,
+/// What a stream of Anthropic's events has used, and whether it reached its end.
+#[derive(Debug, Default)]
+pub struct Meter {
 	usage: Option<Usage>,
-	/// Anthropic's content block index → OpenAI's tool call index, for tool_use blocks.
-	tools: HashMap<u64, u64>,
-	/// Thinking blocks being received, by content block index, passed on whole when they end.
-	thinking: HashMap<u64, Value>,
 	ended: bool,
 }
 
-impl Stream {
-	/// `model` is the name the caller asked for, which every chunk carries.
-	pub fn new(wants_usage: bool, model: &str, created: u64) -> Self {
-		Self {
-			wants_usage,
-			created,
-			id: Value::Null,
-			model: Value::String(model.to_string()),
-			usage: None,
-			tools: HashMap::new(),
-			thinking: HashMap::new(),
-			ended: false,
-		}
-	}
-
+impl Meter {
 	/// What the provider reported using, so far.
 	pub fn usage(&self) -> Option<Usage> {
 		self.usage
@@ -616,11 +674,14 @@ impl Stream {
 		self.ended
 	}
 
-	fn chunk(&self, delta: Value, finish: Value) -> Out {
-		Out::Chunk(json!({
-			"id": self.id, "object": "chat.completion.chunk", "created": self.created, "model": self.model,
-			"choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
-		}))
+	/// Reads one event.
+	pub fn read(&mut self, event: &Value) {
+		match event.get("type").and_then(Value::as_str).unwrap_or("") {
+			"message_start" => self.count(event.pointer("/message/usage")),
+			"message_delta" => self.count(event.get("usage")),
+			"message_stop" => self.ended = true,
+			_ => {}
+		}
 	}
 
 	/// Folds a usage report into what is known: `message_delta` reports the output so far and, on
@@ -639,7 +700,117 @@ impl Stream {
 			known.cache_write_tokens = report.cache_write_tokens.or(known.cache_write_tokens);
 		}
 		known.completion_tokens = report.completion_tokens.max(known.completion_tokens);
+		known.web_searches = report.web_searches.or(known.web_searches);
 		self.usage = Some(known);
+	}
+}
+
+/// A streamed reply's blocks put back together as Anthropic would have sent them whole, for a turn
+/// that pauses: only then is it known they are needed, and by then they have gone by.
+#[derive(Debug, Default)]
+struct Turn {
+	blocks: BTreeMap<u64, Value>,
+	/// The JSON of a tool's input, as far as it has come.
+	input: HashMap<u64, String>,
+}
+
+impl Turn {
+	fn start(&mut self, index: u64, block: &Value) {
+		self.blocks.insert(index, block.clone());
+	}
+
+	fn delta(&mut self, index: u64, delta: &Value) {
+		let Some(block) = self.blocks.get_mut(&index) else {
+			return;
+		};
+		let mut append = |field: &str, piece: &Value| {
+			let joined = format!(
+				"{}{}",
+				block[field].as_str().unwrap_or(""),
+				piece.as_str().unwrap_or("")
+			);
+			block[field] = Value::String(joined);
+		};
+		match delta["type"].as_str() {
+			Some("text_delta") => append("text", &delta["text"]),
+			Some("thinking_delta") => append("thinking", &delta["thinking"]),
+			Some("signature_delta") => append("signature", &delta["signature"]),
+			Some("input_json_delta") => self
+				.input
+				.entry(index)
+				.or_default()
+				.push_str(delta["partial_json"].as_str().unwrap_or("")),
+			Some("citations_delta") => {
+				if !block["citations"].is_array() {
+					block["citations"] = json!([]);
+				}
+				if let Value::Array(citations) = &mut block["citations"] {
+					citations.push(delta["citation"].clone());
+				}
+			}
+			_ => {}
+		}
+	}
+
+	fn whole(&mut self) -> Vec<Value> {
+		for (index, json) in self.input.drain() {
+			if let (Some(block), Ok(input)) = (
+				self.blocks.get_mut(&index),
+				serde_json::from_str::<Value>(&json),
+			) {
+				block["input"] = input;
+			}
+		}
+		std::mem::take(&mut self.blocks).into_values().collect()
+	}
+}
+
+/// One streamed reply being translated.
+#[derive(Debug)]
+pub struct Stream {
+	wants_usage: bool,
+	created: u64,
+	id: Value,
+	model: Value,
+	meter: Meter,
+	turn: Turn,
+	/// Anthropic's content block index → OpenAI's tool call index, for tool_use blocks.
+	tools: HashMap<u64, u64>,
+	/// Thinking blocks being received, by content block index, passed on whole when they end.
+	thinking: HashMap<u64, Value>,
+}
+
+impl Stream {
+	/// `model` is the name the caller asked for, which every chunk carries.
+	pub fn new(wants_usage: bool, model: &str, created: u64) -> Self {
+		Self {
+			wants_usage,
+			created,
+			id: Value::Null,
+			model: Value::String(model.to_string()),
+			meter: Meter::default(),
+			turn: Turn::default(),
+			tools: HashMap::new(),
+			thinking: HashMap::new(),
+		}
+	}
+
+	/// What the provider reported using, so far.
+	pub fn usage(&self) -> Option<Usage> {
+		self.meter.usage()
+	}
+
+	/// Whether the provider's last event (`message_stop`) arrived. A stream that closes without it
+	/// was cut.
+	pub fn ended(&self) -> bool {
+		self.meter.ended()
+	}
+
+	fn chunk(&self, delta: Value, finish: Value) -> Out {
+		Out::Chunk(json!({
+			"id": self.id, "object": "chat.completion.chunk", "created": self.created, "model": self.model,
+			"choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+		}))
 	}
 
 	pub fn event(&mut self, event: &Event) -> Vec<Out> {
@@ -652,16 +823,17 @@ impl Stream {
 				"Anthropic sent a stream event that is not JSON.".into(),
 			)];
 		};
+		self.meter.read(&value);
 		match value.get("type").and_then(Value::as_str).unwrap_or("") {
 			"message_start" => {
 				let message = &value["message"];
 				self.id = message.get("id").cloned().unwrap_or(Value::Null);
-				self.count(message.get("usage"));
 				vec![self.chunk(json!({"role": "assistant", "content": ""}), Value::Null)]
 			}
 			"content_block_start" => {
 				let block = &value["content_block"];
 				let index = value["index"].as_u64().unwrap_or(0);
+				self.turn.start(index, block);
 				if block["type"] == "thinking" || block["type"] == "redacted_thinking" {
 					self.thinking.insert(index, block.clone());
 					return Vec::new();
@@ -681,6 +853,7 @@ impl Stream {
 			}
 			"content_block_delta" => {
 				let delta = &value["delta"];
+				self.turn.delta(value["index"].as_u64().unwrap_or(0), delta);
 				match delta["type"].as_str() {
 					Some("text_delta") => {
 						vec![self.chunk(json!({"content": delta["text"]}), Value::Null)]
@@ -733,20 +906,22 @@ impl Stream {
 				}
 			}
 			"message_delta" => {
-				self.count(value.get("usage"));
-				vec![self.chunk(
-					json!({}),
-					finish_reason(value.pointer("/delta/stop_reason").and_then(Value::as_str)),
-				)]
+				let stop = value.pointer("/delta/stop_reason").and_then(Value::as_str);
+				let mut out = Vec::new();
+				if stop == Some("pause_turn") {
+					let blocks = self.turn.whole();
+					out.push(self.chunk(json!({"anthropic_content": blocks}), Value::Null));
+				}
+				out.push(self.chunk(json!({}), finish_reason(stop)));
+				out
 			}
 			"message_stop" => {
-				self.ended = true;
 				let mut out = Vec::new();
 				if self.wants_usage {
 					out.push(Out::Chunk(json!({
 						"id": self.id, "object": "chat.completion.chunk", "created": self.created,
 						"model": self.model, "choices": [],
-						"usage": self.usage.unwrap_or_default().to_openai(),
+						"usage": self.meter.usage().unwrap_or_default().to_openai(),
 					})));
 				}
 				out.push(Out::Done);
@@ -759,12 +934,7 @@ impl Stream {
 					.pointer("/error/message")
 					.and_then(Value::as_str)
 					.unwrap_or("an error with no message");
-				let class = match kind {
-					Some("rate_limit_error") => Class::RateLimited,
-					Some("invalid_request_error") => Class::Rejected,
-					_ => Class::Upstream,
-				};
-				vec![Out::Error(class, message.to_string())]
+				vec![Out::Error(error_class(kind), message.to_string())]
 			}
 			// content_block_stop, and anything added after this was written.
 			_ => Vec::new(),
@@ -799,6 +969,8 @@ mod tests {
 			embeddings: None,
 			price: None,
 			fits: None,
+			internet: crate::providers::Internet::Provider,
+			quota: None,
 		}
 	}
 
@@ -825,6 +997,152 @@ mod tests {
 			],
 			"tools": [{"type": "function", "function": {"name": "run_sql", "description": "Runs SQL.", "parameters": {"type": "object", "properties": {"sql": {"type": "string"}}}}}]
 		})
+	}
+
+	#[test]
+	fn anthropic_s_web_tools_go_through_as_written_beside_function_tools() {
+		let body = json!({"model": "claude", "messages": [{"role": "user", "content": "hi"}], "tools": [
+			{"type": "web_search_20250305", "name": "web_search", "max_uses": 3, "cache_control": {"type": "ephemeral"}},
+			{"type": "web_fetch_20250910", "name": "web_fetch"},
+			{"type": "function", "function": {"name": "run_sql", "parameters": {"type": "object"}}}
+		]});
+		let out = translate(body.clone(), true).unwrap();
+		assert_eq!(out["tools"][0], body["tools"][0]);
+		assert_eq!(out["tools"][1], body["tools"][1]);
+		assert_eq!(out["tools"][2]["name"], "run_sql");
+		let plain = translate(body, false).unwrap();
+		assert!(plain["tools"][0].get("cache_control").is_none());
+		assert_eq!(plain["tools"][0]["max_uses"], 3);
+
+		// Anything else that is not a function is refused, never passed along or dropped.
+		let other = json!({"model": "claude", "messages": [{"role": "user", "content": "hi"}],
+			"tools": [{"type": "web_search_preview"}]});
+		assert!(
+			translate(other, false)
+				.unwrap_err()
+				.message
+				.contains("tools[0]")
+		);
+	}
+
+	#[test]
+	fn a_reply_that_used_a_server_tool_is_its_text_and_no_call_for_the_caller() {
+		let value = json!({"id": "m", "content": [
+			{"type": "text", "text": "Let me search. "},
+			{"type": "server_tool_use", "id": "srv_1", "name": "web_search", "input": {"query": "x"}},
+			{"type": "web_search_tool_result", "tool_use_id": "srv_1", "content": []},
+			{"type": "text", "text": "Found it."}
+		], "stop_reason": "end_turn", "usage": {"input_tokens": 1, "output_tokens": 2}});
+		let out = reply(&value, "claude", 1).unwrap();
+		let message = &out["choices"][0]["message"];
+		assert_eq!(message["content"], "Let me search. Found it.");
+		assert!(message.get("tool_calls").is_none());
+	}
+
+	#[test]
+	fn a_paused_turn_keeps_its_name_and_its_blocks_and_goes_back_as_it_came() {
+		let blocks = json!([
+			{"type": "text", "text": "Searching. "},
+			{"type": "server_tool_use", "id": "srv_1", "name": "web_search", "input": {"query": "x"}},
+			{"type": "web_search_tool_result", "tool_use_id": "srv_1", "content": [{"encrypted_content": "e"}]}
+		]);
+		let out = reply(
+			&json!({"id": "m", "content": blocks, "stop_reason": "pause_turn",
+				"usage": {"input_tokens": 1, "output_tokens": 2, "server_tool_use": {"web_search_requests": 1}}}),
+			"claude",
+			1,
+		)
+		.unwrap();
+		let choice = &out["choices"][0];
+		assert_eq!(choice["finish_reason"], "pause_turn");
+		assert_eq!(choice["message"]["anthropic_content"], blocks);
+		assert_eq!(out["usage"]["server_tool_use"]["web_search_requests"], 1);
+
+		let again = translate(
+			json!({"messages": [
+				{"role": "user", "content": "find x"},
+				{"role": "assistant", "content": "Searching. ", "anthropic_content": blocks}
+			]}),
+			false,
+		)
+		.unwrap();
+		assert_eq!(again["messages"][1]["role"], "assistant");
+		assert_eq!(again["messages"][1]["content"], blocks, "byte for byte");
+
+		let refused = translate(
+			json!({"messages": [{"role": "assistant", "anthropic_content": []}]}),
+			false,
+		)
+		.unwrap_err();
+		assert!(refused.message.contains("anthropic_content"));
+
+		let finished = reply(
+			&json!({"id": "m", "content": [{"type": "text", "text": "x"}], "stop_reason": "end_turn"}),
+			"claude",
+			1,
+		)
+		.unwrap();
+		assert!(
+			finished["choices"][0]["message"]
+				.get("anthropic_content")
+				.is_none()
+		);
+	}
+
+	#[test]
+	fn a_paused_stream_says_so_with_its_blocks_rebuilt() {
+		let mut stream = Stream::new(false, "claude", 1);
+		let events = [
+			json!({"type": "message_start", "message": {"id": "m", "usage": {"input_tokens": 1}}}),
+			json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}),
+			json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "Sea"}}),
+			json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "rching."}}),
+			json!({"type": "content_block_delta", "index": 0, "delta": {"type": "citations_delta", "citation": {"url": "u"}}}),
+			json!({"type": "content_block_start", "index": 1, "content_block": {"type": "server_tool_use", "id": "srv_1", "name": "web_search"}}),
+			json!({"type": "content_block_delta", "index": 1, "delta": {"type": "input_json_delta", "partial_json": "{\"query\":"}}),
+			json!({"type": "content_block_delta", "index": 1, "delta": {"type": "input_json_delta", "partial_json": "\"x\"}"}}),
+			json!({"type": "content_block_start", "index": 2, "content_block": {"type": "web_search_tool_result", "tool_use_id": "srv_1", "content": []}}),
+			json!({"type": "message_delta", "delta": {"stop_reason": "pause_turn"},
+				"usage": {"output_tokens": 5, "server_tool_use": {"web_search_requests": 2}}}),
+		];
+		let chunks: Vec<Value> = events
+			.iter()
+			.flat_map(|e| stream.event(&event(e.clone())))
+			.filter_map(|o| match o {
+				Out::Chunk(v) => Some(v),
+				_ => None,
+			})
+			.collect();
+		let last = chunks.len() - 1;
+		assert_eq!(chunks[last]["choices"][0]["finish_reason"], "pause_turn");
+		assert_eq!(
+			chunks[last - 1]["choices"][0]["delta"]["anthropic_content"],
+			json!([
+				{"type": "text", "text": "Searching.", "citations": [{"url": "u"}]},
+				{"type": "server_tool_use", "id": "srv_1", "name": "web_search", "input": {"query": "x"}},
+				{"type": "web_search_tool_result", "tool_use_id": "srv_1", "content": []}
+			])
+		);
+		assert_eq!(stream.usage().unwrap().web_searches, Some(2));
+	}
+
+	#[test]
+	fn searches_are_bounded_by_max_uses_or_by_the_bound_it_is_given() {
+		let mut body = json!({"tools": [
+			{"type": "web_search_20250305", "name": "web_search", "max_uses": 3},
+			{"type": "web_search_20260318", "name": "web_search"},
+			{"type": "web_fetch_20250910", "name": "web_fetch"},
+			{"name": "run_sql", "input_schema": {"type": "object"}}
+		]});
+		let bound = bound_searches(body.as_object_mut().unwrap());
+		assert_eq!(bound, 3 + SEARCHES_BOUND);
+		assert_eq!(body["tools"][0]["max_uses"], 3);
+		assert_eq!(body["tools"][1]["max_uses"], SEARCHES_BOUND);
+		assert!(
+			body["tools"][2].get("max_uses").is_none(),
+			"a fetch is not billed"
+		);
+		assert_eq!(bound_searches(json!({}).as_object_mut().unwrap()), 0);
 	}
 
 	#[test]

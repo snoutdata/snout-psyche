@@ -46,6 +46,8 @@
 //! And `price` (`price.rs`), which overrides the price catalogue shipped in the binary; a model
 //! that has neither is served and logged with no cost. And `fits` (`fits.rs`), what it can take
 //! (its window, tools, images, a JSON schema), which `auto` chooses by and every route checks.
+//! And `internet`, how far its calls may reach (`Internet` below, `fits.rs`). And `quota`, the requests and tokens a minute it may be sent, for a provider
+//! whose headers do not say (`health.rs`).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
@@ -53,7 +55,7 @@ use std::sync::{Arc, RwLock};
 use serde::Deserialize;
 
 use crate::config::ConfigError;
-use crate::fits::Fits;
+use crate::fits::{Constraints, Fits, Quota};
 use crate::net::{Egress, check_base_url};
 use crate::price::{self, Place, Price, PriceEntry};
 use crate::sigv4::{self, Credentials};
@@ -105,6 +107,30 @@ impl Reasoning {
 			Reasoning::Budget => "budget",
 			Reasoning::Adaptive => "adaptive",
 			Reasoning::Effort => "effort",
+		}
+	}
+}
+
+/// How far a model's calls may reach.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Internet {
+	/// To no public address: only a provider on a private network, which needs
+	/// `PSYCHE_EGRESS=private`; held at the connection as well as by reading the address (`net.rs`).
+	None,
+	/// To its provider, and a request for the provider's own web tools is not sent to it.
+	#[default]
+	Provider,
+	/// To its provider, and those web tools go through.
+	Web,
+}
+
+impl Internet {
+	pub fn as_str(self) -> &'static str {
+		match self {
+			Internet::None => "none",
+			Internet::Provider => "provider",
+			Internet::Web => "web",
 		}
 	}
 }
@@ -338,6 +364,19 @@ pub struct Model {
 	pub price: Option<Price>,
 	/// What it can take, when its owner wrote it (`fits.rs`).
 	pub fits: Option<Fits>,
+	/// How far its calls may reach; `provider` unless the catalogue says otherwise.
+	pub internet: Internet,
+	/// What it may be sent in a minute, when its owner wrote it.
+	pub quota: Option<Quota>,
+}
+
+impl Model {
+	/// Whether a cache hit here is worth staying for (PS18): reading from its cache costs less than
+	/// a fresh prompt.
+	pub fn cache_pays(&self) -> bool {
+		self.price
+			.is_some_and(|p| p.rates.cache_read < p.rates.input)
+	}
 }
 
 #[derive(Debug, Clone, Default)]
@@ -355,6 +394,28 @@ pub struct Route {
 	/// The models, as written; those not in the catalogue are skipped and named by the admin API.
 	pub targets: Vec<String>,
 	pub sort: Sort,
+	/// A target's share of a `weighted` or `balanced` route, by model name; a target not listed
+	/// counts 1.
+	pub weights: HashMap<String, u32>,
+	/// What every target must meet, or be left out.
+	pub constraints: Option<Constraints>,
+}
+
+/// The largest weight a route may give a target.
+pub const MOST_WEIGHT: u32 = 1000;
+
+/// Why a route's weights cannot be served: a weight is for one of its targets, from 1 to
+/// [`MOST_WEIGHT`].
+pub fn weights_problem(targets: &[String], weights: &HashMap<String, u32>) -> Option<String> {
+	weights.iter().find_map(|(name, weight)| {
+		if !targets.contains(name) {
+			Some(format!("weights names {name}, which is not one of targets"))
+		} else if !(1..=MOST_WEIGHT).contains(weight) {
+			Some(format!("the weight of {name} is 1 to {MOST_WEIGHT}"))
+		} else {
+			None
+		}
+	})
 }
 
 /// The order a route tries its models in.
@@ -372,6 +433,12 @@ pub enum Sort {
 	Latency,
 	/// The most tokens a second first, as measured, likewise.
 	Throughput,
+	/// Drawn at random in proportion to the route's `weights`, its health and its remaining quota
+	/// (`health.rs`).
+	Weighted,
+	/// Drawn at random in proportion to price, health, speed, remaining quota and the route's
+	/// `weights` together (`health.rs` has the weighting and why).
+	Balanced,
 }
 
 impl Sort {
@@ -381,6 +448,8 @@ impl Sort {
 			Sort::Price => "price",
 			Sort::Latency => "latency",
 			Sort::Throughput => "throughput",
+			Sort::Weighted => "weighted",
+			Sort::Balanced => "balanced",
 		}
 	}
 }
@@ -393,6 +462,10 @@ pub struct RouteSpec {
 	pub targets: Vec<String>,
 	#[serde(default)]
 	pub sort: Sort,
+	#[serde(default)]
+	pub weights: HashMap<String, u32>,
+	#[serde(default)]
+	pub constraints: Option<Constraints>,
 }
 
 /// A catalogue before its models are built: the providers, resolved (with what the environment
@@ -466,6 +539,10 @@ pub struct ModelSpec {
 	pub price: Option<serde_json::Value>,
 	#[serde(default)]
 	pub fits: Option<Fits>,
+	#[serde(default)]
+	pub internet: Internet,
+	#[serde(default)]
+	pub quota: Option<Quota>,
 }
 
 impl Provider {
@@ -656,6 +733,9 @@ pub fn build_model(
 		.clone()
 		.filter(|u| !u.is_empty())
 		.unwrap_or_else(|| spec.name.clone());
+	if let Some(problem) = spec.quota.and_then(Quota::problem) {
+		return Err(problem.to_string());
+	}
 	let price = match &spec.price {
 		Some(written) => Some(
 			serde_json::from_value::<PriceEntry>(written.clone())
@@ -668,7 +748,8 @@ pub fn build_model(
 			host: provider.base_url.host_str(),
 			upstream: &upstream,
 		}),
-	};
+	}
+	.map(|price| price.on(provider.kind));
 	Ok(Model {
 		upstream,
 		name: spec.name.clone(),
@@ -679,16 +760,23 @@ pub fn build_model(
 		embeddings: spec.embeddings,
 		price,
 		fits: spec.fits,
+		internet: spec.internet,
+		quota: spec.quota,
 	})
 }
 
 /// The cheapest first, by a million tokens in and a million out; a model nothing prices goes last.
 /// A stable sort, so equal prices keep the order given.
 pub fn by_price(models: &mut [Arc<Model>]) {
-	models.sort_by_key(|m| {
-		m.price
-			.map_or(u64::MAX, |p| p.rates.input.saturating_add(p.rates.output))
-	});
+	models.sort_by_key(|m| list_price(m));
+}
+
+/// What a model is compared by on price: a million tokens in and a million out; a model nothing
+/// prices compares last.
+pub fn list_price(model: &Model) -> u64 {
+	model
+		.price
+		.map_or(u64::MAX, |p| p.rates.input.saturating_add(p.rates.output))
 }
 
 impl Catalogue {
@@ -764,8 +852,14 @@ impl Catalogue {
 					"the route {} names the model {missing}, which is not among the models",
 					entry.name
 				))
+			} else if let Some(problem) = weights_problem(&entry.targets, &entry.weights) {
+				Some(format!("the route {}: {problem}", entry.name))
 			} else {
-				None
+				entry
+					.constraints
+					.as_ref()
+					.and_then(Constraints::problem)
+					.map(|problem| format!("the route {}: {problem}", entry.name))
 			};
 			match why {
 				Some(why) if strict => return Err(ConfigError(why)),
@@ -774,6 +868,8 @@ impl Catalogue {
 					name: entry.name.clone(),
 					targets: entry.targets.clone(),
 					sort: entry.sort,
+					weights: entry.weights.clone(),
+					constraints: entry.constraints.clone(),
 				})),
 			}
 		}
@@ -856,8 +952,14 @@ impl Catalogue {
 	}
 
 	/// The first model a provider serves, by provider name, for a request that proves a credential.
+	/// One held to private addresses comes last, so a proof is not what first sends it anywhere.
 	pub fn first_model_of(&self, provider: &str) -> Option<&Arc<Model>> {
-		self.models.iter().find(|m| m.provider.name == provider)
+		let theirs = |m: &&Arc<Model>| m.provider.name == provider;
+		self.models
+			.iter()
+			.filter(theirs)
+			.find(|m| m.internet != Internet::None)
+			.or_else(|| self.models.iter().find(theirs))
 	}
 
 	/// Every credential the catalogue holds, for scrubbing provider errors (`error::scrub`).
@@ -1060,5 +1162,57 @@ mod tests {
 			r#""kind": "openai", "api_key": "sk-in-a-file""#,
 		);
 		assert!(Catalogue::from_json(&unknown_field, &env(), Egress::Public).is_err());
+	}
+
+	#[test]
+	fn a_route_s_weights_are_for_its_own_targets_and_a_quota_is_above_zero() {
+		let routed = |route: &str| {
+			format!(
+				r#"{{"providers": [{{"name": "p", "kind": "openai", "base_url": "https://p.example/v1"}}],
+				"models": [{{"name": "a", "provider": "p"}}, {{"name": "b", "provider": "p", "internet": "web"}}],
+				"routes": [{route}]}}"#
+			)
+		};
+		let good = Catalogue::from_json(
+			&routed(
+				r#"{"name": "r", "targets": ["a", "b"], "sort": "weighted", "weights": {"a": 3}}"#,
+			),
+			&HashMap::new(),
+			Egress::Public,
+		)
+		.unwrap();
+		let route = good.route("r").unwrap();
+		assert_eq!(route.sort, Sort::Weighted);
+		assert_eq!(route.weights["a"], 3);
+		assert_eq!(good.model("b").unwrap().internet, Internet::Web);
+		assert_eq!(good.model("a").unwrap().internet, Internet::Provider);
+		let unknown = routed(r#"{"name": "r", "targets": ["a"]}"#)
+			.replace(r#""internet": "web""#, r#""internet": "lots""#);
+		assert!(Catalogue::from_json(&unknown, &HashMap::new(), Egress::Public).is_err());
+
+		for (route, said) in [
+			(
+				r#"{"name": "r", "targets": ["a"], "weights": {"b": 1}}"#,
+				"not one of targets",
+			),
+			(
+				r#"{"name": "r", "targets": ["a"], "weights": {"a": 0}}"#,
+				"1 to 1000",
+			),
+			(
+				r#"{"name": "r", "targets": ["a"], "constraints": {"context": 0}}"#,
+				"above 0",
+			),
+		] {
+			let error =
+				Catalogue::from_json(&routed(route), &HashMap::new(), Egress::Public).unwrap_err();
+			assert!(error.0.contains(said), "{route}: {error}");
+		}
+		let no_quota = FILE.replace(
+			r#""name": "gpt-4o", "provider": "openai""#,
+			r#""name": "gpt-4o", "provider": "openai", "quota": {"requests": 0}"#,
+		);
+		let error = Catalogue::from_json(&no_quota, &env(), Egress::Public).unwrap_err();
+		assert!(error.0.contains("quota"), "{error}");
 	}
 }

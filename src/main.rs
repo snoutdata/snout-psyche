@@ -38,6 +38,8 @@ async fn main() {
 	};
 	let catalogue = Catalogue::build(&file).unwrap_or_else(|error| fail(2, &error.to_string()));
 	let http = snout_psyche::net::client(config.egress).unwrap_or_else(|error| fail(1, &error));
+	let sandbox =
+		snout_psyche::net::sandbox_client(config.egress).unwrap_or_else(|error| fail(1, &error));
 	// What calls use: the file's catalogue, until the tables are read.
 	let live = snout_psyche::providers::Live::new(catalogue);
 	let tables = snout_psyche::models::Held::new(file, live.clone(), config.egress);
@@ -137,6 +139,7 @@ async fn main() {
 		catalogue: live.clone(),
 		tables: held_tables,
 		http,
+		sandbox,
 		egress: config.egress,
 		jwt_secret: config.jwt_secret.clone(),
 		timeouts: config.timeouts,

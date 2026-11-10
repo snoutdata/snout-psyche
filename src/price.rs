@@ -16,8 +16,10 @@
 //! ```
 //!
 //! `cache_read` and `cache_write` default to the input price. `request` is a fee per call, in
-//! dollars. `long_context` is the second tier some models have: past `above` prompt tokens, every
-//! token of the call is charged at its prices instead.
+//! dollars. `web_search` is a fee per web search, in dollars, for a provider that bills them apart
+//! from the tokens; on an Anthropic model that writes none it is Anthropic's published rate
+//! ([`ANTHROPIC_WEB_SEARCH`]). `long_context` is the second tier some models have: past `above`
+//! prompt tokens, every token of the call is charged at its prices instead.
 
 use serde::Deserialize;
 
@@ -27,6 +29,10 @@ use crate::usage::Usage;
 
 /// Picodollars per US dollar.
 pub const PICO: u64 = 1_000_000_000_000;
+
+/// Anthropic's fee for one web search, in picodollars: $10 per 1,000 searches, its published rate
+/// (Web search tool, "Usage and pricing", checked 2026-11-10).
+pub const ANTHROPIC_WEB_SEARCH: u64 = PICO / 100;
 
 /// One tier's prices, in picodollars per token.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,6 +50,8 @@ pub struct Price {
 	pub request: u64,
 	/// Past this many prompt tokens, the whole call is charged at the second tier.
 	pub long_context: Option<(u64, Rates)>,
+	/// A fee per web search, in picodollars; `None` when nothing says there is one.
+	pub web_search: Option<u64>,
 }
 
 impl Price {
@@ -60,8 +68,25 @@ impl Price {
 			+ u128::from(read) * u128::from(rates.cache_read)
 			+ u128::from(write) * u128::from(rates.cache_write)
 			+ u128::from(usage.completion_tokens) * u128::from(rates.output)
-			+ u128::from(self.request);
+			+ u128::from(self.request)
+			+ u128::from(usage.web_searches.unwrap_or(0))
+				* u128::from(self.web_search.unwrap_or(0));
 		u64::try_from(sum).unwrap_or(u64::MAX)
+	}
+
+	/// What `searches` web searches cost, in picodollars.
+	pub fn searches(&self, searches: u64) -> u64 {
+		u64::try_from(u128::from(searches) * u128::from(self.web_search.unwrap_or(0)))
+			.unwrap_or(u64::MAX)
+	}
+
+	/// This price on a provider of `kind`: Anthropic's fee per search, unless the price names its
+	/// own (0 is one).
+	pub fn on(mut self, kind: Kind) -> Self {
+		if kind == Kind::Anthropic {
+			self.web_search.get_or_insert(ANTHROPIC_WEB_SEARCH);
+		}
+		self
 	}
 }
 
@@ -87,6 +112,9 @@ impl Price {
 		if self.request > 0 {
 			out["request"] = serde_json::json!(self.request as f64 / PICO as f64);
 		}
+		if let Some(fee) = self.web_search {
+			out["web_search"] = serde_json::json!(fee as f64 / PICO as f64);
+		}
 		if let Some((above, long)) = &self.long_context {
 			let mut long = rates_json(long);
 			long["above"] = serde_json::json!(above);
@@ -109,6 +137,9 @@ pub struct PriceEntry {
 	/// Dollars per call.
 	#[serde(default)]
 	request: Option<f64>,
+	/// Dollars per web search.
+	#[serde(default)]
+	web_search: Option<f64>,
 	#[serde(default)]
 	long_context: Option<LongContextEntry>,
 }
@@ -164,6 +195,13 @@ impl PriceEntry {
 			}
 			Some(d) => return Err(format!("request is not a fee per call: {d}")),
 		};
+		let web_search = match self.web_search {
+			None => None,
+			Some(d) if d.is_finite() && (0.0..=1_000.0).contains(&d) => {
+				Some((d * PICO as f64).round() as u64)
+			}
+			Some(d) => return Err(format!("web_search is not a fee per search: {d}")),
+		};
 		let long_context = match &self.long_context {
 			None => None,
 			Some(l) => Some((
@@ -175,6 +213,7 @@ impl PriceEntry {
 			rates: rates(self.input, self.output, self.cache_read, self.cache_write)?,
 			request,
 			long_context,
+			web_search,
 		})
 	}
 }
@@ -346,6 +385,7 @@ mod tests {
 			cached_tokens: Some(2_000_000),
 			cache_write_tokens: Some(400_000),
 			reasoning_tokens: Some(50_000),
+			web_searches: None,
 		};
 		// 1M plain at $2.20, 2M read at $0.11, 0.4M written at $2.75, 0.1M out at $11: reasoning is
 		// part of the output, not charged again.
@@ -394,8 +434,39 @@ mod tests {
 	}
 
 	#[test]
+	fn a_web_search_is_charged_on_top_of_the_tokens() {
+		let p = price(r#"{"input": 0, "output": 0, "web_search": 0.01}"#);
+		let usage = Usage {
+			web_searches: Some(3),
+			..Usage::default()
+		};
+		assert_eq!(Dollars(p.cost(&usage)).to_string(), "0.030000000000");
+		assert_eq!(p.searches(3), 3 * PICO / 100);
+		assert_eq!(p.to_json()["web_search"], 0.01);
+	}
+
+	#[test]
+	fn anthropic_s_fee_is_the_default_there_and_nowhere_else() {
+		let unwritten = price(r#"{"input": 1, "output": 1}"#);
+		assert_eq!(unwritten.web_search, None);
+		assert!(unwritten.to_json().get("web_search").is_none());
+		assert_eq!(
+			unwritten.on(Kind::Anthropic).web_search,
+			Some(ANTHROPIC_WEB_SEARCH)
+		);
+		assert_eq!(ANTHROPIC_WEB_SEARCH, 10 * PICO / 1000);
+		assert_eq!(unwritten.on(Kind::Openai).web_search, None);
+		assert_eq!(unwritten.on(Kind::Bedrock).web_search, None);
+		// Written, 0 is a price, and it reads back.
+		let free = price(r#"{"input": 1, "output": 1, "web_search": 0}"#).on(Kind::Anthropic);
+		assert_eq!(free.web_search, Some(0));
+		assert_eq!(free.to_json()["web_search"], 0.0);
+	}
+
+	#[test]
 	fn what_is_not_a_price_is_refused() {
 		for bad in [
+			r#"{"input": 0, "output": 0, "web_search": -1}"#,
 			r#"{"input": -1, "output": 0}"#,
 			r#"{"input": 0, "output": 2000000}"#,
 			r#"{"input": 0, "output": 0, "request": -0.5}"#,

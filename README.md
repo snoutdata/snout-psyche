@@ -16,6 +16,24 @@ chooses the model by what the request needs (below). More providers are being bu
 - `POST /ai/v1/chat/completions` and `POST /ai/v1/completions`, streamed or not, to any provider
   that speaks OpenAI's API (OpenAI, vLLM, Groq, Together, DeepSeek, LM Studio, Ollama's `/v1`).
   Each is also served at `/v1/…`, for clients whose base URL ends in `/v1`.
+- `POST /ai/v1/messages` and `POST /ai/v1/messages/count_tokens`, Anthropic's Messages API, so
+  Claude Code and other Anthropic-native agents can set their base URL to a project (`x-api-key` or
+  a Bearer token). The same keys, budgets, limits, routes, `auto`, needs check and log as a chat
+  completion. To an Anthropic provider it passes through; to any other it is translated.
+- `POST /ai/v1/responses`, OpenAI's Responses API, so Codex and other callers written for it can
+  use a project with `wire_api = "responses"` and a Psyche key. The same keys, budgets, limits,
+  routes, `auto`, needs check, internet level, log and usage as a chat completion, translated to a
+  chat completion for every provider and back, streamed or not. Nothing is stored:
+  `previous_response_id` is refused, so a caller sends the whole conversation. A `custom` tool is a
+  function taking one string `input` and comes back as a `custom_tool_call`; a `web_search` tool
+  goes to a model at the internet level `web` whose provider takes it, and any other model is sent
+  the call without it. What has no translation (a hosted tool, a file, a field
+  Psyche does not know) is refused with a 400 that names it; what only tunes the service
+  (`store`, `service_tier`, `truncation`, `prompt_cache_key`, `text.verbosity`) is dropped.
+  `reasoning.effort` goes in the form the model's catalogue entry names and is dropped for a model
+  with none, and on a turn that continues a tool loop for a model that signs its thinking, since a
+  signature does not come back through this API. `parallel_tool_calls: false` is dropped for
+  Bedrock, whose Converse API cannot say it.
 - **Anthropic models through the same API.** A chat completion request to a model whose provider
   is `anthropic` is translated to Anthropic's Messages API and the answer translated back, streamed
   or not: system messages, images, tools and tool results (parallel calls become one turn),
@@ -297,6 +315,74 @@ measurements goes the same way. `GET /ai/v1/models` lists the three (`owned_by: 
 Each attempt's log row has `routing`, the order its models were tried in and every one left out
 with its reason, for instance `cheapest first: big-tools; left out small-text (takes no tools)`.
 
+### Choosing among targets
+
+A route's `sort` may be `weighted` (a random draw in proportion to `weights`, by model name, 1 to
+1000, a model not listed counting 1) or `balanced` (a draw in proportion to the inverse square of
+price, health, speed and room left). Targets of equal price in a `price` route are drawn the same
+way. A route may also hold `constraints`, which every target must state it meets or be left out:
+
+```sh
+curl -X PUT $PSYCHE/ai/v1/admin/routes/chat -H "Authorization: Bearer $SERVICE_KEY" \
+  -d '{"targets": ["sonnet-a", "sonnet-b"], "sort": "balanced", "weights": {"sonnet-a": 3},
+       "constraints": {"context": 100000, "tools": true, "images": true, "json_schema": true,
+                       "regions": ["us-west-2"], "no_data_collection": true,
+                       "max_price": {"prompt": 3, "completion": 15}}}'
+# Left out of a later PUT, weights and constraints are kept; {} clears them.
+```
+
+`auto` takes the same `balanced` policy through a route named `auto`.
+
+**Quota.** A model may say what it can be sent in a minute, `"quota": {"requests": 500, "tokens":
+200000}`, which is how a Bedrock account's limits are known. Together with the remaining quota a
+provider reports in its headers, this gives each model its room: traffic moves to the models with
+more of it before any of them starts answering 429, and a model with none left goes after the rest.
+
+**Conversations stay on their cache.** Where reading a model's prompt cache costs less than a fresh
+prompt, a conversation that has hit a cache goes back to the same model while it is healthy and has
+room, for ten minutes after its last answer. A conversation is known by `session_id` (or the
+`x-session-id` header, or `prompt_cache_key`), else by its first system message and its first other
+message.
+
+A route goes through its targets a second time when every one failed for a reason a moment may fix.
+
+### OpenRouter's request controls
+
+Under OpenRouter's own names, and never sent to a provider. They narrow or reorder what the route
+allows and cannot add to it.
+
+| Field | Does |
+| --- | --- |
+| `provider.only`, `provider.ignore` | Keep or drop targets. A slug is a provider's name, its stored credential's name, or `name/region`. |
+| `provider.order` | Tries the named providers first, in that order, in place of the route's balancing and a conversation's stickiness. |
+| `provider.allow_fallbacks` | `false` keeps only what `order` names, or the first target of each name sent. |
+| `provider.sort` | `price`, `throughput` or `latency`, or `{"by": ..., "partition": "model" \| "none"}`. |
+| `provider.max_price` | `prompt` and `completion` in dollars per million tokens, `request` in dollars. |
+| `provider.data_collection` | `deny` keeps the models whose `fits` say `no_data_collection`. |
+| `provider.require_parameters` | Keeps the targets shown to take everything the request sends. |
+| `provider.preferred_min_throughput`, `provider.preferred_max_latency` | Preferences, never filters: tokens a second and seconds, a number or `{"p50", "p75", "p90", "p99"}`, held against the measured averages. A target that misses goes after those that do not, within each name sent; one with no measurement keeps its place, and an explicit `order` is not moved. |
+| `:floor`, `:nitro` on a name | `sort: "price"`, `sort: "throughput"`. |
+| `:online` on a name | Web search, in the form the model's provider takes it. |
+
+When they leave nothing, the answer is a 404 that says why.
+
+### A model's internet level
+
+Each model has an `internet` level, `"provider"` unless written:
+
+- **`provider`**: its calls reach its provider. A request carrying a web capability the provider
+  would run (Anthropic's server tools and `mcp_servers`, OpenAI's `web_search*` tools and
+  `web_search_options`, Gemini's `google_search` and `url_context`, OpenRouter's `web` plugin and
+  `:online`) does not go to it.
+- **`web`**: those capabilities go through. A provider that cannot run them, such as Bedrock, is
+  left out with the reason.
+- **`none`**: its calls reach no public address. A call goes only to a provider on a private
+  network, under `PSYCHE_EGRESS=private`, and the address connected to is checked at the connection.
+
+A route or `auto` leaves out a model the request cannot go to, with the reason in `routing`; a call
+naming that model alone is a 400 that says which model and why, and nothing is sent. A PUT that
+leaves `internet` out keeps the level.
+
 ### Health
 
 Each model is measured from its own calls: the time to the provider's first byte and tokens a
@@ -511,6 +597,8 @@ providers publish them:
 ```
 
 `cache_read` and `cache_write` default to the input price; `request` adds a fee per call in dollars;
+`web_search` adds a fee per web search in dollars (0.01, Anthropic's rate, on an Anthropic model that
+names none, and a budget reserves the most a call's `max_uses` allow, or 10 searches if it names none);
 `long_context: {"above": 272000, "input": …, "output": …}` is the second tier some models have,
 charged for the whole call once the prompt is longer than `above`. Without a `price`, Psyche looks the
 model up in the catalogue it ships ([`catalogue/models.json`](catalogue/models.json)), matched on the

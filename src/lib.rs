@@ -25,12 +25,15 @@ pub mod keys;
 pub mod layout;
 pub mod limits;
 pub mod log;
+pub mod messages;
 pub mod migrations;
 pub mod models;
 pub mod net;
+pub mod prefs;
 pub mod price;
 pub mod providers;
 pub mod proxy;
+pub mod responses;
 pub mod sigv4;
 pub mod sse;
 pub mod translate;
@@ -89,8 +92,12 @@ pub mod fuzz {
 			embeddings: None,
 			price: None,
 			fits: None,
+			internet: crate::providers::Internet::Web,
+			quota: None,
 		};
 		let _ = crate::anthropic::request(&inbound.body, &model, inbound.stream);
+		let _ = crate::messages::to_chat(&inbound.body, &model);
+		let _ = crate::responses::to_chat(&inbound.body, &model);
 		let _ = crate::bedrock::request(&inbound.body, &model);
 		for family in [
 			crate::providers::Embeddings::Titan,

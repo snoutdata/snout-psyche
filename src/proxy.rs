@@ -1,5 +1,7 @@
 //! The OpenAI-compatible API: `/ai/v1/chat/completions`, `/ai/v1/completions`, `/ai/v1/embeddings`
-//! and `/ai/v1/models` (each also at `/v1/…`, for clients whose base URL ends in `/v1`).
+//! and `/ai/v1/models` (each also at `/v1/…`, for clients whose base URL ends in `/v1`), and
+//! Anthropic's Messages API, `/ai/v1/messages` and its `count_tokens` (`messages.rs`), and OpenAI's
+//! Responses API, `/ai/v1/responses` (`responses.rs`), which are the same call in other shapes.
 //!
 //! A call is checked, resolved to a model in the catalogue, and sent to that model's provider with
 //! Psyche's credential. To a provider that speaks OpenAI's API the request goes as the caller wrote
@@ -26,6 +28,8 @@
 //!  - **A refused credential is Psyche's problem, not the caller's**: a provider's 401 or 403 is
 //!    answered 503 `provider_auth`, never passed on as if the caller's own key were wrong.
 
+use std::borrow::Cow;
+use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -44,20 +48,21 @@ use crate::budgets::{self, Budgets, Reservation};
 use crate::config::Timeouts;
 use crate::credentials;
 use crate::error::{ApiError, Class, scrub};
-use crate::fits::{self, Needs};
+use crate::fits::{self, Needs, WebWay};
 use crate::health::{self, Health, Remaining};
 use crate::jwt::{self, Role};
 use crate::keys::{self, Key, KeyId, Refusal};
 use crate::limits::{self, Limits, Taken};
 use crate::models;
 use crate::net;
+use crate::prefs::Prefs;
 use crate::price::{Dollars, Price};
-use crate::providers::{self, Kind, Live, Model, Provider, Sort};
+use crate::providers::{self, Catalogue, Internet, Kind, Live, Model, Provider, Sort};
 use crate::sse::{Event, Parser};
 use crate::translate::{Out, Translator};
 use crate::usage::Usage;
 use crate::who::{Members, UserId, Who};
-use crate::{anthropic, bedrock, embeddings, sigv4};
+use crate::{anthropic, bedrock, embeddings, messages, responses, sigv4};
 
 /// How much of a provider's error body is read. Errors are a few hundred bytes.
 const MAX_ERROR_BODY: usize = 64 * 1024;
@@ -65,6 +70,10 @@ const MAX_ERROR_BODY: usize = 64 * 1024;
 const MAX_REPLY_BODY: usize = 64 * 1024 * 1024;
 /// How many of one request's embedding calls are in flight at once.
 const EMBED_CONCURRENCY: usize = 8;
+/// How many times a route goes through its targets. A target that was failing when the call reached
+/// it may be answering a moment later, while the one that answered before has started to fail
+/// (the chaos run's excused failures).
+const PASSES: usize = 2;
 
 /// The server: the catalogue, the one outbound client, and the rules for callers.
 pub struct Proxy {
@@ -74,6 +83,9 @@ pub struct Proxy {
 	/// The tables behind it (`models.rs`), when there is a database.
 	pub tables: Option<models::Held>,
 	pub http: reqwest::Client,
+	/// The client for a model at the internet level `none`, which connects only to private
+	/// addresses (`net.rs`); there is none under public egress, so such a model cannot be sent.
+	pub sandbox: Option<reqwest::Client>,
 	/// The egress rules `http` was built with, for an address the admin API is handed.
 	pub egress: net::Egress,
 	pub jwt_secret: String,
@@ -189,12 +201,16 @@ pub enum Operation {
 	Chat,
 	Completions,
 	Embeddings,
+	/// Anthropic's Messages API. To a provider that speaks OpenAI's API it is a chat completion.
+	Messages,
+	/// OpenAI's Responses API. To every provider it is a chat completion.
+	Responses,
 }
 
 impl Operation {
 	fn path(self) -> &'static str {
 		match self {
-			Operation::Chat => "chat/completions",
+			Operation::Chat | Operation::Messages | Operation::Responses => "chat/completions",
 			Operation::Completions => "completions",
 			Operation::Embeddings => "embeddings",
 		}
@@ -205,6 +221,8 @@ impl Operation {
 			Operation::Chat => "chat",
 			Operation::Completions => "completions",
 			Operation::Embeddings => "embeddings",
+			Operation::Messages => "messages",
+			Operation::Responses => "responses",
 		}
 	}
 }
@@ -219,6 +237,17 @@ pub struct Inbound {
 	pub stream: bool,
 	/// Whether the caller asked for the usage chunk itself.
 	pub wants_usage: bool,
+	/// OpenRouter's `provider` object (`prefs.rs`). Taken out of the body.
+	pub prefs: Option<Prefs>,
+	/// OpenRouter's `session_id`: what the caller calls this conversation. Taken out of the body.
+	pub session: Option<String>,
+	/// Whether a name was sent with the `:online` suffix. One call, one capability: it applies to
+	/// every target, since one that answered without the web would look like one that used it.
+	pub online: bool,
+	/// For `/messages`: the caller's `anthropic-beta` and `anthropic-version`, which an Anthropic
+	/// provider gets as the caller sent them.
+	pub beta: Option<String>,
+	pub version: Option<String>,
 }
 
 impl Inbound {
@@ -238,6 +267,15 @@ impl Inbound {
 		// OpenRouter's fallback list, and its `route: "fallback"`, which says what a list already
 		// does; neither goes to a provider.
 		body.remove("route");
+		let prefs = match body.remove("provider") {
+			None | Some(Value::Null) => None,
+			Some(value) => Some(Prefs::parse(value)?),
+		};
+		let session = match body.remove("session_id") {
+			None | Some(Value::Null) => None,
+			Some(Value::String(session)) => Some(session_checked(session)?),
+			Some(_) => return Err(ApiError::new(Class::BadRequest, "session_id is a string.")),
+		};
 		let mut fallbacks = match body.remove("models") {
 			None | Some(Value::Null) => Vec::new(),
 			Some(Value::Array(names))
@@ -289,11 +327,22 @@ impl Inbound {
 			fallbacks,
 			stream,
 			wants_usage,
+			prefs,
+			session,
+			online: false,
+			beta: None,
+			version: None,
 		})
 	}
 
 	/// The body the provider gets, for this operation.
 	fn upstream(&self, model: &Model, operation: Operation) -> Result<Vec<u8>, ApiError> {
+		if operation == Operation::Messages {
+			return self.messages_upstream(model);
+		}
+		if operation == Operation::Responses {
+			return self.responses_upstream(model);
+		}
 		match model.provider.kind {
 			Kind::Openai => return Ok(self.openai(model)),
 			Kind::Anthropic | Kind::Bedrock if operation != Operation::Chat => {
@@ -309,9 +358,115 @@ impl Inbound {
 		}
 		let body = match model.provider.kind {
 			Kind::Bedrock => bedrock::request(&self.body, model)?,
-			_ => anthropic::request(&self.body, model, self.stream)?,
+			_ => anthropic::request(&self.anthropic_body(), model, self.stream)?,
 		};
 		Ok(serde_json::to_vec(&body).unwrap_or_default())
+	}
+
+	/// The body the provider gets for `/messages`: the caller's, to an Anthropic provider, and
+	/// otherwise the translation `messages.rs` makes, carried as a chat completion is.
+	fn messages_upstream(&self, model: &Model) -> Result<Vec<u8>, ApiError> {
+		let provider = &model.provider;
+		if provider.kind == Kind::Anthropic {
+			let mut body = self.anthropic_body().into_owned();
+			body.insert("model".into(), Value::String(model.upstream.clone()));
+			if !model.prompt_caching {
+				strip_cache_control(&mut body);
+			}
+			return Ok(serde_json::to_vec(&Value::Object(body)).unwrap_or_default());
+		}
+		let mut chat = messages::to_chat(&self.body, model)?;
+		if provider.kind == Kind::Bedrock {
+			let converse = bedrock::request(&chat, model)?;
+			return Ok(serde_json::to_vec(&converse).unwrap_or_default());
+		}
+		let field = cap_field(provider, Operation::Chat);
+		if field != "max_tokens"
+			&& let Some(cap) = chat.remove("max_tokens")
+		{
+			chat.insert(field.into(), cap);
+		}
+		let translated = Self {
+			body: chat,
+			model: self.model.clone(),
+			fallbacks: Vec::new(),
+			stream: self.stream,
+			wants_usage: true,
+			prefs: None,
+			session: None,
+			online: self.online,
+			beta: None,
+			version: None,
+		};
+		Ok(translated.openai(model))
+	}
+
+	/// The body the provider gets for `/responses`: the translation `responses.rs` makes, carried as
+	/// a chat completion is, whichever the provider.
+	fn responses_upstream(&self, model: &Model) -> Result<Vec<u8>, ApiError> {
+		let mut chat = responses::to_chat(&self.body, model)?;
+		let field = cap_field(&model.provider, Operation::Chat);
+		if field != "max_tokens"
+			&& let Some(cap) = chat.remove("max_tokens")
+		{
+			chat.insert(field.into(), cap);
+		}
+		let translated = Self {
+			body: chat,
+			model: self.model.clone(),
+			fallbacks: Vec::new(),
+			stream: self.stream,
+			wants_usage: true,
+			prefs: None,
+			session: None,
+			online: self.online,
+			beta: None,
+			version: None,
+		};
+		translated.upstream(model, Operation::Chat)
+	}
+
+	/// Writes out what `:online` and a plain `web` plugin ask for, gives a search tool that names no
+	/// `max_uses` the bound (`anthropic::SEARCHES_BOUND`), and says the most web searches this call
+	/// can be billed for. Only Anthropic bills them apart from the tokens, as far as Psyche knows.
+	fn bound_searches(&mut self, model: &Model) -> u64 {
+		if model.provider.kind != Kind::Anthropic {
+			return 0;
+		}
+		let written = match self.anthropic_body() {
+			Cow::Owned(body) => Some(body),
+			Cow::Borrowed(_) => None,
+		};
+		if let Some(body) = written {
+			self.body = body;
+		}
+		anthropic::bound_searches(&mut self.body)
+	}
+
+	/// The caller's body for Anthropic: `:online` and a plain `web` plugin become its own web search
+	/// tool, the form it takes. The needs check has already kept out any other form.
+	fn anthropic_body(&self) -> Cow<'_, Map<String, Value>> {
+		if !self.online && !self.body.contains_key("plugins") {
+			return Cow::Borrowed(&self.body);
+		}
+		let mut body = self.body.clone();
+		if fits::take_plain_web_plugin(&mut body) || self.online {
+			let tools = body
+				.entry("tools")
+				.or_insert_with(|| Value::Array(Vec::new()));
+			if !tools.is_array() {
+				*tools = Value::Array(Vec::new());
+			}
+			if let Value::Array(tools) = tools
+				&& !tools.iter().any(|t| {
+					t["type"]
+						.as_str()
+						.is_some_and(|k| k.starts_with("web_search_"))
+				}) {
+				tools.push(json!({"type": anthropic::WEB_SEARCH, "name": "web_search"}));
+			}
+		}
+		Cow::Owned(body)
 	}
 
 	/// To an OpenAI-style provider: the provider's name for the model, usage asked for, and no
@@ -322,6 +477,7 @@ impl Inbound {
 		if !model.prompt_caching {
 			strip_cache_control(&mut body);
 		}
+		openai_web(&mut body, self.online, model);
 		if self.stream {
 			let options = body
 				.entry("stream_options")
@@ -335,6 +491,112 @@ impl Inbound {
 		}
 		serde_json::to_vec(&Value::Object(body)).unwrap_or_default()
 	}
+}
+
+/// Gives an OpenAI-style provider web search in the form it takes, for `:online` (and a plain `web`
+/// plugin, for a provider that has no plugins): OpenRouter's plugin, or OpenAI's field. A provider
+/// whose upstream name already says `:online` needs nothing added.
+fn openai_web(body: &mut Map<String, Value>, online: bool, model: &Model) {
+	if model.upstream.ends_with(":online") {
+		return;
+	}
+	match WebWay::of(&model.provider) {
+		WebWay::OpenRouter if online => {
+			let plugins = body
+				.entry("plugins")
+				.or_insert_with(|| Value::Array(Vec::new()));
+			if !plugins.is_array() {
+				*plugins = Value::Array(Vec::new());
+			}
+			if let Value::Array(plugins) = plugins
+				&& !plugins.iter().any(|p| p["id"] == "web")
+			{
+				plugins.push(json!({"id": "web"}));
+			}
+		}
+		WebWay::OpenAi | WebWay::Other => {
+			let converted =
+				WebWay::of(&model.provider) == WebWay::OpenAi && fits::take_plain_web_plugin(body);
+			if online || converted {
+				body.entry("web_search_options")
+					.or_insert_with(|| json!({}));
+			}
+		}
+		_ => {}
+	}
+}
+
+/// A conversation's name, as long as OpenRouter takes one.
+fn session_checked(session: String) -> Result<String, ApiError> {
+	if session.len() > health::LONGEST_SESSION {
+		return Err(ApiError::new(
+			Class::BadRequest,
+			format!(
+				"session_id is at most {} characters.",
+				health::LONGEST_SESSION
+			),
+		));
+	}
+	Ok(session)
+}
+
+/// What a name's suffixes asked for (`prefs.rs`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Suffixes {
+	floor: bool,
+	nitro: bool,
+	online: bool,
+}
+
+/// A name without OpenRouter's suffixes, and what they asked for. A name the catalogue has as it
+/// stands is left alone, which is how a model's own `:0` or `auto:floor` keeps its meaning, and a
+/// name that is unknown without its suffixes too is left for the caller to be told about whole.
+fn without_suffixes<'a>(catalogue: &Catalogue, name: &'a str) -> (&'a str, Suffixes) {
+	let known =
+		|n: &str| fits::is_auto(n) || catalogue.route(n).is_some() || catalogue.model(n).is_some();
+	let mut suffixes = Suffixes::default();
+	let mut base = name;
+	while !known(base) {
+		let Some((rest, suffix)) = base.rsplit_once(':') else {
+			return (name, Suffixes::default());
+		};
+		match suffix {
+			"online" if !suffixes.online => suffixes.online = true,
+			"floor" if !suffixes.floor => suffixes.floor = true,
+			"nitro" if !suffixes.nitro => suffixes.nitro = true,
+			_ => return (name, Suffixes::default()),
+		}
+		base = rest;
+	}
+	(base, suffixes)
+}
+
+/// Why `provider.require_parameters` leaves `model` out: the translation for it would refuse
+/// something the request sends, or it cannot be shown to take what the request needs.
+fn parameters_refused(
+	inbound: &Inbound,
+	model: &Model,
+	operation: Operation,
+	needs: &Needs,
+) -> Option<String> {
+	if let Err(error) = inbound.upstream(model, operation) {
+		return Some(error.message);
+	}
+	if model.fits.is_none() {
+		let wanted = [
+			(needs.tools, "tools"),
+			(needs.images, "images"),
+			(needs.json_schema, "a JSON schema"),
+		]
+		.into_iter()
+		.find_map(|(asked, what)| asked.then_some(what));
+		if let Some(what) = wanted {
+			return Some(format!(
+				"provider.require_parameters is set and it does not say it takes {what}"
+			));
+		}
+	}
+	needs.rules_out(model)
 }
 
 /// The most a reply can be, in tokens: what is sent as its cap (Anthropic always gets one, Bedrock
@@ -352,7 +614,7 @@ fn output_cap(inbound: &Inbound, upstream: &[u8], model: &Model) -> u64 {
 				}),
 		};
 	sent.or_else(|| {
-		["max_completion_tokens", "max_tokens"]
+		["max_completion_tokens", "max_tokens", "max_output_tokens"]
 			.iter()
 			.find_map(|f| inbound.body.get(*f).and_then(Value::as_u64))
 	})
@@ -361,8 +623,8 @@ fn output_cap(inbound: &Inbound, upstream: &[u8], model: &Model) -> u64 {
 }
 
 /// A call's worst-case cost: every prompt token at the dearer of the plain and cache-write prices,
-/// and `output` reply tokens.
-fn worst(price: &Price, prompt: u64, output: u64) -> u64 {
+/// `output` reply tokens and `searches` web searches.
+fn worst(price: &Price, prompt: u64, output: u64, searches: u64) -> u64 {
 	let at = |write: bool| {
 		price.cost(&Usage {
 			prompt_tokens: prompt,
@@ -371,13 +633,19 @@ fn worst(price: &Price, prompt: u64, output: u64) -> u64 {
 			..Usage::default()
 		})
 	};
-	at(false).max(at(true))
+	at(false)
+		.max(at(true))
+		.saturating_add(price.searches(searches))
 }
 
 /// Where a reply cap goes in what the caller sent, so each translation carries it on: OpenAI's own
 /// API (and Azure's) refuse `max_tokens` for reasoning models and take `max_completion_tokens`;
 /// the legacy completions API and the other OpenAI-style servers take `max_tokens`.
 fn cap_field(provider: &Provider, operation: Operation) -> &'static str {
+	// `responses.rs` turns it into the provider's own on the way out.
+	if operation == Operation::Responses {
+		return "max_output_tokens";
+	}
 	let host = provider.base_url.host_str().unwrap_or("");
 	let openai = host == "api.openai.com" || host.ends_with(".openai.azure.com");
 	if provider.kind == Kind::Openai && operation == Operation::Chat && openai {
@@ -415,21 +683,27 @@ fn warn(mut response: Response, warned: Option<HeaderValue>) -> Response {
 	response
 }
 
-/// Removes every `cache_control` breakpoint from a chat request: on a message, on a content part,
-/// on a tool (a model that does not cache can answer a request that carries one with an error,
-/// whatever the gateway's settings say).
+/// Removes every `cache_control` breakpoint from a request: on a message, on a content part, inside
+/// a tool result, on a tool, on a system block or on the request as a whole (a model that does not
+/// cache can answer a request that carries one with an error, whatever the gateway's settings say).
 fn strip_cache_control(body: &mut Map<String, Value>) {
-	for list in ["messages", "tools"] {
+	body.remove("cache_control");
+	for list in ["messages", "tools", "system"] {
 		let Some(Value::Array(items)) = body.get_mut(list) else {
 			continue;
 		};
 		for item in items.iter_mut().filter_map(Value::as_object_mut) {
-			item.remove("cache_control");
-			if let Some(Value::Array(parts)) = item.get_mut("content") {
-				for part in parts.iter_mut().filter_map(Value::as_object_mut) {
-					part.remove("cache_control");
-				}
-			}
+			strip_cache_control_of(item);
+		}
+	}
+}
+
+/// Removes `cache_control` from one item and whatever content it holds.
+fn strip_cache_control_of(item: &mut Map<String, Value>) {
+	item.remove("cache_control");
+	if let Some(Value::Array(parts)) = item.get_mut("content") {
+		for part in parts.iter_mut().filter_map(Value::as_object_mut) {
+			strip_cache_control_of(part);
 		}
 	}
 }
@@ -438,6 +712,9 @@ pub fn router(proxy: Arc<Proxy>) -> Router {
 	let api = Router::new()
 		.route("/chat/completions", post(chat))
 		.route("/completions", post(completions))
+		.route("/messages", post(messages))
+		.route("/messages/count_tokens", post(count_tokens))
+		.route("/responses", post(responses))
 		.route("/embeddings", post(embed))
 		.route("/models", get(models))
 		.route("/admin/keys", get(list_keys).post(create_key))
@@ -519,6 +796,66 @@ async fn embed(
 	}
 }
 
+async fn messages(
+	State(proxy): State<Arc<Proxy>>,
+	headers: HeaderMap,
+	body: Result<Bytes, BytesRejection>,
+) -> Response {
+	match proxy.forward(&headers, body, Operation::Messages).await {
+		Ok(response) => response,
+		Err(error) => messages::error_response(error),
+	}
+}
+
+async fn responses(
+	State(proxy): State<Arc<Proxy>>,
+	headers: HeaderMap,
+	body: Result<Bytes, BytesRejection>,
+) -> Response {
+	match proxy.forward(&headers, body, Operation::Responses).await {
+		Ok(response) => response,
+		Err(error) => error.into_response(),
+	}
+}
+
+/// Claude Code's `count_tokens`: the same estimate the needs check makes (`fits::estimated_tokens`),
+/// a third of the request's bytes, not a provider's count. Nothing is sent to a provider, so it
+/// costs nothing and names no target.
+async fn count_tokens(
+	State(proxy): State<Arc<Proxy>>,
+	headers: HeaderMap,
+	body: Result<Bytes, BytesRejection>,
+) -> Response {
+	let counted = proxy.authorize(&headers).and_then(|_| {
+		let body = read_body(body)?;
+		Inbound::parse(&body)?;
+		Ok(json!({"input_tokens": fits::estimated_tokens(budgets::prompt_bound(&body))}))
+	});
+	match counted {
+		Ok(count) => axum::Json(count).into_response(),
+		Err(error) => messages::error_response(error),
+	}
+}
+
+/// A request's bytes, or why they could not be read.
+fn read_body(body: Result<Bytes, BytesRejection>) -> Result<Bytes, ApiError> {
+	body.map_err(|rejection| {
+		let mut error = ApiError::new(
+			Class::BadRequest,
+			format!("The request could not be read: {}", rejection.body_text()),
+		);
+		error.status = Some(rejection.status());
+		error
+	})
+}
+
+/// One entry of the model list, which both API shapes read: OpenAI's fields, and Anthropic's `type`,
+/// `display_name` and `created_at`, for a client written for either.
+fn listed(id: &str, owned_by: &str) -> Value {
+	json!({"id": id, "object": "model", "created": 0, "owned_by": owned_by,
+		"type": "model", "display_name": id, "created_at": "1970-01-01T00:00:00Z"})
+}
+
 async fn models(State(proxy): State<Arc<Proxy>>, headers: HeaderMap) -> Response {
 	let caller = match proxy.authorize(&headers) {
 		Ok(caller) => caller,
@@ -533,8 +870,15 @@ async fn models(State(proxy): State<Arc<Proxy>>, headers: HeaderMap) -> Response
 		.map(|m| {
 			// The price each model is charged at, as the admin API writes it (dollars per million
 			// tokens), so a picker can say what a model costs; null when nothing prices it.
-			json!({"id": m.name, "object": "model", "created": 0, "owned_by": m.provider.name,
-				"pricing": m.price.map(|p| p.to_json())})
+			let mut model = listed(&m.name, &m.provider.name);
+			model["pricing"] = json!(m.price.map(|p| p.to_json()));
+			if let Some(context) = m.fits.and_then(|f| f.context) {
+				model["max_input_tokens"] = json!(context);
+			}
+			if let Some(output) = m.max_output_tokens {
+				model["max_tokens"] = json!(output);
+			}
+			model
 		})
 		.collect();
 	// A route, with the models it tries that this caller may use; one with none is not listed.
@@ -546,8 +890,9 @@ async fn models(State(proxy): State<Arc<Proxy>>, headers: HeaderMap) -> Response
 			.map(|m| m.name.clone())
 			.collect();
 		if caller.may_use(&route.name) && !targets.is_empty() {
-			data.push(json!({"id": route.name, "object": "model", "created": 0,
-				"owned_by": "route", "targets": targets}));
+			let mut model = listed(&route.name, "route");
+			model["targets"] = json!(targets);
+			data.push(model);
 		}
 	}
 	// Automatic choice, once a model this caller may use says what it can take; a project's own
@@ -561,12 +906,18 @@ async fn models(State(proxy): State<Arc<Proxy>>, headers: HeaderMap) -> Response
 	if !pool.is_empty() {
 		for name in [fits::AUTO, fits::AUTO_FLOOR, fits::AUTO_NITRO] {
 			if caller.may_use(name) && (name != fits::AUTO || catalogue.route(name).is_none()) {
-				data.push(json!({"id": name, "object": "model", "created": 0,
-					"owned_by": "auto", "targets": pool}));
+				let mut model = listed(name, "auto");
+				model["targets"] = json!(pool);
+				data.push(model);
 			}
 		}
 	}
-	axum::Json(json!({"object": "list", "data": data})).into_response()
+	// Anthropic's list says where it ends; this one is whole.
+	let edge = |at: Option<&Value>| at.map_or(Value::Null, |m| m["id"].clone());
+	let (first, last) = (edge(data.first()), edge(data.last()));
+	axum::Json(json!({"object": "list", "data": data, "has_more": false,
+		"first_id": first, "last_id": last}))
+	.into_response()
 }
 
 fn now() -> u64 {
@@ -975,7 +1326,7 @@ async fn set_model(
 			ApiError::new(
 				Class::BadRequest,
 				format!(
-					"A model is made from provider, upstream, prompt_caching, max_output_tokens, reasoning, embeddings, price and enabled: {e}"
+					"A model is made from provider, upstream, prompt_caching, max_output_tokens, reasoning, embeddings, price, fits, internet (none, provider or web), quota and enabled: {e}"
 				),
 			)
 		})?;
@@ -1188,7 +1539,7 @@ async fn set_route(
 			ApiError::new(
 				Class::BadRequest,
 				format!(
-					"A route is made from targets (the models, in order) and sort (order, price, latency or throughput): {e}"
+					"A route is made from targets (the models, in order), sort (order, price, latency, throughput, weighted or balanced), weights and constraints: {e}"
 				),
 			)
 		})?;
@@ -1276,7 +1627,7 @@ async fn set_credential(
 					format!("{} serves no model, so the credential cannot be checked.", provider.name),
 				)
 			})?;
-			credentials::prove(&proxy.http, provider, model, &stored)
+			credentials::prove(proxy.client_for(model)?, provider, model, &stored)
 				.await
 				.map_err(|m| ApiError::new(Class::BadRequest, m))?;
 		}
@@ -2073,6 +2424,7 @@ impl Proxy {
 		model: &Model,
 		prompt_bound: Option<u64>,
 		output: u64,
+		searches: u64,
 	) -> Result<Option<Reservation>, ApiError> {
 		let (Some(budgets), Some(prompt)) = (&self.budgets, prompt_bound) else {
 			return Ok(None);
@@ -2086,7 +2438,7 @@ impl Proxy {
 				),
 			));
 		};
-		let amount = worst(&price, prompt, output);
+		let amount = worst(&price, prompt, output, searches);
 		budgets
 			.reserve(who, amount, SystemTime::now())
 			.map(Some)
@@ -2102,8 +2454,9 @@ impl Proxy {
 		inbound: &Inbound,
 		model: &Model,
 		prompt_bound: Option<u64>,
+		searches: u64,
 	) -> Option<u64> {
-		let named = ["max_tokens", "max_completion_tokens"]
+		let named = ["max_tokens", "max_completion_tokens", "max_output_tokens"]
 			.iter()
 			.any(|f| inbound.body.get(*f).is_some_and(|v| !v.is_null()));
 		if named || model.max_output_tokens.is_some() {
@@ -2111,8 +2464,8 @@ impl Proxy {
 		}
 		let room = self.budgets.as_ref()?.room(who, SystemTime::now())?;
 		let (price, prompt) = (model.price?, prompt_bound?);
-		let base = worst(&price, prompt, 0);
-		let per_token = worst(&price, prompt, 1).saturating_sub(base);
+		let base = worst(&price, prompt, 0, searches);
+		let per_token = worst(&price, prompt, 1, searches).saturating_sub(base);
 		let fits = room
 			.saturating_sub(base)
 			.checked_div(per_token)
@@ -2120,8 +2473,8 @@ impl Proxy {
 		Some(fits.clamp(budgets::MIN_SENT_OUTPUT, budgets::UNCAPPED_OUTPUT))
 	}
 
-	/// The caller, from `Authorization: Bearer` or the `apikey` header (the front door sends both):
-	/// a Psyche key, the project's service key, or a signed-in user's token, which is taken only
+	/// The caller, from `Authorization: Bearer`, the `apikey` header (the front door sends both) or
+	/// `x-api-key`, where a client written for Anthropic sends it: a Psyche key, the project's service key, or a signed-in user's token, which is taken only
 	/// once the project has budgets that hold every user (PS10b). The anon key alone is not a
 	/// caller.
 	fn authorize(&self, headers: &HeaderMap) -> Result<Caller, ApiError> {
@@ -2134,6 +2487,7 @@ impl Proxy {
 			});
 		let token = bearer
 			.or_else(|| headers.get("apikey").and_then(|v| v.to_str().ok()))
+			.or_else(|| headers.get("x-api-key").and_then(|v| v.to_str().ok()))
 			.map(str::trim)
 			.filter(|t| !t.is_empty())
 			.ok_or_else(|| {
@@ -2207,23 +2561,47 @@ impl Proxy {
 	) -> Result<Response, ApiError> {
 		let caller = self.authorize(headers)?;
 		let who = caller.who(self.keys.as_ref().map(|k| &k.members));
-		let body = body.map_err(|rejection| {
-			let mut error = ApiError::new(
-				Class::BadRequest,
-				format!("The request could not be read: {}", rejection.body_text()),
-			);
-			error.status = Some(rejection.status());
-			error
-		})?;
-		let inbound = Inbound::parse(&body)?;
+		let body = read_body(body)?;
+		let mut inbound = Inbound::parse(&body)?;
+		if operation == Operation::Messages {
+			messages::check(&inbound.body)?;
+			let text = |name: &str| {
+				headers
+					.get(name)
+					.and_then(|v| v.to_str().ok())
+					.map(String::from)
+			};
+			inbound.beta = text("anthropic-beta");
+			inbound.version = text("anthropic-version");
+		}
+		if operation == Operation::Responses {
+			responses::check(&inbound.body)?;
+		}
+		let session = match (&inbound.session, headers.get("x-session-id")) {
+			(Some(session), _) => Some(session.clone()),
+			(None, Some(header)) => Some(session_checked(
+				header
+					.to_str()
+					.map_err(|_| ApiError::new(Class::BadRequest, "x-session-id is plain text."))?
+					.to_string(),
+			)?),
+			(None, None) => None,
+		};
 		let catalogue = self.catalogue.get();
 		let mut targets: Vec<Arc<Model>> = Vec::new();
+		// Which of the names sent each target came from.
+		let mut groups: HashMap<String, usize> = HashMap::new();
 		let mut route = None;
 		let mut sort = None;
-		for (i, named) in std::iter::once(&inbound.model)
+		let mut weights: Option<HashMap<String, u32>> = None;
+		let mut constraints: Option<fits::Constraints> = None;
+		let written: Vec<String> = std::iter::once(&inbound.model)
 			.chain(&inbound.fallbacks)
-			.enumerate()
-		{
+			.cloned()
+			.collect();
+		for (i, written) in written.iter().enumerate() {
+			let (named, suffixes) = without_suffixes(&catalogue, written);
+			inbound.online |= suffixes.online;
 			if !caller.may_use(named) {
 				return Err(ApiError::new(
 					Class::Forbidden,
@@ -2250,7 +2628,7 @@ impl Proxy {
 							.cloned()
 							.collect(),
 					};
-					let order = match named.as_str() {
+					let order = match named {
 						fits::AUTO_FLOOR => Sort::Price,
 						fits::AUTO_NITRO => Sort::Throughput,
 						_ => own.map_or(Sort::Price, |r| r.sort),
@@ -2267,8 +2645,10 @@ impl Proxy {
 						));
 					}
 					if i == 0 {
-						route = Some(named.clone());
+						route = Some(named.to_string());
 						sort = Some(order);
+						weights = own.map(|r| r.weights.clone());
+						constraints = own.and_then(|r| r.constraints.clone());
 					}
 					pool
 				}
@@ -2276,6 +2656,8 @@ impl Proxy {
 					if i == 0 {
 						route = Some(r.name.clone());
 						sort = Some(r.sort);
+						weights = Some(r.weights.clone());
+						constraints = r.constraints.clone();
 					}
 					catalogue.targets(r)
 				}
@@ -2289,7 +2671,13 @@ impl Proxy {
 					));
 				}
 			};
+			if i == 0 && suffixes.floor {
+				sort = Some(Sort::Price);
+			} else if i == 0 && suffixes.nitro {
+				sort = Some(Sort::Throughput);
+			}
 			for model in models {
+				groups.entry(model.name.clone()).or_insert(i);
 				if !targets.iter().any(|t| t.name == model.name) {
 					targets.push(model);
 				}
@@ -2298,51 +2686,152 @@ impl Proxy {
 		if !inbound.fallbacks.is_empty() && route.is_none() {
 			route = Some("models".to_string());
 		}
+		let inbound = inbound;
+		let prefs = inbound.prefs.as_ref();
 		let open: Vec<Arc<Model>> = targets
 			.into_iter()
 			.filter(|m| self.granted(&m.name, &who))
 			.collect();
-		// A route, `auto` or a fallback list leaves out every model whose own facts say it cannot take
-		// this request, before anything is sent (`fits.rs`); a model named alone is the caller's
-		// choice and goes as it is.
+		// Before anything is sent, every model that may not or cannot take this request is left out
+		// (`fits.rs`). A route, `auto` or a fallback list holds a model to its own facts as well; a
+		// model named alone is the caller's choice, and is held only to its internet level and to
+		// what the caller's own controls ask.
 		let mut left_out: Vec<(String, String)> = Vec::new();
-		let open: Vec<Arc<Model>> = if route.is_some() && !open.is_empty() {
-			let needs = Needs::of(&inbound.body, budgets::prompt_bound(&body));
-			let mut fit = Vec::new();
+		// Whether only the caller's controls left anything out, which is a 404 as OpenRouter's is.
+		let mut only_controls = true;
+		let open: Vec<Arc<Model>> = if open.is_empty() {
+			open
+		} else {
+			let web = fits::Web::of(&inbound.body, inbound.online);
+			let web = if operation == Operation::Responses {
+				web.offered_search_is_no_need()
+			} else {
+				web
+			};
+			let alone = route.is_none();
+			let needs = (!alone || prefs.is_some())
+				.then(|| Needs::of(&inbound.body, budgets::prompt_bound(&body), web.clone()));
+			let prompt = needs.as_ref().map_or(0, |n| n.prompt);
+			let mut fit = Vec::with_capacity(open.len());
 			for model in open {
-				match needs.rules_out(&model) {
-					Some(why) => left_out.push((model.name.clone(), why)),
+				let mut why = self.sandbox_refused(&model).await;
+				if why.is_none() {
+					why = match &needs {
+						Some(needs) if !alone => needs.rules_out(&model),
+						_ => web.refused(&model),
+					};
+				}
+				if why.is_none() {
+					why = constraints
+						.as_ref()
+						.and_then(|c| c.rules_out(&model, prompt));
+				}
+				// Among several, a target whose translation would refuse this request is left out, so
+				// a document or a server tool's blocks in the history still reach one that can take
+				// them.
+				let translated = match operation {
+					Operation::Messages => model.provider.kind != Kind::Anthropic,
+					Operation::Responses => true,
+					_ => false,
+				};
+				if why.is_none() && translated && !alone {
+					why = inbound.upstream(&model, operation).err().map(|e| e.message);
+				}
+				let before_controls = why.is_some();
+				if why.is_none()
+					&& let Some(prefs) = prefs
+				{
+					why = prefs.rules_out(&model, prompt);
+					if why.is_none()
+						&& prefs.require_parameters()
+						&& let Some(needs) = &needs
+					{
+						why = parameters_refused(&inbound, &model, operation, needs);
+					}
+				}
+				match why {
+					Some(why) => {
+						only_controls &= !before_controls;
+						left_out.push((model.name.clone(), why));
+					}
 					None => fit.push(model),
 				}
 			}
 			if fit.is_empty() {
+				let reasons = left_out
+					.iter()
+					.map(|(name, why)| format!("{name} {why}"))
+					.collect::<Vec<_>>()
+					.join("; ");
 				return Err(ApiError::new(
-					Class::BadRequest,
-					format!(
-						"None of the models {} stands for can take this request: {}.",
-						inbound.model,
-						left_out
-							.iter()
-							.map(|(name, why)| format!("{name} {why}"))
-							.collect::<Vec<_>>()
-							.join("; ")
-					),
+					if only_controls {
+						Class::ModelNotFound
+					} else {
+						Class::BadRequest
+					},
+					match (&route, left_out.first()) {
+						(None, Some((name, why))) => {
+							format!("{name} cannot take this request: {why}.")
+						}
+						_ => format!(
+							"None of the models {} stands for can take this request: {reasons}.",
+							inbound.model
+						),
+					},
 				));
 			}
 			fit
-		} else {
-			open
 		};
-		// A target cooling down goes after the others, and a route sorted by speed is sorted here.
-		let open = self.health.order(open, sort, SystemTime::now());
+		// The caller's `order` goes first and turns off the route's balancing and stickiness; its
+		// `sort`, like a suffix, replaces the route's.
+		let by_order = prefs.is_some_and(Prefs::has_order);
+		let mut open = open;
+		if let Some(prefs) = prefs.filter(|p| p.has_order()) {
+			open.sort_by_key(|m| prefs.rank(m).unwrap_or(usize::MAX));
+		}
+		let sort = prefs.and_then(Prefs::sort).or(sort);
+		let sticky = (!by_order && open.len() > 1 && open.iter().any(|m| m.cache_pays()))
+			.then(|| health::conversation(&inbound.body, &inbound.model, session.as_deref()))
+			.flatten();
+		let within_names =
+			!inbound.fallbacks.is_empty() && !prefs.is_some_and(Prefs::sorted_as_one);
+		let plan = health::Plan {
+			sort: if by_order { Some(Sort::Order) } else { sort },
+			weights: weights.as_ref().filter(|_| !by_order),
+			groups: within_names.then_some(&groups),
+			sticky: sticky.map(|(key, _)| key),
+			// An explicit `order` is the caller's own choice, and a preference does not move it.
+			preferred: prefs.filter(|_| !by_order).and_then(Prefs::preferred),
+		};
+		// A target cooling down or out of quota goes after the others, a route draws or sorts its
+		// order here, and a conversation goes back to its own cache.
+		let health::Arranged {
+			targets: mut open,
+			stuck,
+			behind,
+		} = self.health.arrange(open, &plan, SystemTime::now());
+		// No fallbacks and no `order`: the first target of each name sent, and no other.
+		if prefs.is_some_and(|p| !p.allow_fallbacks() && !p.has_order()) {
+			let mut seen = HashSet::new();
+			open.retain(|m| {
+				seen.insert(
+					plan.groups
+						.and_then(|g| g.get(&m.name).copied())
+						.unwrap_or(0),
+				)
+			});
+		}
 		// What the log says about the order, for anything but a model named alone.
 		let routing = route.as_ref().map(|_| {
 			let mut text = format!(
 				"{}: {}",
 				match sort {
+					_ if by_order => "in the caller's provider.order",
 					Some(Sort::Price) => "cheapest first",
 					Some(Sort::Latency) => "fastest first byte first",
 					Some(Sort::Throughput) => "most tokens a second first",
+					Some(Sort::Weighted) => "drawn by weight, health and room",
+					Some(Sort::Balanced) => "drawn by price, health, speed and room",
 					Some(Sort::Order) | None => "in the order written",
 				},
 				open.iter()
@@ -2350,6 +2839,15 @@ impl Proxy {
 					.collect::<Vec<_>>()
 					.join(", ")
 			);
+			if let Some(name) = &stuck {
+				text.push_str(&format!("; stayed on {name} for its cache"));
+			}
+			if !behind.is_empty() {
+				text.push_str(&format!(
+					"; behind the rest for provider.preferred_*: {}",
+					behind.join(", ")
+				));
+			}
 			if !left_out.is_empty() {
 				text.push_str("; left out ");
 				text.push_str(
@@ -2384,43 +2882,99 @@ impl Proxy {
 			prompt_bound: (budgeted || limited).then(|| budgets::prompt_bound(&body)),
 			route,
 			routing,
+			sticky,
 			taken: Arc::default(),
 			rate: std::sync::Mutex::default(),
 		};
+		let started = Instant::now();
 		let mut number = 0u16;
 		let mut last = None;
-		for (i, model) in open.iter().enumerate() {
-			let mut tries = 0;
-			loop {
-				number += 1;
-				tries += 1;
-				let result = self
-					.attempt(
-						inbound.clone(),
-						operation,
-						model.clone(),
-						who,
-						&shared,
-						number,
-					)
-					.await;
-				let error = match result {
-					Ok(out) => return Ok(shared.finish(out)),
-					Err(error) => error,
-				};
-				if let Some(wait) = again(&error, tries) {
-					tokio::time::sleep(wait).await;
-					continue;
-				}
-				if error.class.falls_over() && i + 1 < open.len() {
+		let mut round = open;
+		for pass in 0..PASSES {
+			let mut again_later: Vec<Arc<Model>> = Vec::new();
+			for (i, model) in round.iter().enumerate() {
+				let mut tries = 0;
+				loop {
+					number += 1;
+					tries += 1;
+					let result = self
+						.attempt(
+							inbound.clone(),
+							operation,
+							model.clone(),
+							who,
+							&shared,
+							number,
+						)
+						.await;
+					let error = match result {
+						Ok(out) => return Ok(shared.finish(out)),
+						Err(error) => error,
+					};
+					if let Some(wait) = again(&error, tries) {
+						tokio::time::sleep(wait).await;
+						continue;
+					}
+					if !error.class.falls_over() {
+						return Err(error);
+					}
+					if worth_another_pass(&error) {
+						again_later.push(model.clone());
+					}
+					let last_of_round = i + 1 == round.len();
+					// A route goes round again while time remains, and only if every target it has
+					// is one that a moment may fix; a single model is the caller's and is told at once.
+					let another = last_of_round
+						&& pass + 1 < PASSES
+						&& shared.route.is_some()
+						&& !again_later.is_empty()
+						&& started.elapsed() < self.timeouts.total / 2;
+					if last_of_round && !another {
+						return Err(error);
+					}
 					tracing::info!(target: "psyche::route", model = %model.name, class = error.class.code(), "falling over to the next target");
 					last = Some(error);
 					break;
 				}
-				return Err(error);
 			}
+			tokio::time::sleep(jitter()).await;
+			round = again_later;
 		}
 		Err(last.unwrap_or_else(|| ApiError::new(Class::Upstream, "No model answered.")))
+	}
+
+	/// The client a call of this model goes through.
+	fn client_for(&self, model: &Model) -> Result<&reqwest::Client, ApiError> {
+		if model.internet != Internet::None {
+			return Ok(&self.http);
+		}
+		self.sandbox.as_ref().ok_or_else(|| {
+			ApiError::new(
+				Class::EgressRefused,
+				format!(
+					"{} has the internet level none, and this Psyche only sends to public addresses.",
+					model.name
+				),
+			)
+		})
+	}
+
+	/// Why a model at the internet level `none` may not be sent this call; `None` for any other
+	/// model. A hosted provider is public by what it is; for any other the address is read, and a
+	/// name resolved, here so the caller hears before anything is sent. `net::sandbox_client` holds
+	/// it at the connection, whatever the answer was here.
+	async fn sandbox_refused(&self, model: &Model) -> Option<String> {
+		if model.internet != Internet::None {
+			return None;
+		}
+		let provider = &model.provider;
+		let why = match provider.kind {
+			Kind::Openai => net::sandbox_refused(&provider.base_url, self.egress).await?,
+			Kind::Anthropic | Kind::Bedrock => {
+				format!("{} is a public service", provider.kind.as_str())
+			}
+		};
+		Some(format!("its internet level is none, and {why}"))
 	}
 
 	/// The rate limits a call takes, once whichever attempt gets there first; refused, the call is.
@@ -2490,7 +3044,7 @@ impl Proxy {
 				}
 				Kind::Bedrock => {
 					let reservation =
-						self.reserve(&who, &model, prompt_bound.filter(|_| budgeted), 0)?;
+						self.reserve(&who, &model, prompt_bound.filter(|_| budgeted), 0, 0)?;
 					self.take_once(&who, prompt_bound.filter(|_| limited), 0, shared)?;
 					let warned = warned(&reservation);
 					let out = self
@@ -2502,7 +3056,14 @@ impl Proxy {
 		}
 		// Under a hard budget a reply is never left uncapped: the provider is told the most it may
 		// write, which is what is reserved.
-		if budgeted && let Some(cap) = self.sent_cap(&who, &inbound, &model, prompt_bound) {
+		// Likewise its web searches: what a search tool can spend is bounded before it is reserved.
+		let searches = if budgeted {
+			inbound.bound_searches(&model)
+		} else {
+			0
+		};
+		if budgeted && let Some(cap) = self.sent_cap(&who, &inbound, &model, prompt_bound, searches)
+		{
 			inbound
 				.body
 				.insert(cap_field(provider, operation).into(), cap.into());
@@ -2513,7 +3074,13 @@ impl Proxy {
 			_ if prompt_bound.is_some() => output_cap(&inbound, &body, &model),
 			_ => 0,
 		};
-		let reservation = self.reserve(&who, &model, prompt_bound.filter(|_| budgeted), output)?;
+		let reservation = self.reserve(
+			&who,
+			&model,
+			prompt_bound.filter(|_| budgeted),
+			output,
+			searches,
+		)?;
 		self.take_once(&who, prompt_bound.filter(|_| limited), output, shared)?;
 		let warned = warned(&reservation);
 		let (path, accept) = match provider.kind {
@@ -2543,13 +3110,19 @@ impl Proxy {
 
 		let started = Instant::now();
 		let mut request = self
-			.http
+			.client_for(&model)?
 			.post(url.clone())
 			.header(header::CONTENT_TYPE, "application/json");
 		request = provider.authorize(request, &url, &body, now());
 		request = request.body(body);
 		if provider.kind == Kind::Anthropic {
-			request = request.header("anthropic-version", anthropic::VERSION);
+			request = request.header(
+				"anthropic-version",
+				inbound.version.as_deref().unwrap_or(anthropic::VERSION),
+			);
+			if let Some(beta) = &inbound.beta {
+				request = request.header("anthropic-beta", beta);
+			}
 		}
 		if inbound.stream {
 			request = request.header(header::ACCEPT, accept);
@@ -2581,6 +3154,7 @@ impl Proxy {
 			health: self.health.clone(),
 			retry_after: None,
 			remaining: Remaining::default(),
+			sticky: shared.sticky.filter(|_| model.cache_pays()),
 		};
 		self.health.begin(&model, SystemTime::now());
 		let response = match tokio::time::timeout(self.timeouts.first_byte, request.send()).await {
@@ -2611,9 +3185,10 @@ impl Proxy {
 		// is charged its whole reservation.
 		record.billable = true;
 		let out = if inbound.stream {
-			self.stream(response, &model, inbound.wants_usage, record)
+			self.stream(response, &model, &inbound, operation, record)
 		} else {
-			self.whole(response, &model, record).await?
+			self.whole(response, &model, &inbound, operation, record)
+				.await?
 		};
 		Ok(warn(labelled(out, &model), warned))
 	}
@@ -2679,6 +3254,7 @@ impl Proxy {
 			health: self.health.clone(),
 			retry_after: None,
 			remaining: Remaining::default(),
+			sticky: None,
 		};
 		self.health.begin(model, SystemTime::now());
 		let calls = request
@@ -2769,7 +3345,7 @@ impl Proxy {
 		let body = serde_json::to_vec(&body).unwrap_or_default();
 		let started = Instant::now();
 		let request = self
-			.http
+			.client_for(model)?
 			.post(url.clone())
 			.header(header::CONTENT_TYPE, "application/json");
 		let request = provider.authorize(request, url, &body, now()).body(body);
@@ -2827,6 +3403,8 @@ impl Proxy {
 		&self,
 		response: reqwest::Response,
 		model: &Model,
+		inbound: &Inbound,
+		operation: Operation,
 		mut record: Record,
 	) -> Result<Response, ApiError> {
 		let provider = record.call.provider.clone();
@@ -2861,6 +3439,89 @@ impl Proxy {
 				.from_provider(&provider),
 			));
 		};
+		if operation == Operation::Messages {
+			let reply = match model.provider.kind {
+				Kind::Anthropic => {
+					record.call.usage = value.get("usage").and_then(Usage::from_anthropic);
+					let mut value = value;
+					rename(&mut value, &model.name);
+					Ok(value)
+				}
+				Kind::Openai => {
+					record.call.usage = Usage::from_openai(&value);
+					messages::reply(&value, record.call.usage, &model.name)
+				}
+				Kind::Bedrock => {
+					record.call.usage = value.get("usage").and_then(Usage::from_bedrock);
+					bedrock::reply(&value, &model.name, &bedrock::new_id(), now())
+						.and_then(|chat| messages::reply(&chat, record.call.usage, &model.name))
+				}
+			};
+			let reply = match reply {
+				Ok(reply) => reply,
+				Err(why) => {
+					record.call.usage = None;
+					return Err(record.fail(
+						ApiError::new(
+							Class::Upstream,
+							format!(
+								"{provider} answered with something that is not its API: {why}."
+							),
+						)
+						.from_provider(&provider),
+					));
+				}
+			};
+			record.finish(Outcome::Completed);
+			return Ok((
+				StatusCode::OK,
+				[(header::CONTENT_TYPE, "application/json")],
+				serde_json::to_vec(&reply).unwrap_or_default(),
+			)
+				.into_response());
+		}
+		if operation == Operation::Responses {
+			let chat = match model.provider.kind {
+				Kind::Openai => {
+					record.call.usage = Usage::from_openai(&value);
+					Ok(value)
+				}
+				Kind::Anthropic => {
+					record.call.usage = value.get("usage").and_then(Usage::from_anthropic);
+					anthropic::reply(&value, &model.name, now())
+				}
+				Kind::Bedrock => {
+					record.call.usage = value.get("usage").and_then(Usage::from_bedrock);
+					bedrock::reply(&value, &model.name, &bedrock::new_id(), now())
+				}
+			};
+			let custom = responses::custom_tools(&inbound.body);
+			let reply = chat.and_then(|chat| {
+				responses::reply(&chat, record.call.usage, &model.name, &custom, now())
+			});
+			let reply = match reply {
+				Ok(reply) => reply,
+				Err(why) => {
+					record.call.usage = None;
+					return Err(record.fail(
+						ApiError::new(
+							Class::Upstream,
+							format!(
+								"{provider} answered with something that is not its API: {why}."
+							),
+						)
+						.from_provider(&provider),
+					));
+				}
+			};
+			record.finish(Outcome::Completed);
+			return Ok((
+				StatusCode::OK,
+				[(header::CONTENT_TYPE, "application/json")],
+				serde_json::to_vec(&reply).unwrap_or_default(),
+			)
+				.into_response());
+		}
 		let body = match model.provider.kind {
 			Kind::Openai => {
 				record.call.usage = Usage::from_openai(&value);
@@ -2909,22 +3570,49 @@ impl Proxy {
 		&self,
 		response: reqwest::Response,
 		model: &Model,
-		wants_usage: bool,
+		inbound: &Inbound,
+		operation: Operation,
 		record: Record,
 	) -> Response {
+		let wants_usage = inbound.wants_usage;
+		let inbound_messages = operation == Operation::Messages;
+		// Written in another shape, so it needs the usage whether or not the caller asked.
+		let written = inbound_messages || operation == Operation::Responses;
+		let messages = match operation {
+			Operation::Messages => Some(match model.provider.kind {
+				Kind::Anthropic => MessagesStream::Pass(anthropic::Meter::default()),
+				kind => {
+					let mut events = messages::Events::new(&model.name);
+					if kind == Kind::Bedrock {
+						events.signed();
+					}
+					MessagesStream::Translate(Box::new(events))
+				}
+			}),
+			Operation::Responses => Some(MessagesStream::Translate(Box::new(
+				responses::Events::new(&model.name, responses::custom_tools(&inbound.body), now()),
+			))),
+			_ => None,
+		};
 		let state = Streaming {
 			upstream: Box::pin(response.bytes_stream()),
 			parser: Parser::new(),
 			translate: match model.provider.kind {
 				Kind::Openai => None,
-				Kind::Anthropic => Some(Translator::anthropic(wants_usage, &model.name, now())),
+				Kind::Anthropic if inbound_messages => None,
+				Kind::Anthropic => Some(Translator::anthropic(
+					wants_usage || written,
+					&model.name,
+					now(),
+				)),
 				Kind::Bedrock => Some(Translator::bedrock(
-					wants_usage,
+					wants_usage || written,
 					&model.name,
 					&bedrock::new_id(),
 					now(),
 				)),
 			},
+			messages,
 			wants_usage,
 			idle: self.timeouts.idle,
 			secrets: self
@@ -3120,6 +3808,8 @@ struct Shared {
 	prompt_bound: Option<u64>,
 	route: Option<String>,
 	routing: Option<String>,
+	/// The conversation, and whether the caller named it (`health::conversation`).
+	sticky: Option<(u64, bool)>,
 	taken: Arc<std::sync::Mutex<Option<Taken>>>,
 	/// The rate-limit headers, once a limit was taken.
 	rate: std::sync::Mutex<Option<limits::Headers>>,
@@ -3169,6 +3859,12 @@ fn again(error: &ApiError, tries: u32) -> Option<Duration> {
 	}
 }
 
+/// Whether a failed target is worth asking again on a route's second pass: what a moment may fix.
+/// A rate limit that named a longer wait is not, and neither is a refused or empty account.
+fn worth_another_pass(error: &ApiError) -> bool {
+	error.class == Class::Timeout || again(error, 1).is_some()
+}
+
 /// 100 to 300 ms, so callers that failed together do not come back together.
 fn jitter() -> Duration {
 	let nanos = SystemTime::now()
@@ -3196,6 +3892,9 @@ struct Record {
 	retry_after: Option<Duration>,
 	/// What the provider said is left on Psyche's credential.
 	remaining: Remaining,
+	/// The conversation this call is part of, and whether the caller named it, for a target whose
+	/// cache is worth coming back to.
+	sticky: Option<(u64, bool)>,
 }
 
 impl Record {
@@ -3257,6 +3956,22 @@ impl Drop for Record {
 			health::Seen::of(&self.call, self.retry_after, self.remaining),
 			SystemTime::now(),
 		);
+		if self.call.outcome == Outcome::Completed
+			&& let Some((conversation, named)) = self.sticky
+		{
+			let hit = self
+				.call
+				.usage
+				.and_then(|u| u.cached_tokens)
+				.is_some_and(|read| read > 0);
+			self.health.stick(
+				conversation,
+				&self.call.provider,
+				&self.call.model,
+				named || hit,
+				SystemTime::now(),
+			);
+		}
 		if let Some(sink) = &self.sink {
 			let _ = sink.send(self.call.clone());
 		}
@@ -3265,12 +3980,85 @@ impl Drop for Record {
 
 type Upstream = Pin<Box<dyn Stream<Item = reqwest::Result<Bytes>> + Send>>;
 
+/// What a stream on `/messages` or `/responses` is doing.
+enum MessagesStream {
+	/// An Anthropic provider's events, forwarded and counted.
+	Pass(anthropic::Meter),
+	/// OpenAI's chunks, written in the shape the caller asked for.
+	Translate(Box<dyn Writer>),
+}
+
+impl MessagesStream {
+	fn keep_alive(&self) -> &'static [u8] {
+		match self {
+			Self::Pass(_) => messages::PING,
+			Self::Translate(writer) => writer.keep_alive(),
+		}
+	}
+}
+
+/// What turns a stream of OpenAI's chunks into another shape's events.
+trait Writer: Send {
+	fn chunk(&mut self, chunk: &Value) -> Vec<u8>;
+	fn end(&mut self) -> Vec<u8>;
+	fn finished(&self) -> bool;
+	fn keep_alive(&self) -> &'static [u8];
+	/// A failure once the reply has started, the way this shape ends one.
+	fn failure(&mut self, error: &ApiError) -> Vec<u8>;
+}
+
+impl Writer for messages::Events {
+	fn chunk(&mut self, chunk: &Value) -> Vec<u8> {
+		messages::Events::chunk(self, chunk)
+	}
+
+	fn end(&mut self) -> Vec<u8> {
+		messages::Events::end(self)
+	}
+
+	fn finished(&self) -> bool {
+		messages::Events::finished(self)
+	}
+
+	fn keep_alive(&self) -> &'static [u8] {
+		messages::PING
+	}
+
+	fn failure(&mut self, error: &ApiError) -> Vec<u8> {
+		messages::error_event(error)
+	}
+}
+
+impl Writer for responses::Events {
+	fn chunk(&mut self, chunk: &Value) -> Vec<u8> {
+		responses::Events::chunk(self, chunk)
+	}
+
+	fn end(&mut self) -> Vec<u8> {
+		responses::Events::end(self)
+	}
+
+	fn finished(&self) -> bool {
+		responses::Events::finished(self)
+	}
+
+	fn keep_alive(&self) -> &'static [u8] {
+		responses::KEEP_ALIVE
+	}
+
+	fn failure(&mut self, error: &ApiError) -> Vec<u8> {
+		self.failed(error)
+	}
+}
+
 /// The state of one streamed reply.
 struct Streaming {
 	upstream: Upstream,
 	parser: Parser,
 	/// For a provider whose stream is not OpenAI's: what turns it into OpenAI's chunks.
 	translate: Option<Translator>,
+	/// For `/messages` and `/responses`: the shape the caller gets.
+	messages: Option<MessagesStream>,
 	wants_usage: bool,
 	idle: Duration,
 	secrets: Vec<String>,
@@ -3309,6 +4097,7 @@ impl Streaming {
 							let pieces = translate.end();
 							self.render(pieces)
 						}
+						None if self.messages.is_some() => self.close_messages(),
 						None => {
 							let rest = std::mem::take(&mut self.parser).finish();
 							self.pass(rest)
@@ -3336,7 +4125,11 @@ impl Streaming {
 				Ok(Some(Ok(chunk))) => match self.parser.feed(&chunk) {
 					Err(e) => return Some(self.fail(Class::Upstream, format!("{provider}: {e}"))),
 					Ok(events) => {
-						let out = self.pass(events);
+						let out = if self.messages.is_some() {
+							self.pass_messages(events)
+						} else {
+							self.pass(events)
+						};
 						if !out.is_empty() {
 							return Some(out);
 						}
@@ -3384,16 +4177,124 @@ impl Streaming {
 		Bytes::from(out)
 	}
 
+	/// A `/messages` or `/responses` stream's next events, from an Anthropic provider or an
+	/// OpenAI-style one. A failure the provider reports ends the reply as that API ends one.
+	fn pass_messages(&mut self, events: Vec<Event>) -> Bytes {
+		let mut out = Vec::new();
+		let mut failed = None;
+		for event in events {
+			let parsed = event
+				.data
+				.as_deref()
+				.filter(|d| *d != "[DONE]")
+				.and_then(|d| serde_json::from_str::<Value>(d).ok());
+			match self.messages.as_mut() {
+				Some(MessagesStream::Pass(meter)) => {
+					let Some(mut value) = parsed else {
+						out.extend_from_slice(&event.raw);
+						continue;
+					};
+					meter.read(&value);
+					self.record.call.usage = meter.usage();
+					if value["type"] == "error" {
+						let kind = value.pointer("/error/type").and_then(Value::as_str);
+						let class = anthropic::error_class(kind);
+						self.record.finish(Outcome::Failed(class));
+						let secrets: Vec<&str> = self.secrets.iter().map(String::as_str).collect();
+						let clean = scrub(&String::from_utf8_lossy(&event.raw), &secrets);
+						out.extend_from_slice(clean.as_bytes());
+						continue;
+					}
+					if value["type"] == "message_start"
+						&& rename(&mut value["message"], &self.record.call.model)
+					{
+						out.extend_from_slice(
+							format!("event: message_start\ndata: {value}\n\n").as_bytes(),
+						);
+						continue;
+					}
+					out.extend_from_slice(&event.raw);
+				}
+				Some(MessagesStream::Translate(writer)) => {
+					if event.data.as_deref() == Some("[DONE]") {
+						out.extend(writer.end());
+						continue;
+					}
+					let Some(value) = parsed else {
+						continue;
+					};
+					if let Some(error) = value.get("error") {
+						let said = error
+							.get("message")
+							.and_then(Value::as_str)
+							.unwrap_or("an error with no message");
+						failed = Some(said.to_string());
+						break;
+					}
+					if let Some(usage) = Usage::from_openai(&value) {
+						self.record.call.usage = Some(usage);
+					}
+					out.extend(writer.chunk(&value));
+				}
+				None => {}
+			}
+		}
+		if let Some(message) = failed {
+			let secrets: Vec<&str> = self.secrets.iter().map(String::as_str).collect();
+			let provider = self.record.call.provider.clone();
+			let message = format!("{provider}: {}", scrub(&message, &secrets));
+			out.extend_from_slice(&self.fail(Class::Upstream, message));
+		}
+		Bytes::from(out)
+	}
+
+	/// The provider closed a `/messages` stream: what is still owed, or an error event if the reply
+	/// was cut.
+	fn close_messages(&mut self) -> Bytes {
+		let rest = std::mem::take(&mut self.parser).finish();
+		let mut out = self.pass_messages(rest).to_vec();
+		if self.done {
+			return Bytes::from(out);
+		}
+		let cut = match self.messages.as_mut() {
+			// A failure the provider reported has been passed on already.
+			Some(MessagesStream::Pass(meter)) => {
+				!meter.ended() && self.record.call.outcome == Outcome::Cancelled
+			}
+			Some(MessagesStream::Translate(writer)) if writer.finished() => {
+				out.extend(writer.end());
+				false
+			}
+			Some(MessagesStream::Translate(_)) => true,
+			None => false,
+		};
+		if cut {
+			let provider = self.record.call.provider.clone();
+			out.extend_from_slice(&self.fail(
+				Class::Upstream,
+				format!("{provider}: the stream ended before the reply was complete"),
+			));
+		}
+		Bytes::from(out)
+	}
+
 	/// The bytes of a translated stream's pieces. The first error ends the stream.
 	fn render(&mut self, pieces: Vec<Out>) -> Bytes {
 		let mut out = Vec::new();
 		let mut failed = None;
 		for piece in pieces {
-			match piece {
-				Out::Chunk(chunk) => out.extend_from_slice(format!("data: {chunk}\n\n").as_bytes()),
-				Out::Done => out.extend_from_slice(b"data: [DONE]\n\n"),
-				Out::KeepAlive => out.extend_from_slice(b": ping\n\n"),
-				Out::Error(class, message) => {
+			match (piece, self.messages.as_mut()) {
+				(Out::Chunk(chunk), Some(MessagesStream::Translate(writer))) => {
+					out.extend(writer.chunk(&chunk));
+				}
+				(Out::Done, Some(MessagesStream::Translate(writer))) => out.extend(writer.end()),
+				(Out::KeepAlive, Some(stream)) => out.extend_from_slice(stream.keep_alive()),
+				(Out::Chunk(chunk), _) => {
+					out.extend_from_slice(format!("data: {chunk}\n\n").as_bytes());
+				}
+				(Out::Done, _) => out.extend_from_slice(b"data: [DONE]\n\n"),
+				(Out::KeepAlive, _) => out.extend_from_slice(b": ping\n\n"),
+				(Out::Error(class, message), _) => {
 					failed = Some((class, message));
 					break;
 				}
@@ -3409,11 +4310,16 @@ impl Streaming {
 		Bytes::from(out)
 	}
 
-	/// Ends the stream with an error event, OpenAI's way.
+	/// Ends the stream with an error event, in the caller's protocol.
 	fn fail(&mut self, class: Class, message: String) -> Bytes {
 		self.done = true;
 		self.record.finish(Outcome::Failed(class));
 		let error = ApiError::new(class, message).from_provider(&self.record.call.provider);
+		match self.messages.as_mut() {
+			Some(MessagesStream::Translate(writer)) => return Bytes::from(writer.failure(&error)),
+			Some(MessagesStream::Pass(_)) => return Bytes::from(messages::error_event(&error)),
+			None => {}
+		}
 		Bytes::from(format!("data: {}\n\n", error.body()))
 	}
 }
@@ -3435,6 +4341,8 @@ mod tests {
 		tables: models::Held,
 		calls: tokio::sync::mpsc::UnboundedReceiver<Call>,
 		client: reqwest::Client,
+		/// What routing knows, for a test that measures it.
+		health: Health,
 	}
 
 	impl Setup {
@@ -3476,7 +4384,12 @@ mod tests {
 						{{"name": "stored", "kind": "openai", "base_url": "{0}/v1", "credential": "stored"}},
 						{{"name": "stored-aws", "kind": "bedrock", "region": "us-west-2", "base_url": "{0}", "credential": "stored-aws"}},
 						{{"name": "bedrock-wrong", "kind": "bedrock", "region": "us-west-2", "base_url": "{0}",
-							"aws": {{"access_key_id_env": "AWS_AK", "secret_access_key_env": "AWS_SK_WRONG"}}}}
+							"aws": {{"access_key_id_env": "AWS_AK", "secret_access_key_env": "AWS_SK_WRONG"}}}},
+						{{"name": "public", "kind": "openai", "base_url": "http://8.8.8.8/v1", "api_key_env": "FAKE_KEY"}},
+						{{"name": "cache-a", "kind": "anthropic", "base_url": "{0}/a/v1", "api_key_env": "FAKE_KEY"}},
+						{{"name": "cache-b", "kind": "anthropic", "base_url": "{0}/b/v1", "api_key_env": "FAKE_KEY"}},
+						{{"name": "acct-near", "kind": "bedrock", "region": "us-west-2", "base_url": "{0}", "api_key_env": "FAKE_KEY"}},
+						{{"name": "acct-far", "kind": "bedrock", "region": "us-east-1", "base_url": "{0}", "api_key_env": "FAKE_KEY"}}
 					],
 					"models": [
 						{{"name": "ok", "provider": "fake", "upstream": "fake-ok"}},
@@ -3484,6 +4397,8 @@ mod tests {
 						{{"name": "cached", "provider": "fake", "upstream": "fake-ok", "prompt_caching": true}},
 						{{"name": "claude", "provider": "anthropic", "upstream": "fake-ok", "prompt_caching": true}},
 						{{"name": "claude-tool", "provider": "anthropic", "upstream": "fake-tool"}},
+						{{"name": "claude-search", "provider": "anthropic", "upstream": "fake-search", "internet": "web",
+							"price": {{"input": 0, "output": 0}}}},
 						{{"name": "claude-529", "provider": "anthropic", "upstream": "fake-529"}},
 						{{"name": "claude-overloaded", "provider": "anthropic", "upstream": "fake-overloaded"}},
 						{{"name": "claude-truncated", "provider": "anthropic", "upstream": "fake-truncated"}},
@@ -3517,9 +4432,35 @@ mod tests {
 						{{"name": "mid-images", "provider": "fake", "upstream": "fake-ok", "price": {{"input": 0.5, "output": 1}},
 							"fits": {{"context": 100000, "images": true}}}},
 						{{"name": "big-tools", "provider": "fake", "upstream": "fake-ok", "price": {{"input": 1, "output": 2}},
-							"fits": {{"context": 200000, "tools": true, "images": true, "json_schema": true}}}}
+							"fits": {{"context": 200000, "tools": true, "images": true, "json_schema": true}}}},
+						{{"name": "local", "provider": "fake", "upstream": "fake-ok", "internet": "none"}},
+						{{"name": "none-public", "provider": "public", "upstream": "fake-ok", "internet": "none"}},
+						{{"name": "none-claude", "provider": "anthropic", "upstream": "fake-ok", "internet": "none"}},
+						{{"name": "web-ok", "provider": "fake", "upstream": "fake-ok", "internet": "web"}},
+						{{"name": "web-claude", "provider": "anthropic", "upstream": "fake-ok", "internet": "web"}},
+						{{"name": "web-bedrock", "provider": "bedrock-key", "upstream": "fake-ok", "internet": "web"}},
+						{{"name": "cache-on-a", "provider": "cache-a", "upstream": "fake-cache", "prompt_caching": true,
+							"price": {{"input": 3, "output": 15, "cache_read": 0.3}}}},
+						{{"name": "cache-on-b", "provider": "cache-b", "upstream": "fake-cache", "prompt_caching": true,
+							"price": {{"input": 3, "output": 15, "cache_read": 0.3}}}},
+						{{"name": "near", "provider": "acct-near", "upstream": "fake-quota-near", "quota": {{"requests": 8}}}},
+						{{"name": "far", "provider": "acct-far", "upstream": "fake-far", "quota": {{"requests": 1000}}}},
+						{{"name": "flaky-a", "provider": "fake", "upstream": "fake-flaky-a"}},
+						{{"name": "flaky-b", "provider": "fake", "upstream": "fake-flaky-b"}},
+						{{"name": "weighted-a", "provider": "fake", "upstream": "fake-ok"}},
+						{{"name": "weighted-b", "provider": "fake", "upstream": "fake-ok"}}
 					],
 					"routes": [
+						{{"name": "web-first", "targets": ["ok", "web-ok"]}},
+						{{"name": "web-bedrock-first", "targets": ["web-bedrock", "web-claude"]}},
+						{{"name": "sandbox-first", "targets": ["none-public", "ok"]}},
+						{{"name": "sandbox-only", "targets": ["none-public", "none-claude"]}},
+						{{"name": "two-caches", "targets": ["cache-on-a", "cache-on-b"], "sort": "balanced"}},
+						{{"name": "spread", "targets": ["near", "far"], "sort": "balanced"}},
+						{{"name": "flaky", "targets": ["flaky-a", "flaky-b"]}},
+						{{"name": "only-three-to-one", "targets": ["weighted-a", "weighted-b"], "sort": "weighted",
+							"weights": {{"weighted-a": 3}}}},
+						{{"name": "must-have-tools", "targets": ["ok", "big-tools"], "constraints": {{"tools": true}}}},
 						{{"name": "falls-over", "targets": ["fails", "ok"]}},
 						{{"name": "cheapest", "targets": ["ok-priced", "ok-cheap"], "sort": "price"}},
 						{{"name": "picky-first", "targets": ["picky", "ok"]}},
@@ -3542,10 +4483,12 @@ mod tests {
 			let (tx, calls) = tokio::sync::mpsc::unbounded_channel();
 			let live = Live::new(crate::providers::Catalogue::build(&file).unwrap());
 			let held = models::Held::new(file, live.clone(), Egress::Private);
+			let health = Health::default();
 			let proxy = Arc::new(Proxy {
 				catalogue: live,
 				tables: keys.as_ref().map(|_| held.clone()),
 				http: net::client(Egress::Private).unwrap(),
+				sandbox: net::sandbox_client(Egress::Private).unwrap(),
 				egress: Egress::Private,
 				jwt_secret: SECRET.into(),
 				timeouts,
@@ -3554,7 +4497,7 @@ mod tests {
 				keys,
 				budgets,
 				limits,
-				health: Health::default(),
+				health: health.clone(),
 			});
 			let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
 			let base = format!("http://{}", listener.local_addr().unwrap());
@@ -3565,6 +4508,7 @@ mod tests {
 				tables: held,
 				calls,
 				client: reqwest::Client::new(),
+				health,
 			}
 		}
 
@@ -5666,6 +6610,710 @@ mod tests {
 		assert_eq!(s.call().await.outcome, Outcome::Failed(Class::Timeout));
 	}
 
+	fn messages_request(model: &str, stream: bool) -> Value {
+		json!({"model": model, "max_tokens": 16, "stream": stream,
+			"messages": [{"role": "user", "content": "hello there"}]})
+	}
+
+	#[tokio::test]
+	async fn messages_pass_through_to_anthropic_under_the_name_asked_for() {
+		let mut s = Setup::new().await;
+		let reply = s
+			.post("/ai/v1/messages", messages_request("claude", false))
+			.header("anthropic-beta", "some-beta-2026-01-01")
+			.send()
+			.await
+			.unwrap();
+		assert_eq!(reply.status(), 200);
+		let body: Value = reply.json().await.unwrap();
+		assert_eq!(body["type"], "message");
+		assert_eq!(body["model"], "claude");
+		assert_eq!(body["content"][0]["text"], "Hello from the fake.");
+		let seen = s.fake.last();
+		assert_eq!(seen.path, "/v1/messages");
+		assert_eq!(seen.body["model"], "fake-ok");
+		assert_eq!(seen.anthropic_version.as_deref(), Some(anthropic::VERSION));
+		let call = s.call().await;
+		assert_eq!(call.operation, Operation::Messages);
+		assert_eq!(call.outcome, Outcome::Completed);
+		assert_eq!(call.usage.unwrap().prompt_tokens, 129);
+
+		// Streamed, with the key where a client written for Anthropic puts it.
+		let text = s
+			.client
+			.post(format!("{}/v1/messages", s.base))
+			.header(
+				"x-api-key",
+				jwt::sign(&json!({"role": "service_role"}), SECRET),
+			)
+			.json(&messages_request("claude", true))
+			.send()
+			.await
+			.unwrap()
+			.text()
+			.await
+			.unwrap();
+		assert!(text.contains("event: message_start"), "{text}");
+		assert!(text.contains("\"model\":\"claude\""), "{text}");
+		assert!(!text.contains("fake-ok"), "{text}");
+		assert!(text.contains("event: message_stop"), "{text}");
+		let call = s.call().await;
+		assert_eq!(call.outcome, Outcome::Completed);
+		assert_eq!(call.usage.unwrap().completion_tokens, 4);
+	}
+
+	#[tokio::test]
+	async fn a_breakpoint_does_not_reach_a_model_that_does_not_cache_on_messages() {
+		let mut s = Setup::new().await;
+		let mut body = messages_request("claude-tool", false);
+		body["system"] =
+			json!([{"type": "text", "text": "x", "cache_control": {"type": "ephemeral"}}]);
+		body["messages"] = json!([{"role": "user", "content": [
+			{"type": "tool_result", "tool_use_id": "t", "cache_control": {"type": "ephemeral"},
+				"content": [{"type": "text", "text": "y", "cache_control": {"type": "ephemeral"}}]}
+		]}]);
+		let reply = s.post("/ai/v1/messages", body).send().await.unwrap();
+		assert_eq!(reply.status(), 200);
+		s.call().await;
+		let sent = s.fake.last().body;
+		assert!(!sent.to_string().contains("cache_control"), "{sent}");
+	}
+
+	#[tokio::test]
+	async fn messages_are_translated_for_any_other_provider() {
+		let mut s = Setup::new().await;
+		for model in ["ok", "qwen"] {
+			let body: Value = s
+				.post("/ai/v1/messages", messages_request(model, false))
+				.send()
+				.await
+				.unwrap()
+				.json()
+				.await
+				.unwrap();
+			assert_eq!(body["type"], "message", "{model}: {body}");
+			assert_eq!(body["model"], model);
+			assert_eq!(body["content"][0]["type"], "text", "{model}: {body}");
+			assert!(
+				body["usage"]["output_tokens"].as_u64().unwrap() > 0,
+				"{model}: {body}"
+			);
+			assert_eq!(s.call().await.operation, Operation::Messages);
+
+			let text = s
+				.post("/ai/v1/messages", messages_request(model, true))
+				.send()
+				.await
+				.unwrap()
+				.text()
+				.await
+				.unwrap();
+			for name in [
+				"message_start",
+				"content_block_delta",
+				"message_delta",
+				"message_stop",
+			] {
+				assert!(text.contains(&format!("event: {name}")), "{model}: {text}");
+			}
+			assert!(!text.contains("data: [DONE]"), "{model}: {text}");
+			let call = s.call().await;
+			assert_eq!(call.outcome, Outcome::Completed, "{model}");
+			assert!(call.usage.is_some(), "{model}");
+		}
+		assert!(s.fake.last().path.contains("converse"));
+	}
+
+	#[tokio::test]
+	async fn a_cut_or_failed_messages_stream_ends_with_anthropic_s_error_event() {
+		let mut s = Setup::new().await;
+		for model in [
+			"claude-truncated",
+			"claude-overloaded",
+			"cut",
+			"bedrock-truncated",
+		] {
+			let text = s
+				.post("/ai/v1/messages", messages_request(model, true))
+				.send()
+				.await
+				.unwrap()
+				.text()
+				.await
+				.unwrap();
+			assert!(text.contains("event: error"), "{model}: {text}");
+			assert!(!text.contains("event: message_stop"), "{model}: {text}");
+			assert!(
+				matches!(s.call().await.outcome, Outcome::Failed(_)),
+				"{model}"
+			);
+		}
+	}
+
+	#[tokio::test]
+	async fn messages_refusals_are_in_anthropic_s_shape() {
+		let s = Setup::new().await;
+		let refused = |body: Value| {
+			let request = s.post("/ai/v1/messages", body);
+			async move {
+				let reply = request.send().await.unwrap();
+				let status = reply.status().as_u16();
+				let body: Value = reply.json().await.unwrap();
+				(status, body)
+			}
+		};
+		let (status, body) = refused(messages_request("nobody", false)).await;
+		assert_eq!(status, 404);
+		assert_eq!(body["type"], "error");
+		assert_eq!(body["error"]["type"], "not_found_error");
+		let (status, body) =
+			refused(json!({"model": "claude", "messages": [{"role": "user", "content": "hi"}]}))
+				.await;
+		assert_eq!(status, 400);
+		assert!(
+			body["error"]["message"]
+				.as_str()
+				.unwrap()
+				.contains("max_tokens")
+		);
+		// The internet level, with Anthropic's server tools counted as the web.
+		let mut search = messages_request("claude", false);
+		search["tools"] = json!([{"type": "web_search_20250305", "name": "web_search"}]);
+		let (status, body) = refused(search).await;
+		assert_eq!(status, 400);
+		assert!(
+			body["error"]["message"]
+				.as_str()
+				.unwrap()
+				.contains("internet level"),
+			"{body}"
+		);
+		let unsigned = s
+			.client
+			.post(format!("{}/ai/v1/messages", s.base))
+			.json(&messages_request("claude", false))
+			.send()
+			.await
+			.unwrap();
+		assert_eq!(unsigned.status(), 401);
+		let body: Value = unsigned.json().await.unwrap();
+		assert_eq!(body["error"]["type"], "authentication_error");
+	}
+
+	fn responses_request(model: &str, stream: bool) -> Value {
+		json!({"model": model, "stream": stream, "store": false, "instructions": "Be brief.",
+			"input": [{"type": "message", "role": "user",
+				"content": [{"type": "input_text", "text": "hello there"}]}]})
+	}
+
+	/// An SSE body's events as `(name, data)`.
+	fn sse_events(text: &str) -> Vec<(String, Value)> {
+		text.split("\n\n")
+			.filter(|event| !event.is_empty() && !event.starts_with(':'))
+			.map(|event| {
+				let (name, data) = event.split_once('\n').unwrap();
+				(
+					name.strip_prefix("event: ").unwrap().to_string(),
+					serde_json::from_str(data.strip_prefix("data: ").unwrap()).unwrap(),
+				)
+			})
+			.collect()
+	}
+
+	#[tokio::test]
+	async fn responses_are_answered_by_every_provider_and_end_in_response_completed() {
+		let mut s = Setup::new().await;
+		for model in ["ok", "claude", "qwen"] {
+			let reply = s
+				.post("/ai/v1/responses", responses_request(model, false))
+				.send()
+				.await
+				.unwrap();
+			assert_eq!(reply.status(), 200, "{model}");
+			let body: Value = reply.json().await.unwrap();
+			assert_eq!(body["object"], "response", "{model}: {body}");
+			assert_eq!(body["model"], model);
+			assert_eq!(body["status"], "completed");
+			assert!(body["id"].as_str().unwrap().starts_with("resp_"));
+			assert_eq!(body["output"][0]["type"], "message", "{model}: {body}");
+			assert_eq!(
+				body["output"][0]["content"][0]["text"], "Hello from the fake.",
+				"{model}: {body}"
+			);
+			assert!(body["usage"]["total_tokens"].as_u64().unwrap() > 0);
+			let call = s.call().await;
+			assert_eq!(call.operation, Operation::Responses);
+			assert_eq!(call.outcome, Outcome::Completed);
+			assert!(call.usage.is_some(), "{model}");
+
+			let text = s
+				.post("/v1/responses", responses_request(model, true))
+				.send()
+				.await
+				.unwrap()
+				.text()
+				.await
+				.unwrap();
+			let events = sse_events(&text);
+			for (n, (name, data)) in events.iter().enumerate() {
+				assert_eq!(data["type"], name.as_str(), "{model}: {text}");
+				assert_eq!(data["sequence_number"], n, "{model}: {text}");
+			}
+			assert_eq!(events[0].0, "response.created", "{model}: {text}");
+			let names: Vec<&str> = events.iter().map(|(n, _)| n.as_str()).collect();
+			for name in [
+				"response.in_progress",
+				"response.output_item.added",
+				"response.content_part.added",
+				"response.output_text.delta",
+				"response.output_text.done",
+				"response.content_part.done",
+				"response.output_item.done",
+			] {
+				assert!(names.contains(&name), "{model}: {name}: {text}");
+			}
+			let (last, data) = events.last().unwrap();
+			assert_eq!(last, "response.completed", "{model}: {text}");
+			assert_eq!(
+				names.iter().filter(|n| **n == "response.completed").count(),
+				1
+			);
+			assert_eq!(data["response"]["model"], model);
+			assert!(
+				data["response"]["usage"]["input_tokens"].as_u64().unwrap() > 0,
+				"{model}: {text}"
+			);
+			assert!(!text.contains("[DONE]"), "{model}: {text}");
+			assert!(!text.contains("fake-ok"), "{model}: {text}");
+			let call = s.call().await;
+			assert_eq!(call.operation, Operation::Responses);
+			assert_eq!(call.outcome, Outcome::Completed, "{model}");
+			assert!(call.usage.is_some(), "{model}");
+		}
+		assert!(s.fake.last().path.contains("converse"));
+	}
+
+	#[tokio::test]
+	async fn the_chat_completion_a_response_becomes_is_what_the_provider_gets() {
+		let mut s = Setup::new().await;
+		let mut body = responses_request("ok", true);
+		body["max_output_tokens"] = json!(77);
+		body["reasoning"] = json!({"effort": "low", "summary": "auto"});
+		body["include"] = json!(["reasoning.encrypted_content"]);
+		let reply = s.post("/ai/v1/responses", body).send().await.unwrap();
+		assert_eq!(reply.status(), 200);
+		reply.bytes().await.unwrap();
+		s.call().await;
+		let seen = s.fake.last();
+		assert_eq!(seen.path, "/v1/chat/completions");
+		assert_eq!(seen.body["model"], "fake-ok");
+		assert_eq!(seen.body["max_tokens"], 77);
+		assert_eq!(seen.body["stream_options"]["include_usage"], true);
+		assert_eq!(seen.body["messages"][0]["content"], "Be brief.");
+		assert_eq!(seen.body["messages"][1]["content"], "hello there");
+		for gone in [
+			"input",
+			"instructions",
+			"store",
+			"include",
+			"reasoning",
+			"reasoning_effort",
+		] {
+			assert!(seen.body.get(gone).is_none(), "{gone}: {}", seen.body);
+		}
+	}
+
+	#[tokio::test]
+	async fn a_tool_turn_goes_through_the_responses_api_both_ways() {
+		let mut s = Setup::new().await;
+		for model in ["claude-tool", "bedrock-tool"] {
+			let mut body = responses_request(model, false);
+			body["tools"] = json!([{"type": "function", "name": "run_sql", "strict": false,
+				"parameters": {"type": "object", "properties": {"sql": {"type": "string"}}}}]);
+			body["input"].as_array_mut().unwrap().extend([
+				json!({"type": "function_call", "name": "run_sql", "arguments": "{\"sql\":\"x\"}", "call_id": "c1"}),
+				json!({"type": "function_call_output", "call_id": "c1", "output": "1"}),
+			]);
+			let reply: Value = s
+				.post("/ai/v1/responses", body.clone())
+				.send()
+				.await
+				.unwrap()
+				.json()
+				.await
+				.unwrap();
+			let output = reply["output"].as_array().unwrap();
+			assert_eq!(
+				output[0]["content"][0]["text"], "Let me look.",
+				"{model}: {reply}"
+			);
+			assert_eq!(output[1]["type"], "function_call", "{model}: {reply}");
+			assert_eq!(output[1]["name"], "run_sql");
+			assert_eq!(output[1]["status"], "completed");
+			let arguments: Value =
+				serde_json::from_str(output[1]["arguments"].as_str().unwrap()).unwrap();
+			assert_eq!(arguments["sql"], "select 1", "{model}: {reply}");
+			assert!(output[1]["call_id"].as_str().unwrap().starts_with("tool"));
+			s.call().await;
+
+			body["stream"] = json!(true);
+			let text = s
+				.post("/ai/v1/responses", body.clone())
+				.send()
+				.await
+				.unwrap()
+				.text()
+				.await
+				.unwrap();
+			let events = sse_events(&text);
+			let names: Vec<&str> = events.iter().map(|(n, _)| n.as_str()).collect();
+			assert!(
+				names.contains(&"response.function_call_arguments.delta"),
+				"{model}: {text}"
+			);
+			assert!(
+				names.contains(&"response.function_call_arguments.done"),
+				"{model}: {text}"
+			);
+			let (last, data) = events.last().unwrap();
+			assert_eq!(last, "response.completed", "{model}: {text}");
+			let items = data["response"]["output"].as_array().unwrap();
+			assert_eq!(items[0]["type"], "message", "{model}: {text}");
+			assert_eq!(items[1]["type"], "function_call", "{model}: {text}");
+			assert_eq!(items[1]["output_index"], Value::Null);
+			let arguments: Value =
+				serde_json::from_str(items[1]["arguments"].as_str().unwrap()).unwrap();
+			assert_eq!(arguments["sql"], "select 1", "{model}: {text}");
+			s.call().await;
+
+			// A freeform tool of the same name comes back as what the caller declared.
+			body["stream"] = json!(false);
+			body["tools"] = json!([{"type": "custom", "name": "run_sql", "description": "Runs."}]);
+			let reply: Value = s
+				.post("/ai/v1/responses", body)
+				.send()
+				.await
+				.unwrap()
+				.json()
+				.await
+				.unwrap();
+			assert_eq!(
+				reply["output"][1]["type"], "custom_tool_call",
+				"{model}: {reply}"
+			);
+			assert!(
+				reply["output"][1]["input"]
+					.as_str()
+					.unwrap()
+					.contains("select 1"),
+				"the whole arguments, for a call that did not use the string: {reply}"
+			);
+			s.call().await;
+		}
+		let sent = s.fake.last().body.to_string();
+		assert!(sent.contains("run_sql"), "{sent}");
+	}
+
+	#[tokio::test]
+	async fn a_cut_or_failed_responses_stream_ends_in_response_failed() {
+		let mut s = Setup::new().await;
+		for model in [
+			"claude-truncated",
+			"claude-overloaded",
+			"cut",
+			"bedrock-truncated",
+		] {
+			let text = s
+				.post("/ai/v1/responses", responses_request(model, true))
+				.send()
+				.await
+				.unwrap()
+				.text()
+				.await
+				.unwrap();
+			let events = sse_events(&text);
+			let (last, data) = events.last().unwrap();
+			assert_eq!(last, "response.failed", "{model}: {text}");
+			assert_eq!(data["response"]["status"], "failed", "{model}: {text}");
+			assert!(
+				data["response"]["error"]["message"].is_string(),
+				"{model}: {text}"
+			);
+			assert!(!text.contains("response.completed"), "{model}: {text}");
+			assert!(
+				matches!(s.call().await.outcome, Outcome::Failed(_)),
+				"{model}"
+			);
+		}
+	}
+
+	#[tokio::test]
+	async fn responses_refusals_are_openai_s_shape_and_send_nothing() {
+		let s = Setup::new().await;
+		let refused = |body: Value| {
+			let request = s.post("/ai/v1/responses", body);
+			async move {
+				let reply = request.send().await.unwrap();
+				let status = reply.status().as_u16();
+				let body: Value = reply.json().await.unwrap();
+				(status, body)
+			}
+		};
+		let sent = s.fake.count();
+		let message = |body: &Value| body["error"]["message"].as_str().unwrap().to_string();
+		let (status, body) = refused(responses_request("nobody", false)).await;
+		assert_eq!(status, 404);
+		assert_eq!(body["error"]["code"], "model_not_found");
+		assert!(body.get("type").is_none(), "OpenAI's shape: {body}");
+
+		let mut named = responses_request("ok", false);
+		named["previous_response_id"] = json!("resp_1");
+		let (status, body) = refused(named).await;
+		assert_eq!(status, 400);
+		assert!(message(&body).contains("previous_response_id"), "{body}");
+
+		let mut unknown = responses_request("ok", false);
+		unknown["conversation"] = json!("c");
+		let (status, body) = refused(unknown).await;
+		assert_eq!(status, 400);
+		assert!(message(&body).contains("conversation"), "{body}");
+
+		let (status, body) = refused(json!({"model": "ok"})).await;
+		assert_eq!(status, 400);
+		assert!(message(&body).contains("input"), "{body}");
+
+		assert_eq!(s.fake.count(), sent, "nothing reached a provider");
+
+		let unsigned = s
+			.client
+			.post(format!("{}/ai/v1/responses", s.base))
+			.json(&responses_request("ok", false))
+			.send()
+			.await
+			.unwrap();
+		assert_eq!(unsigned.status(), 401);
+		let body: Value = unsigned.json().await.unwrap();
+		assert_eq!(body["error"]["type"], "authentication_error");
+	}
+
+	#[tokio::test]
+	async fn a_web_search_on_offer_is_left_off_a_model_that_may_not_use_it() {
+		let mut s = Setup::new().await;
+		for model in ["ok", "claude", "web-claude", "web-bedrock"] {
+			let mut body = responses_request(model, false);
+			body["tools"] = json!([
+				{"type": "web_search", "external_web_access": false},
+				{"type": "function", "name": "shell", "parameters": {"type": "object"}}
+			]);
+			let reply = s.post("/ai/v1/responses", body).send().await.unwrap();
+			assert_eq!(reply.status(), 200, "{model}");
+			reply.bytes().await.unwrap();
+			s.call().await;
+			let sent = s.fake.last().body.to_string();
+			assert!(sent.contains("shell"), "{model}: {sent}");
+			assert!(!sent.contains("web_search"), "{model}: {sent}");
+		}
+	}
+
+	#[tokio::test]
+	async fn a_model_at_web_level_takes_the_web_tool() {
+		let mut s = Setup::new().await;
+		let mut body = responses_request("web-ok", false);
+		body["tools"] = json!([{"type": "web_search"}]);
+		let reply = s.post("/ai/v1/responses", body).send().await.unwrap();
+		assert_eq!(reply.status(), 200);
+		reply.bytes().await.unwrap();
+		s.call().await;
+		assert_eq!(s.fake.last().body["tools"][0]["type"], "web_search");
+	}
+
+	#[tokio::test]
+	async fn auto_and_routes_read_a_response_s_needs() {
+		let mut s = Setup::new().await;
+		// An image in a tool's output and a schema in `text`: only a model that says it takes both.
+		let mut body = responses_request("auto", false);
+		body["text"] =
+			json!({"format": {"type": "json_schema", "name": "n", "schema": {"type": "object"}}});
+		body["input"].as_array_mut().unwrap().extend([
+			json!({"type": "function_call", "name": "see", "arguments": "{}", "call_id": "c"}),
+			json!({"type": "function_call_output", "call_id": "c", "output": [
+				{"type": "input_image", "image_url": "data:image/png;base64,AAAA"}
+			]}),
+		]);
+		let reply = s.post("/ai/v1/responses", body).send().await.unwrap();
+		assert_eq!(reply.status(), 200, "{:?}", reply.text().await);
+		let call = s.call().await;
+		assert_eq!(call.model, "big-tools", "{:?}", call.routing);
+	}
+
+	#[tokio::test]
+	async fn a_hard_budget_caps_a_response_in_its_own_field() {
+		let budgets = Budgets::default();
+		budgets.replace(vec![crate::budgets::Budget {
+			id: KeyId([9; 16]),
+			name: "project".into(),
+			scope: crate::who::Scope::Project,
+			limit: crate::price::PICO,
+			period: crate::budgets::Period::Day,
+			hard: true,
+		}]);
+		let mut s = Setup::build(Fake::KEY, Timeouts::default(), None, Some(budgets)).await;
+		let reply = s
+			.post("/ai/v1/responses", responses_request("ok-priced", false))
+			.send()
+			.await
+			.unwrap();
+		assert_eq!(reply.status(), 200);
+		reply.bytes().await.unwrap();
+		s.call().await;
+		assert!(s.fake.last().body["max_tokens"].as_u64().unwrap() > 0);
+	}
+
+	#[tokio::test]
+	async fn count_tokens_is_the_needs_estimate_and_the_model_list_reads_both_ways() {
+		let s = Setup::new().await;
+		let request = messages_request("claude", false);
+		let bytes = serde_json::to_vec(&request).unwrap();
+		let body: Value = s
+			.post("/ai/v1/messages/count_tokens", request)
+			.send()
+			.await
+			.unwrap()
+			.json()
+			.await
+			.unwrap();
+		assert_eq!(
+			body["input_tokens"],
+			fits::estimated_tokens(budgets::prompt_bound(&bytes))
+		);
+		let list: Value = s
+			.get("/v1/models")
+			.send()
+			.await
+			.unwrap()
+			.json()
+			.await
+			.unwrap();
+		assert_eq!(list["object"], "list", "OpenAI's");
+		assert_eq!(list["has_more"], false, "Anthropic's");
+		assert_eq!(list["data"][0]["type"], "model");
+		assert_eq!(list["data"][0]["object"], "model");
+		assert_eq!(list["first_id"], list["data"][0]["id"]);
+	}
+
+	#[tokio::test]
+	async fn a_web_search_is_on_the_call_s_cost() {
+		let mut s = Setup::new().await;
+		for stream in [false, true] {
+			let mut body = messages_request("claude-search", stream);
+			body["tools"] =
+				json!([{"type": "web_search_20250305", "name": "web_search", "max_uses": 5}]);
+			let reply = s.post("/ai/v1/messages", body).send().await.unwrap();
+			assert_eq!(reply.status(), 200);
+			reply.bytes().await.unwrap();
+			let call = s.call().await;
+			assert_eq!(
+				call.usage.unwrap().web_searches,
+				Some(2),
+				"stream: {stream}"
+			);
+			assert_eq!(
+				call.cost().unwrap().to_string(),
+				"0.020000000000",
+				"two searches at Anthropic's rate; stream: {stream}"
+			);
+		}
+	}
+
+	#[tokio::test]
+	async fn a_budget_holds_room_for_the_searches_a_call_may_make() {
+		let budgets = Budgets::default();
+		budgets.replace(vec![crate::budgets::Budget {
+			id: KeyId([9; 16]),
+			name: "project".into(),
+			scope: crate::who::Scope::Project,
+			limit: crate::price::PICO / 20,
+			period: crate::budgets::Period::Day,
+			hard: true,
+		}]);
+		let mut s = Setup::build(Fake::KEY, Timeouts::default(), None, Some(budgets)).await;
+		let search = |max_uses: Option<u64>| {
+			let mut tool = json!({"type": "web_search_20250305", "name": "web_search"});
+			if let Some(uses) = max_uses {
+				tool["max_uses"] = json!(uses);
+			}
+			let mut body = messages_request("claude-search", false);
+			body["tools"] = json!([tool]);
+			body
+		};
+		// Ten cents of searches against five cents of budget, sent nowhere.
+		let sent = s.fake.count();
+		let refused = s
+			.post("/ai/v1/messages", search(Some(10)))
+			.send()
+			.await
+			.unwrap();
+		assert_eq!(refused.status(), 402);
+		let body: Value = refused.json().await.unwrap();
+		assert_eq!(body["error"]["type"], "billing_error");
+		assert_eq!(s.fake.count(), sent);
+		// No max_uses: it is given the bound, which is what makes the reservation true.
+		let refused = s
+			.post("/ai/v1/messages", search(None))
+			.send()
+			.await
+			.unwrap();
+		assert_eq!(
+			refused.status(),
+			402,
+			"ten searches is the bound, and it does not fit"
+		);
+		assert_eq!(s.fake.count(), sent);
+		let fits = s
+			.post("/ai/v1/messages", search(Some(3)))
+			.send()
+			.await
+			.unwrap();
+		assert_eq!(fits.status(), 200);
+		fits.bytes().await.unwrap();
+		assert_eq!(s.fake.last().body["tools"][0]["max_uses"], 3);
+		assert_eq!(s.call().await.usage.unwrap().web_searches, Some(2));
+	}
+
+	#[test]
+	fn the_worst_case_counts_the_searches_and_online_is_bounded_too() {
+		let price = serde_json::from_value::<crate::price::PriceEntry>(
+			json!({"input": 0, "output": 0, "web_search": 0.01}),
+		)
+		.unwrap()
+		.price()
+		.unwrap();
+		assert_eq!(worst(&price, 0, 0, 3), 3 * crate::price::PICO / 100);
+		let catalogue = Catalogue::from_json(
+			r#"{"providers": [{"name": "a", "kind": "anthropic", "base_url": "https://api.anthropic.com/v1"}],
+				"models": [{"name": "m", "provider": "a", "internet": "web"}]}"#,
+			&HashMap::new(),
+			Egress::Public,
+		)
+		.unwrap();
+		let model = catalogue.model("m").unwrap().clone();
+		let mut inbound = Inbound::parse(
+			br#"{"model": "m", "max_tokens": 1, "messages": [{"role": "user", "content": "x"}]}"#,
+		)
+		.unwrap();
+		assert_eq!(inbound.bound_searches(&model), 0, "no tool, no searches");
+		inbound.online = true;
+		assert_eq!(inbound.bound_searches(&model), anthropic::SEARCHES_BOUND);
+		let body = inbound.upstream(&model, Operation::Messages).unwrap();
+		let body: Value = serde_json::from_slice(&body).unwrap();
+		assert_eq!(
+			body["tools"].as_array().unwrap().len(),
+			1,
+			"the tool is written out once"
+		);
+		assert_eq!(body["tools"][0]["max_uses"], anthropic::SEARCHES_BOUND);
+	}
+
 	#[tokio::test]
 	async fn a_stream_cut_halfway_ends_with_an_error_event() {
 		let mut s = Setup::new().await;
@@ -6063,6 +7711,431 @@ mod tests {
 			(200, Some("small-text"), None)
 		);
 		assert_eq!(s.call().await.routing, None);
+	}
+
+	/// A status, the `x-psyche-model` header and the whole body, without holding `s`.
+	async fn asked(s: &Setup, body: Value) -> (u16, Option<String>, Value) {
+		let reply = s
+			.post("/ai/v1/chat/completions", body)
+			.send()
+			.await
+			.unwrap();
+		let status = reply.status().as_u16();
+		let model = reply
+			.headers()
+			.get("x-psyche-model")
+			.map(|v| v.to_str().unwrap().to_string());
+		let text = reply.text().await.unwrap();
+		(
+			status,
+			model,
+			serde_json::from_str(&text).unwrap_or(json!(text)),
+		)
+	}
+
+	fn with(mut body: Value, field: &str, value: Value) -> Value {
+		body[field] = value;
+		body
+	}
+
+	fn web_tool() -> Value {
+		json!([{"type": "web_search_20250305", "name": "web_search"}])
+	}
+
+	#[tokio::test]
+	async fn a_web_tool_reaches_only_a_model_at_the_web_level() {
+		let mut s = Setup::new().await;
+		// Named alone at the default level: a 400 that says which and why, and nothing sent.
+		let sent = s.fake.count();
+		let (status, _, body) = asked(&s, with(chat("ok", false), "tools", web_tool())).await;
+		assert_eq!(status, 400, "{body}");
+		assert_eq!(body["error"]["code"], "bad_request");
+		assert_eq!(
+			body["error"]["message"],
+			"ok cannot take this request: its internet level is provider, which allows no web tools, and this asks for web_search_20250305."
+		);
+		assert_eq!(s.fake.count(), sent);
+
+		// A function that is merely called web_search is the caller's own.
+		let own =
+			json!([{"type": "function", "function": {"name": "web_search", "parameters": {}}}]);
+		assert_eq!(
+			asked(&s, with(chat("ok", false), "tools", own)).await.0,
+			200
+		);
+		s.call().await;
+
+		// A route leaves it out, with the reason in the log.
+		let (status, model, _) = asked(
+			&s,
+			with(chat("web-first", false), "web_search_options", json!({})),
+		)
+		.await;
+		assert_eq!((status, model.as_deref()), (200, Some("web-ok")));
+		let routing = s.call().await.routing.unwrap();
+		assert!(
+			routing.contains("left out ok (its internet level is provider"),
+			"{routing}"
+		);
+		assert!(s.fake.last().body.get("web_search_options").is_some());
+
+		// `auto` likewise: none of its models has the level, so nothing is sent.
+		let sent = s.fake.count();
+		let (status, _, body) = asked(&s, with(chat("auto", false), "tools", web_tool())).await;
+		assert_eq!(status, 400, "{body}");
+		assert_eq!(s.fake.count(), sent);
+
+		// A model at the level gets Anthropic's server tool, translated through as written.
+		let (status, _, _) = asked(&s, with(chat("web-claude", false), "tools", web_tool())).await;
+		assert_eq!(status, 200);
+		s.call().await;
+		assert_eq!(s.fake.last().body["tools"], web_tool());
+
+		// `:online` is that provider's own web search, and the suffix never leaves.
+		let (status, model, _) = asked(&s, chat("web-claude:online", false)).await;
+		assert_eq!((status, model.as_deref()), (200, Some("web-claude")));
+		s.call().await;
+		let seen = s.fake.last().body;
+		assert_eq!(seen["model"], "fake-ok");
+		assert_eq!(seen["tools"][0]["name"], "web_search");
+		// And on an OpenAI-style server with nothing else to go on, OpenAI's field.
+		assert_eq!(asked(&s, chat("web-ok:online", false)).await.0, 200);
+		s.call().await;
+		assert!(s.fake.last().body.get("web_search_options").is_some());
+		// Below the level, `:online` is refused just the same.
+		assert_eq!(asked(&s, chat("ok:online", false)).await.0, 400);
+
+		// Bedrock runs no web tool: left out with a reason, never sent without it.
+		let (status, model, _) = asked(
+			&s,
+			with(chat("web-bedrock-first", false), "tools", web_tool()),
+		)
+		.await;
+		assert_eq!((status, model.as_deref()), (200, Some("web-claude")));
+		let routing = s.call().await.routing.unwrap();
+		assert!(routing.contains("web-bedrock (its provider"), "{routing}");
+		let (status, _, body) =
+			asked(&s, with(chat("web-bedrock", false), "tools", web_tool())).await;
+		assert_eq!(status, 400, "{body}");
+		assert!(
+			body["error"]["message"]
+				.as_str()
+				.unwrap()
+				.contains("cannot take")
+		);
+	}
+
+	#[tokio::test]
+	async fn a_model_at_level_none_reaches_only_a_private_address() {
+		let mut s = Setup::new().await;
+		// On a private address under private egress it answers, through the sandboxed client.
+		let (status, model, _) = asked(&s, chat("local", false)).await;
+		assert_eq!((status, model.as_deref()), (200, Some("local")));
+		s.call().await;
+
+		// A public address or a hosted provider: a 400 naming it, and nothing sent.
+		let sent = s.fake.count();
+		let (status, _, body) = asked(&s, chat("none-public", false)).await;
+		assert_eq!(status, 400, "{body}");
+		assert_eq!(
+			body["error"]["message"],
+			"none-public cannot take this request: its internet level is none, and 8.8.8.8 is a public address."
+		);
+		let (status, _, body) = asked(&s, chat("none-claude", false)).await;
+		assert_eq!(status, 400, "{body}");
+		assert!(
+			body["error"]["message"]
+				.as_str()
+				.unwrap()
+				.contains("its internet level is none")
+		);
+
+		// A route leaves it out with the reason in the log; all left out is a 400.
+		let (status, model, _) = asked(&s, chat("sandbox-first", false)).await;
+		assert_eq!((status, model.as_deref()), (200, Some("ok")));
+		let routing = s.call().await.routing.unwrap();
+		assert!(
+			routing.contains("none-public (its internet level is none"),
+			"{routing}"
+		);
+		let sent_now = s.fake.count();
+		assert_eq!(sent_now, sent + 1);
+		assert_eq!(asked(&s, chat("sandbox-only", false)).await.0, 400);
+		assert_eq!(s.fake.count(), sent_now);
+	}
+
+	#[tokio::test]
+	async fn openrouter_s_controls_narrow_a_route_and_never_reach_the_provider() {
+		let mut s = Setup::new().await;
+		let controls = |value: Value| with(chat("cheapest", false), "provider", value);
+
+		// `ignore` leaves one out, and `order` puts the named provider first; neither is sent on.
+		let (status, model, _) = asked(&s, controls(json!({"sort": "price"}))).await;
+		assert_eq!((status, model.as_deref()), (200, Some("ok-cheap")));
+		s.call().await;
+		assert!(s.fake.last().body.get("provider").is_none());
+
+		// Nothing the controls leave standing is a 404 with a sentence.
+		let (status, _, body) = asked(&s, controls(json!({"only": ["nobody"]}))).await;
+		assert_eq!(status, 404, "{body}");
+		assert!(
+			body["error"]["message"]
+				.as_str()
+				.unwrap()
+				.contains("provider.only")
+		);
+
+		// A ceiling below every price, by name.
+		let (status, _, body) = asked(&s, controls(json!({"max_price": {"prompt": 0.01}}))).await;
+		assert_eq!(status, 404, "{body}");
+
+		// They cannot name anything into the route: only what is already there is tried.
+		let (status, model, _) =
+			asked(&s, controls(json!({"only": ["fake"], "order": ["fake"]}))).await;
+		assert_eq!(status, 200);
+		assert!(matches!(model.as_deref(), Some("ok-priced" | "ok-cheap")));
+		assert!(
+			s.call()
+				.await
+				.routing
+				.unwrap()
+				.starts_with("in the caller's provider.order")
+		);
+
+		// A promise that cannot be kept is refused by name.
+		assert_eq!(asked(&s, controls(json!({"zdr": true}))).await.0, 400);
+
+		// The suffixes: `:floor` on a route is its price order, and an unknown suffix is no model.
+		let (status, model, _) = asked(&s, chat("falls-over:floor", false)).await;
+		assert_eq!(status, 200, "{model:?}");
+		for _ in 0..3 {
+			if s.call().await.outcome == Outcome::Completed {
+				break;
+			}
+		}
+		assert_eq!(asked(&s, chat("ok:sideways", false)).await.0, 404);
+
+		// `require_parameters`: a target that says nothing about tools cannot be shown to take them.
+		let body = with(
+			with(
+				chat("cheapest", false),
+				"provider",
+				json!({"require_parameters": true}),
+			),
+			"tools",
+			json!([{"type": "function", "function": {"name": "f", "parameters": {}}}]),
+		);
+		let (status, _, body) = asked(&s, body).await;
+		assert_eq!(status, 404, "{body}");
+		assert!(
+			body["error"]["message"]
+				.as_str()
+				.unwrap()
+				.contains("require_parameters")
+		);
+	}
+
+	#[tokio::test]
+	async fn a_route_s_constraints_and_weights_are_held() {
+		let mut s = Setup::new().await;
+		// `ok` says nothing about tools, so the route's requirement leaves it out.
+		let (status, model, _) = asked(&s, chat("must-have-tools", false)).await;
+		assert_eq!((status, model.as_deref()), (200, Some("big-tools")));
+		let routing = s.call().await.routing.unwrap();
+		assert!(
+			routing.contains("ok (the route requires tools)"),
+			"{routing}"
+		);
+
+		// Three to one, drawn.
+		let mut first = 0;
+		for _ in 0..200 {
+			let (status, model, _) = asked(&s, chat("only-three-to-one", false)).await;
+			assert_eq!(status, 200);
+			first += u32::from(model.as_deref() == Some("weighted-a"));
+			s.call().await;
+		}
+		assert!((120..=180).contains(&first), "{first} of 200 at 3 to 1");
+	}
+
+	#[tokio::test]
+	async fn a_route_goes_round_again_while_time_remains() {
+		let mut s = Setup::new().await;
+		// Each target fails its first two calls and answers its third: the first pass fails them
+		// all, and the second finds one answering.
+		let (status, model, _) = asked(&s, chat("flaky", false)).await;
+		assert_eq!((status, model.as_deref()), (200, Some("flaky-a")));
+		let mut outcomes = Vec::new();
+		for _ in 0..5 {
+			let call = s.call().await;
+			outcomes.push((call.model, call.attempt, call.outcome));
+		}
+		assert_eq!(outcomes[4], ("flaky-a".to_string(), 5, Outcome::Completed));
+		assert_eq!(outcomes[3].2, Outcome::Failed(Class::Upstream));
+	}
+
+	#[tokio::test]
+	async fn traffic_moves_to_the_other_credential_before_the_first_one_answers_429() {
+		let mut s = Setup::new().await;
+		// `near` is told it may be sent 8 a minute, and the fake starts refusing at 20: the point is
+		// that nothing ever gets that far, on two Bedrock accounts behind one route.
+		let mut near = 0;
+		for _ in 0..60 {
+			let (status, model, _) = asked(&s, chat("spread", false)).await;
+			assert_eq!(status, 200);
+			near += u32::from(model.as_deref() == Some("near"));
+			let call = s.call().await;
+			assert_eq!(call.outcome, Outcome::Completed, "no call met a 429");
+			assert_eq!(call.attempt, 1, "and none had to fall over");
+		}
+		assert!(near <= 12, "{near} calls went to the full account");
+		assert!(near >= 1);
+	}
+
+	/// The cache-read tokens of a whole conversation over `two-caches`, each turn longer.
+	async fn cache_reads(s: &mut Setup, forget: bool, opening: &str) -> u64 {
+		let mut messages = vec![
+			json!({"role": "system", "content": "be brief"}),
+			json!({"role": "user", "content": opening}),
+		];
+		let mut reads = 0;
+		for turn in 0..24 {
+			if forget {
+				s.health.forget_conversations();
+			}
+			let body = json!({"model": "two-caches", "messages": messages});
+			let (status, _, reply) = asked(s, body).await;
+			assert_eq!(status, 200, "{reply}");
+			reads += reply["usage"]["cache_read_input_tokens"]
+				.as_u64()
+				.unwrap_or(0);
+			s.call().await;
+			messages.push(json!({"role": "assistant", "content": format!("answer {turn}")}));
+			messages.push(json!({"role": "user", "content": format!("question {turn}")}));
+		}
+		reads
+	}
+
+	#[tokio::test]
+	async fn a_conversation_that_stays_on_its_cache_reads_more_of_it() {
+		let mut s = Setup::new().await;
+		let with_sticking = cache_reads(&mut s, false, "first conversation").await;
+		let without = cache_reads(&mut s, true, "second conversation").await;
+		assert!(
+			with_sticking > without,
+			"{with_sticking} tokens read staying, {without} moving"
+		);
+		// Once a hit is seen it stays: all but the first few turns read their whole prefix.
+		let whole: u64 = (0..24).map(|turn: u64| turn * 2 * 100).sum();
+		assert!(
+			with_sticking * 10 >= whole * 8,
+			"{with_sticking} of {whole}"
+		);
+
+		// A conversation the caller names is stuck from its first answer.
+		let named = json!({"model": "two-caches", "session_id": "s-1", "provider": {},
+			"messages": [{"role": "user", "content": "named"}]});
+		let (_, first, _) = asked(&s, named.clone()).await;
+		s.call().await;
+		for _ in 0..20 {
+			let (_, again, _) = asked(&s, named.clone()).await;
+			assert_eq!(again, first);
+			s.call().await;
+		}
+		assert!(s.fake.last().body.get("session_id").is_none());
+
+		// `provider.order` overrides it.
+		let moved = with(named, "provider", json!({"order": ["cache-b"]}));
+		let (_, model, _) = asked(&s, moved).await;
+		assert_eq!(model.as_deref(), Some("cache-on-b"));
+	}
+
+	#[tokio::test]
+	async fn a_models_internet_level_is_kept_and_an_unknown_one_refused() {
+		let Some((s, _db, _key, _id)) = with_budgets("internet").await else {
+			return;
+		};
+		let service = jwt::sign(&json!({"role": "service_role"}), SECRET);
+		let put = async |body: Value| {
+			let reply = s
+				.client
+				.put(format!("{}/ai/v1/admin/models/api-net", s.base))
+				.bearer_auth(&service)
+				.json(&body)
+				.send()
+				.await
+				.unwrap();
+			let status = reply.status().as_u16();
+			(status, reply.json::<Value>().await.unwrap())
+		};
+		let listed = async || -> Value {
+			let listed: Value = s
+				.client
+				.get(format!("{}/ai/v1/admin/models", s.base))
+				.bearer_auth(&service)
+				.send()
+				.await
+				.unwrap()
+				.json()
+				.await
+				.unwrap();
+			listed["data"]
+				.as_array()
+				.unwrap()
+				.iter()
+				.find(|m| m["name"] == "api-net")
+				.unwrap()
+				.clone()
+		};
+		let base = json!({"provider": "fake", "upstream": "fake-ok"});
+		// A new model is at `provider`.
+		let (status, made) = put(base.clone()).await;
+		assert_eq!(
+			(status, made["internet"].as_str()),
+			(200, Some("provider")),
+			"{made}"
+		);
+		assert_eq!(listed().await["internet"], "provider");
+		// Written, read back; left out of a later PUT, kept.
+		let (status, made) = put(with(base.clone(), "internet", json!("web"))).await;
+		assert_eq!(
+			(status, made["internet"].as_str()),
+			(200, Some("web")),
+			"{made}"
+		);
+		let (status, made) = put(base.clone()).await;
+		assert_eq!(
+			(status, made["internet"].as_str()),
+			(200, Some("web")),
+			"{made}"
+		);
+		assert_eq!(listed().await["internet"], "web");
+		assert_eq!(
+			put(with(base.clone(), "internet", json!("none"))).await.0,
+			200
+		);
+		assert_eq!(listed().await["internet"], "none");
+		// An unknown level, or the old boolean form, is refused.
+		assert_eq!(
+			put(with(base.clone(), "internet", json!("lots"))).await.0,
+			400
+		);
+		assert_eq!(
+			put(with(base.clone(), "internet", json!(true))).await.0,
+			400
+		);
+		assert_eq!(listed().await["internet"], "none");
+		// A quota is kept the same way, and `{}` clears it.
+		assert_eq!(
+			put(with(base.clone(), "quota", json!({"requests": 60})))
+				.await
+				.0,
+			200
+		);
+		assert_eq!(put(base.clone()).await.0, 200);
+		assert_eq!(listed().await["quota"], json!({"requests": 60}));
+		assert_eq!(put(with(base, "quota", json!({}))).await.0, 200);
+		assert_eq!(listed().await["quota"], Value::Null);
 	}
 
 	#[tokio::test]

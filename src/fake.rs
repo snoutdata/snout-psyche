@@ -14,6 +14,7 @@
 //! | `fake-402` | 402, as OpenRouter answers an account with no credit |
 //! | `fake-hang` | nothing, ever |
 //! | `fake-cut` | two streamed chunks, 20 ms apart, then the connection drops |
+//! | `fake-flaky-…` | 500 to its first two requests, then answers |
 //! | `chaos-…` | whatever [`Fake::set_chaos`] last set for that name ([`Chaos`]), answering until then |
 //!
 //! `/embeddings` answers any other model with one vector per input, its first number the input's
@@ -30,6 +31,11 @@
 //! | `fake-no-credit` | 400 `invalid_request_error` saying the credit balance is too low, as Anthropic answers |
 //! | `fake-overloaded` | a stream that starts, then sends Anthropic's `error` event |
 //! | `fake-truncated` | a stream that closes cleanly before `message_stop` |
+//! | `fake-cache` | the cache model below |
+//!
+//! `fake-cache` keeps a prompt cache for each account (the part of the path before `/messages`), as
+//! Anthropic's lives in one account: a request reads the longest run of leading messages that
+//! account has already seen, 100 tokens a message, writes the rest, and leaves them cached.
 //!
 //! A request to `/model/<id>/converse` or `…/converse-stream` is answered as Bedrock answers. It
 //! takes a Bedrock API key ([`Fake::KEY`] as a bearer) or a SigV4 signature made with
@@ -47,6 +53,7 @@
 //! | `fake-unavailable` | 503 `ServiceUnavailableException` |
 //! | `fake-stream-throttle` | a stream that starts, then a `throttlingException` |
 //! | `fake-truncated` | a stream that closes before `messageStop` |
+//! | `fake-quota` | answers its first 20 requests per model id, then 429 `ThrottlingException` |
 //!
 //! `/model/<id>/invoke` is InvokeModel for embeddings, by family as Bedrock's ids name it: an id
 //! holding `titan-embed` takes `inputText` (one text), one holding `cohere.embed` takes `texts` (at
@@ -96,6 +103,10 @@ struct Shared {
 	/// What each `chaos-…` model does now, and how many requests each answered in each way.
 	chaos: Arc<Mutex<HashMap<String, Chaos>>>,
 	served: Arc<Mutex<HashMap<(String, &'static str), u64>>>,
+	/// Requests each `fake-flaky-…` and `fake-quota` model has had.
+	tally: Arc<Mutex<HashMap<String, u32>>>,
+	/// The message prefixes each account's cache holds (`fake-cache`).
+	caches: Arc<Mutex<HashMap<(String, String), ()>>>,
 }
 
 /// What a `chaos-…` model does, set by the chaos run (`psyche-bench chaos`) while it runs.
@@ -272,7 +283,7 @@ async fn answer(
 		return bedrock(shared, &uri, &headers, &raw, &body);
 	}
 	if uri.path().ends_with("/messages") {
-		return anthropic(shared, &headers, &body);
+		return anthropic(shared, uri.path(), &headers, &body);
 	}
 
 	let gate = header(Fake::GATE_HEADER);
@@ -350,6 +361,13 @@ async fn answer(
 				StatusCode::OK.into_response()
 			}
 		};
+	}
+	if model.starts_with("fake-flaky") && count_of(&shared, &model) <= 2 {
+		return error(
+			StatusCode::INTERNAL_SERVER_ERROR,
+			"The fake fell over.",
+			"server_error",
+		);
 	}
 	match model.as_str() {
 		"fake-500" => error(
@@ -438,6 +456,47 @@ async fn answer(
 			false,
 		),
 	}
+}
+
+/// Counts one more request to `model`, and says how many it has had.
+fn count_of(shared: &Shared, model: &str) -> u32 {
+	let mut tally = shared.tally.lock().expect("the fake's tally");
+	let count = tally.entry(model.to_string()).or_default();
+	*count += 1;
+	*count
+}
+
+/// The usage of a `fake-cache` request: reads the longest run of leading messages this account has
+/// cached, writes the rest, and remembers them.
+fn cached_usage(shared: &Shared, path: &str, body: &Value) -> Value {
+	let account = path.trim_end_matches("/messages").to_string();
+	let text = |message: &Value| -> String {
+		match &message["content"] {
+			Value::String(text) => text.clone(),
+			Value::Array(blocks) => blocks
+				.iter()
+				.filter_map(|b| b["text"].as_str())
+				.collect::<Vec<_>>()
+				.join(""),
+			_ => String::new(),
+		}
+	};
+	let mut prefix = body["system"].to_string();
+	let mut caches = shared.caches.lock().expect("the fake's caches");
+	let (mut read, mut written, mut matching) = (0u64, 0u64, true);
+	for message in body["messages"].as_array().into_iter().flatten() {
+		prefix.push_str(message["role"].as_str().unwrap_or(""));
+		prefix.push_str(&text(message));
+		let key = (account.clone(), prefix.clone());
+		matching = matching && caches.contains_key(&key);
+		if matching {
+			read += 100;
+		} else {
+			written += 100;
+			caches.insert(key, ());
+		}
+	}
+	json!({"input_tokens": 9, "cache_read_input_tokens": read, "cache_creation_input_tokens": written, "output_tokens": 4})
 }
 
 /// A vector the test can recognise: its text's length first.
@@ -618,7 +677,7 @@ fn anthropic_error(status: StatusCode, kind: &str, message: &str) -> Response {
 }
 
 /// Anthropic's half.
-fn anthropic(shared: Shared, headers: &HeaderMap, body: &Value) -> Response {
+fn anthropic(shared: Shared, path: &str, headers: &HeaderMap, body: &Value) -> Response {
 	let key = headers.get("x-api-key").and_then(|v| v.to_str().ok());
 	if key != Some(Fake::KEY) {
 		return anthropic_error(
@@ -651,7 +710,13 @@ fn anthropic(shared: Shared, headers: &HeaderMap, body: &Value) -> Response {
 		);
 	}
 	let tool = model == "fake-tool";
-	let usage = json!({"input_tokens": 9, "cache_read_input_tokens": 100, "cache_creation_input_tokens": 20, "output_tokens": 4});
+	let usage = if model == "fake-cache" {
+		cached_usage(&shared, path, body)
+	} else if model == "fake-search" {
+		json!({"input_tokens": 9, "output_tokens": 4, "server_tool_use": {"web_search_requests": 2}})
+	} else {
+		json!({"input_tokens": 9, "cache_read_input_tokens": 100, "cache_creation_input_tokens": 20, "output_tokens": 4})
+	};
 	if !stream {
 		let mut content = vec![
 			json!({"type": "text", "text": if tool { "Let me look." } else { "Hello from the fake." }}),
@@ -707,7 +772,11 @@ fn anthropic(shared: Shared, headers: &HeaderMap, body: &Value) -> Response {
 	if model == "fake-truncated" {
 		return send(shared, events, Duration::ZERO, None);
 	}
-	events.push(event(json!({"type": "message_delta", "delta": {"stop_reason": if tool { "tool_use" } else { "end_turn" }}, "usage": {"output_tokens": 4}})));
+	let mut delta_usage = json!({"output_tokens": 4});
+	if model == "fake-search" {
+		delta_usage["server_tool_use"] = json!({"web_search_requests": 2});
+	}
+	events.push(event(json!({"type": "message_delta", "delta": {"stop_reason": if tool { "tool_use" } else { "end_turn" }}, "usage": delta_usage})));
 	events.push(event(json!({"type": "message_stop"})));
 	send(shared, events, Duration::ZERO, None)
 }
@@ -965,6 +1034,13 @@ fn bedrock(shared: Shared, uri: &Uri, headers: &HeaderMap, raw: &[u8], body: &Va
 	.find(|kind| id.contains(kind))
 	.unwrap_or("fake-ok")
 	.to_string();
+	if id.contains("fake-quota") && count_of(&shared, &id) > 20 {
+		return bedrock_error(
+			429,
+			"ThrottlingException",
+			"Too many requests, please wait before trying again.",
+		);
+	}
 	match model.as_str() {
 		"fake-throttle" => {
 			return bedrock_error(
