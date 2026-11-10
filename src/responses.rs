@@ -1295,7 +1295,7 @@ mod tests {
 	fn codex_turn() -> Value {
 		json!({
 			"model": "m", "stream": true, "store": false, "instructions": "You are an agent.",
-			"prompt_cache_key": "conversation-1", "service_tier": "auto", "truncation": "auto",
+			"prompt_cache_key": "c1", "service_tier": "auto", "truncation": "auto",
 			"include": ["reasoning.encrypted_content"], "metadata": {"a": "b"},
 			"parallel_tool_calls": true, "tool_choice": "auto", "max_output_tokens": 500,
 			"text": {"verbosity": "low"}, "reasoning": {"effort": "high", "summary": "auto"},
