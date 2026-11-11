@@ -528,7 +528,15 @@ left.
 A model is open to everyone, or, with `"access": "granted"` on it, only to the users and groups in
 `psyche.model_grants` (a model being tried by a few, or one a plan includes). A signed-in user, and
 a key a user owns, are held to it: a model they are not granted is refused (403) and left out of
-`/ai/v1/models`. The project's own keys and the service key use every model.
+`/ai/v1/models`. The project's own keys and the service key use every model. The service key grants
+and takes back a model, one user or one group at a time, and the next call follows it:
+
+```sh
+curl -X POST $PSYCHE/ai/v1/admin/grants -H "Authorization: Bearer $SERVICE_KEY" \
+  -d '{"model": "big-model", "user_id": "<user id>"}'      # or "group_id"; again changes nothing
+curl $PSYCHE/ai/v1/admin/grants?model=big-model -H "Authorization: Bearer $SERVICE_KEY"
+curl -X DELETE $PSYCHE/ai/v1/admin/grants/<grant id> -H "Authorization: Bearer $SERVICE_KEY"
+```
 
 ### Rate limits
 

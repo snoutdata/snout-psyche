@@ -742,6 +742,8 @@ pub fn router(proxy: Arc<Proxy>) -> Router {
 			get(upstream_models_of),
 		)
 		.route("/admin/upstream-models", post(upstream_models_for))
+		.route("/admin/grants", get(list_grants).post(create_grant))
+		.route("/admin/grants/{id}", delete(delete_grant))
 		.route("/admin/models", get(list_models))
 		.route("/admin/models/{*name}", put(set_model).delete(delete_model))
 		.route("/admin/routes", get(list_routes))
@@ -1838,6 +1840,170 @@ async fn remove_member(
 		reload_members(&keys, &client).await;
 		if deleted == 0 {
 			return Err(not_found("That user is in no group."));
+		}
+		Ok(())
+	}
+	.await;
+	match result {
+		Ok(()) => StatusCode::NO_CONTENT.into_response(),
+		Err(error) => error.into_response(),
+	}
+}
+
+/// Who a model that is `granted` is open to (`psyche.model_grants`): one user or one group a row.
+/// `?model=` reads one model's.
+async fn list_grants(
+	State(proxy): State<Arc<Proxy>>,
+	headers: HeaderMap,
+	RawQuery(query): RawQuery,
+) -> Response {
+	let result = async {
+		let (_, client) = admin(&proxy, &headers).await?;
+		let pairs = query_pairs(query.as_deref());
+		let model = pairs.get("model").filter(|m| !m.is_empty());
+		let rows = client
+			.query(
+				"SELECT g.id::text, g.model, g.user_id::text, g.group_id::text, gr.name, \
+				 (extract(epoch FROM g.created_at) * 1000)::bigint FROM psyche.model_grants g \
+				 LEFT JOIN psyche.groups gr ON gr.id = g.group_id \
+				 WHERE $1::text IS NULL OR g.model = $1 ORDER BY g.created_at, g.id",
+				&[&model],
+			)
+			.await
+			.map_err(|e| database_error(&e))?;
+		Ok::<_, ApiError>(rows.iter().map(grant_json).collect::<Vec<_>>())
+	}
+	.await;
+	match result {
+		Ok(data) => axum::Json(json!({"object": "list", "data": data})).into_response(),
+		Err(error) => error.into_response(),
+	}
+}
+
+fn grant_json(row: &tokio_postgres::Row) -> Value {
+	json!({
+		"id": row.get::<_, String>(0),
+		"model": row.get::<_, String>(1),
+		"user_id": row.get::<_, Option<String>>(2),
+		"group_id": row.get::<_, Option<String>>(3),
+		"group_name": row.get::<_, Option<String>>(4),
+		"created_at": row.get::<_, i64>(5),
+	})
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NewGrant {
+	model: String,
+	user_id: Option<String>,
+	group_id: Option<String>,
+}
+
+/// Grants a model to one user or one group. Granting it again changes nothing and answers the
+/// grant that is there (200, not 201).
+async fn create_grant(
+	State(proxy): State<Arc<Proxy>>,
+	headers: HeaderMap,
+	body: Result<Bytes, BytesRejection>,
+) -> Response {
+	let result = async {
+		let (_, client) = admin(&proxy, &headers).await?;
+		let held = held_tables(&proxy)?;
+		let body = body.map_err(|r| ApiError::new(Class::BadRequest, r.body_text()))?;
+		let new: NewGrant = serde_json::from_slice(&body).map_err(|e| {
+			ApiError::new(
+				Class::BadRequest,
+				format!("A grant is {{\"model\"}} and one of user_id or group_id: {e}"),
+			)
+		})?;
+		let id = |text: &Option<String>, what: &str| -> Result<Option<KeyId>, ApiError> {
+			text.as_deref()
+				.map(|t| {
+					KeyId::parse(t.trim()).ok_or_else(|| {
+						ApiError::new(Class::BadRequest, format!("{what} is a uuid."))
+					})
+				})
+				.transpose()
+		};
+		let (user, group) = (id(&new.user_id, "user_id")?, id(&new.group_id, "group_id")?);
+		if user.is_some() == group.is_some() {
+			return Err(ApiError::new(
+				Class::BadRequest,
+				"A grant names one user (user_id) or one group (group_id), not both.",
+			));
+		}
+		let model = new.model.trim();
+		if client
+			.query_opt("SELECT 1 FROM psyche.models WHERE name = $1", &[&model])
+			.await
+			.map_err(|e| database_error(&e))?
+			.is_none()
+		{
+			return Err(not_found(&format!("There is no model named {model}.")));
+		}
+		if let Some(group) = group
+			&& client
+				.query_opt("SELECT 1 FROM psyche.groups WHERE id = $1", &[&group])
+				.await
+				.map_err(|e| database_error(&e))?
+				.is_none()
+		{
+			return Err(not_found("There is no group with that id."));
+		}
+		let made = client
+			.query_opt(
+				"WITH made AS (INSERT INTO psyche.model_grants (model, user_id, group_id) \
+				 VALUES ($1, $2, $3) ON CONFLICT DO NOTHING RETURNING *) \
+				 SELECT m.id::text, m.model, m.user_id::text, m.group_id::text, gr.name, \
+				 (extract(epoch FROM m.created_at) * 1000)::bigint FROM made m \
+				 LEFT JOIN psyche.groups gr ON gr.id = m.group_id",
+				&[&model, &user, &group],
+			)
+			.await
+			.map_err(|e| write_error(&e))?;
+		let (status, row) = match made {
+			Some(row) => (StatusCode::CREATED, row),
+			None => (
+				StatusCode::OK,
+				client
+					.query_one(
+						"SELECT g.id::text, g.model, g.user_id::text, g.group_id::text, gr.name, \
+						 (extract(epoch FROM g.created_at) * 1000)::bigint FROM psyche.model_grants g \
+						 LEFT JOIN psyche.groups gr ON gr.id = g.group_id WHERE g.model = $1 \
+						 AND g.user_id IS NOT DISTINCT FROM $2 AND g.group_id IS NOT DISTINCT FROM $3",
+						&[&model, &user, &group],
+					)
+					.await
+					.map_err(|e| database_error(&e))?,
+			),
+		};
+		reload_credentials(held, &client).await;
+		Ok::<_, ApiError>((status, grant_json(&row)))
+	}
+	.await;
+	match result {
+		Ok((status, made)) => (status, axum::Json(made)).into_response(),
+		Err(error) => error.into_response(),
+	}
+}
+
+async fn delete_grant(
+	State(proxy): State<Arc<Proxy>>,
+	headers: HeaderMap,
+	Path(id): Path<String>,
+) -> Response {
+	let result = async {
+		let (_, client) = admin(&proxy, &headers).await?;
+		let held = held_tables(&proxy)?;
+		let id = KeyId::parse(&id)
+			.ok_or_else(|| ApiError::new(Class::BadRequest, "A grant's id is a uuid."))?;
+		let deleted = client
+			.execute("DELETE FROM psyche.model_grants WHERE id = $1", &[&id])
+			.await
+			.map_err(|e| database_error(&e))?;
+		reload_credentials(held, &client).await;
+		if deleted == 0 {
+			return Err(not_found("There is no grant with that id."));
 		}
 		Ok(())
 	}
@@ -4525,6 +4691,12 @@ mod tests {
 				.bearer_auth(jwt::sign(&json!({"role": "service_role"}), SECRET))
 		}
 
+		fn delete(&self, path: &str) -> reqwest::RequestBuilder {
+			self.client
+				.delete(format!("{}{path}", self.base))
+				.bearer_auth(jwt::sign(&json!({"role": "service_role"}), SECRET))
+		}
+
 		async fn call(&mut self) -> Call {
 			tokio::time::timeout(Duration::from_secs(5), self.calls.recv())
 				.await
@@ -5423,12 +5595,97 @@ mod tests {
 			models.to_string().contains("\"ok-priced\"")
 		};
 		assert!(!listed().await);
-		db.execute(
-			"INSERT INTO psyche.model_grants (model, user_id) VALUES ('ok-priced', $1::text::uuid)",
-			&[&alice],
+		// A grant names one user or one group, and a model that exists.
+		for (bad, status) in [
+			(json!({"model": "ok-priced"}), 400),
+			(
+				json!({"model": "ok-priced", "user_id": alice, "group_id": alice}),
+				400,
+			),
+			(json!({"model": "ok-priced", "user_id": "alice"}), 400),
+			(json!({"model": "nothing", "user_id": alice}), 404),
+			(json!({"model": "ok-priced", "group_id": alice}), 404),
+		] {
+			let reply = add(&s, "/ai/v1/admin/grants", bad.clone()).await.unwrap();
+			assert_eq!(reply.status(), status, "{bad}");
+		}
+		let reply = add(
+			&s,
+			"/ai/v1/admin/grants",
+			json!({"model": "ok-priced", "user_id": alice}),
 		)
 		.await
 		.unwrap();
+		assert_eq!(reply.status(), 201);
+		let grant: Value = reply.json().await.unwrap();
+		assert_eq!(grant["model"], "ok-priced");
+		assert_eq!(grant["user_id"], alice);
+		// Granting it again answers the same grant.
+		let again = add(
+			&s,
+			"/ai/v1/admin/grants",
+			json!({"model": "ok-priced", "user_id": alice}),
+		)
+		.await
+		.unwrap();
+		assert_eq!(again.status(), 200);
+		assert_eq!(again.json::<Value>().await.unwrap()["id"], grant["id"]);
+		until(&s, alice, &body, 200).await.text().await.unwrap();
+		assert!(listed().await);
+		let grants: Value = s
+			.get("/ai/v1/admin/grants?model=ok-priced")
+			.send()
+			.await
+			.unwrap()
+			.json()
+			.await
+			.unwrap();
+		assert_eq!(grants["data"].as_array().unwrap().len(), 1);
+		let models: Value = s
+			.get("/ai/v1/admin/models")
+			.send()
+			.await
+			.unwrap()
+			.json()
+			.await
+			.unwrap();
+		let held = models["data"]
+			.as_array()
+			.unwrap()
+			.iter()
+			.find(|m| m["name"] == "ok-priced")
+			.unwrap();
+		assert_eq!(held["grants"], 1);
+		// Taken back, she is refused again; then granted once more for what follows.
+		let id = grant["id"].as_str().unwrap();
+		assert_eq!(
+			s.delete(&format!("/ai/v1/admin/grants/{id}"))
+				.send()
+				.await
+				.unwrap()
+				.status(),
+			204
+		);
+		assert_eq!(
+			s.delete(&format!("/ai/v1/admin/grants/{id}"))
+				.send()
+				.await
+				.unwrap()
+				.status(),
+			404
+		);
+		until(&s, alice, &body, 403).await.text().await.unwrap();
+		assert_eq!(
+			add(
+				&s,
+				"/ai/v1/admin/grants",
+				json!({"model": "ok-priced", "user_id": alice})
+			)
+			.await
+			.unwrap()
+			.status(),
+			201
+		);
 		until(&s, alice, &body, 200).await.text().await.unwrap();
 		assert!(listed().await);
 		// The list says what each model costs.
